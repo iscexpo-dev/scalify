@@ -104,12 +104,12 @@ def test_compile_nvidia_cu130_preserves_cuda_runtime():
     assert "nvidia-cuda-runtime==" in content, (
         "nvidia-cuda-runtime missing from compiled output — "
         "cuda-toolkit extras were likely stripped by the override. "
-        "See: https://github.com/Khulnasoft/scalify-cli/issues/412"
+        "See: https://github.com/Khulnasoft/scalify/issues/412"
     )
     assert "nvidia-cuda-nvrtc==" in content, (
         "nvidia-cuda-nvrtc missing from compiled output — "
         "cuda-toolkit extras were likely stripped by the override. "
-        "See: https://github.com/Khulnasoft/scalify-cli/issues/412"
+        "See: https://github.com/Khulnasoft/scalify/issues/412"
     )
 
 

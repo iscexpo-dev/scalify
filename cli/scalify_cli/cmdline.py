@@ -1341,7 +1341,7 @@ def entry(
             renderer.emit(
                 {
                     "welcome": "Scalify CLI",
-                    "homepage": "https://github.com/Khulnasoft/scalify-cli",
+                    "homepage": "https://github.com/Khulnasoft/scalify",
                     "hint": "run `scalify setup` to get started, `scalify --help-json` for the full surface, or `scalify --help` for human help.",
                 },
                 command="welcome",
@@ -2871,7 +2871,7 @@ def env():
 
 _FEEDBACK_DISABLED_NOTICE = (
     "[yellow]Feedback not sent — telemetry is opted out via DO_NOT_TRACK / SCALIFY_NO_TELEMETRY.[/yellow]\n"
-    "Unset that to send, or open an issue: https://github.com/Khulnasoft/scalify-cli/issues/new/choose"
+    "Unset that to send, or open an issue: https://github.com/Khulnasoft/scalify/issues/new/choose"
 )
 
 
@@ -2947,7 +2947,7 @@ def feedback(
         and questionary.confirm("Do you want to provide additional feature-specific feedback on our GitHub page?").ask()
     ):
         tracking.track_event("feedback_additional")
-        webbrowser.open("https://github.com/Khulnasoft/scalify-cli/issues/new/choose")
+        webbrowser.open("https://github.com/Khulnasoft/scalify/issues/new/choose")
 
     _relay_feedback(renderer, sent, message=free_text or "")
 

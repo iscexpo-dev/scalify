@@ -1912,7 +1912,7 @@ def validate_api_workflow(
                 command=command,
                 code="conversion_crash",
                 message=f"Workflow conversion crashed unexpectedly: {type(e).__name__}: {e}",
-                hint="report this at https://github.com/Khulnasoft/scalify-cli/issues",
+                hint="report this at https://github.com/Khulnasoft/scalify/issues",
                 details={"exception_type": type(e).__name__},
             )
             raise typer.Exit(code=1) from e

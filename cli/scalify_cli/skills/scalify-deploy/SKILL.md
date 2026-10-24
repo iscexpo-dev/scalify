@@ -6,7 +6,7 @@ description: "Run a Scalify Build release as a serverless deployment with scalif
 # scalify-deploy
 
 The commands here are the `scalify deploy` group from
-[scalify-cli](https://github.com/Khulnasoft/scalify-cli). Everything in it needs
+[scalify-cli](https://github.com/Khulnasoft/scalify). Everything in it needs
 `scalify cloud login`, or a workspace API key in `SCALIFY_CLOUD_API_KEY`, which a CI
 job uses in place of a sign-in and which wins over a stored sign-in; a command
 answers `deploy_not_signed_in` when it has neither, or when the key is refused.

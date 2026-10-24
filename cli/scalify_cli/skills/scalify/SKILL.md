@@ -1114,7 +1114,7 @@ let it evaporate.
 Never invent, embellish, or send your own assessment. If they say nothing or
 brush it off, send nothing. Strip secrets, file contents, and PII. For long or
 sensitive reports, point them to
-`https://github.com/Khulnasoft/scalify-cli/issues/new/choose` instead.
+`https://github.com/Khulnasoft/scalify/issues/new/choose` instead.
 
 ## Agent session review (separate, consent-gated)
 

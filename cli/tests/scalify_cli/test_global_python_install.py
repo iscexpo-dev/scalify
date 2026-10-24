@@ -6,7 +6,7 @@ Covers the scenario where scalify-cli is installed via ``pip install`` or
 dependencies into the same global environment instead of creating a
 workspace ``.venv``.
 
-See https://github.com/Khulnasoft/scalify-cli/issues/393
+See https://github.com/Khulnasoft/scalify/issues/393
 """
 
 import os

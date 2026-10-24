@@ -69,7 +69,7 @@ dependencies = [
 
 optional-dependencies.dev = [ "jsonschema", "pre-commit", "pytest", "pytest-cov", "ruff==0.15.15", "typer>=0.24" ]
 optional-dependencies.preview = [ "term-image>=0.7,<0.8" ]
-urls.Repository = "https://github.com/Khulnasoft/scalify-cli.git"
+urls.Repository = "https://github.com/Khulnasoft/scalify.git"
 scripts.scalify = "scalify_cli.__main__:main"
 scripts.scalify-cli = "scalify_cli.__main__:main"
 scripts.scalifycli = "scalify_cli.__main__:main"

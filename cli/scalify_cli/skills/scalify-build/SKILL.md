@@ -6,7 +6,7 @@ description: "Build a custom ScalifyUI environment on the Scalify developer plat
 # scalify-build
 
 The commands here are the `scalify build` group from
-[scalify-cli](https://github.com/Khulnasoft/scalify-cli). `scalify which` and
+[scalify-cli](https://github.com/Khulnasoft/scalify). `scalify which` and
 `scalify cloud login` are its two helpers.
 
 **Check for the commands, not a version.** `scalify build --help` either lists

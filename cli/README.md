@@ -1,11 +1,11 @@
 # scalify-cli: A Command Line Tool for ScalifyUI
 
-[![Run pytest](https://github.com/Khulnasoft/scalify-cli/actions/workflows/pytest.yml/badge.svg)](https://github.com/Khulnasoft/scalify-cli/actions/workflows/pytest.yml)
+[![Run pytest](https://github.com/Khulnasoft/scalify/actions/workflows/pytest.yml/badge.svg)](https://github.com/Khulnasoft/scalify/actions/workflows/pytest.yml)
 [![codecov](https://codecov.io/github/Khulnasoft/scalify-cli/graph/badge.svg?token=S64WJWD2ZX)](https://codecov.io/github/Khulnasoft/scalify-cli)
 [![PyPI](https://img.shields.io/pypi/v/scalify-cli.svg)](https://pypi.org/project/scalify-cli/)
 [![Downloads](https://static.pepy.tech/badge/scalify-cli/month)](https://pepy.tech/project/scalify-cli)
 [![Python](https://img.shields.io/pypi/pyversions/scalify-cli)](https://pypi.org/project/scalify-cli/)
-[![License](https://img.shields.io/pypi/l/scalify-cli)](https://github.com/Khulnasoft/scalify-cli/blob/main/LICENSE)
+[![License](https://img.shields.io/pypi/l/scalify-cli)](https://github.com/Khulnasoft/scalify/blob/main/LICENSE)
 
 scalify-cli is a command-line tool for installing, running, and extending
 [ScalifyUI](https://github.com/khulnasoft/scalify) — the open-source
@@ -697,7 +697,7 @@ Check out the usage here: [Mixpanel Board](https://mixpanel.com/p/13hGfPfEPdRkjP
 ## Contributing
 
 We welcome contributions to scalify-cli! For ideas, suggestions, or bug reports,
-open an issue at [Khulnasoft/scalify-cli](https://github.com/Khulnasoft/scalify-cli/issues).
+open an issue at [Khulnasoft/scalify-cli](https://github.com/Khulnasoft/scalify/issues).
 For code changes, fork the repo and open a pull request.
 
 See [CONTRIBUTING.md](/CONTRIBUTING.md) for setup, the checks CI enforces,
@@ -705,11 +705,11 @@ and PR conventions. Notable changes are recorded in [CHANGELOG.md](/CHANGELOG.md
 
 ## License
 
-Released under the [GNU General Public License v3.0](https://github.com/Khulnasoft/scalify-cli/blob/main/LICENSE).
+Released under the [GNU General Public License v3.0](https://github.com/Khulnasoft/scalify/blob/main/LICENSE).
 
 ## Support
 
-Questions or issues? [Open an issue](https://github.com/Khulnasoft/scalify-cli/issues)
+Questions or issues? [Open an issue](https://github.com/Khulnasoft/scalify/issues)
 or reach us on [Discord](https://discord.com/invite/scalify).
 
 Happy diffusing with ScalifyUI and scalify-cli! 🎉

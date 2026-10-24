@@ -5,7 +5,7 @@ CLI for installing and running ScalifyUI, published to PyPI as
 [`scalify-cli`](https://pypi.org/project/scalify-cli/).
 
 - **Bugs and feature requests** — open an issue at
-  [Khulnasoft/scalify-cli/issues](https://github.com/Khulnasoft/scalify-cli/issues)
+  [Khulnasoft/scalify-cli/issues](https://github.com/Khulnasoft/scalify/issues)
   using one of the issue templates.
 - **Code changes** — fork the repo, branch off `main`, and open a pull request.
 - **Questions** — ask in [Discord](https://discord.com/invite/scalify).
@@ -277,7 +277,7 @@ in the ScalifyUI root) rather than being git-cloned into `custom_nodes/`.
 ## Contact
 
 If you have any questions or need further assistance,
-[open an issue](https://github.com/Khulnasoft/scalify-cli/issues) or reach us on
+[open an issue](https://github.com/Khulnasoft/scalify/issues) or reach us on
 [Discord](https://discord.com/invite/scalify).
 
 Happy coding!

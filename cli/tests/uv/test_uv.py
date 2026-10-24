@@ -241,7 +241,7 @@ def test_make_override_does_not_strip_cuda_toolkit_extras():
                 f"Override contains bare cuda-toolkit pin without extras: {stripped!r}\n"
                 "This causes uv to strip extras from torch's cuda-toolkit dependency, "
                 "dropping nvidia-cuda-runtime, nvidia-cuda-nvrtc, and other CUDA packages.\n"
-                "See: https://github.com/Khulnasoft/scalify-cli/issues/412"
+                "See: https://github.com/Khulnasoft/scalify/issues/412"
             )
 
 

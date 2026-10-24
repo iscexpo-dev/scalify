@@ -1,0 +1,1460 @@
+import contextlib
+import os
+import pathlib
+import platform
+import shutil
+import subprocess
+import sys
+import uuid
+from enum import Enum
+from typing import Annotated
+
+import typer
+from rich.console import Console
+
+from scalify_cli import constants, logging, tracking, ui, utils
+from scalify_cli._safe_exec import BinaryNotFoundError
+from scalify_cli.command.custom_nodes.bisect_custom_nodes import bisect_app
+from scalify_cli.command.custom_nodes.cm_cli_util import (
+    execute_cm_cli,
+    find_cm_cli,
+    normalize_cm_cli_exit_code,
+)
+from scalify_cli.config_manager import ConfigManager
+from scalify_cli.constants import NODE_ZIP_FILENAME
+from scalify_cli.file_utils import (
+    DownloadException,
+    download_file,
+    extract_package_as_zip,
+    upload_file_to_signed_url,
+    zip_files,
+)
+from scalify_cli.output import get_renderer
+from scalify_cli.output import rprint as print  # context-aware: stderr in JSON mode
+from scalify_cli.registry import (
+    RegistryAPI,
+    RegistryAPIError,
+    extract_node_configuration,
+    initialize_project_config,
+)
+from scalify_cli.resolve_python import resolve_workspace_python
+from scalify_cli.workspace_manager import WorkspaceManager
+
+console = Console()
+app = typer.Typer()
+app.add_typer(bisect_app, name="bisect", help="Bisect custom nodes for culprit node.")
+manager_app = typer.Typer()
+workspace_manager = WorkspaceManager()
+registry_api = RegistryAPI()
+
+
+# Enum for show command target
+class ShowTarget(str, Enum):
+    INSTALLED = "installed"
+    ENABLED = "enabled"
+    NOT_INSTALLED = "not-installed"
+    DISABLED = "disabled"
+    ALL = "all"
+    SNAPSHOT = "snapshot"
+    SNAPSHOT_LIST = "snapshot-list"
+
+
+def _resolve_uv_compile(uv_compile: bool | None, fast_deps: bool = False, no_deps: bool = False) -> bool:
+    """Resolve effective uv_compile value from explicit flag, config default, and conflicting flags.
+
+    Priority: explicit --uv-compile/--no-uv-compile > config default > False.
+    When config default is True, explicit --fast-deps or --no-deps silently override it.
+    """
+    if uv_compile is not None:
+        return uv_compile
+
+    config_manager = ConfigManager()
+    config_value = config_manager.get(constants.CONFIG_KEY_UV_COMPILE_DEFAULT)
+    if config_value is not None and config_value.lower() == "true":
+        if fast_deps or no_deps:
+            return False
+        return True
+    return False
+
+
+def validate_scalifyui_manager():
+    if not find_cm_cli():
+        print("[bold red]ScalifyUI-Manager is not installed. 'cm-cli' command is not available.[/bold red]")
+        raise typer.Exit(code=1)
+
+
+def run_script(cmd, cwd="."):
+    if len(cmd) > 0 and cmd[0].startswith("#"):
+        print(f"[ScalifyUI-Manager] Unexpected behavior: `{cmd}`")
+        return 0
+
+    subprocess.check_call(cmd, cwd=cwd)
+
+    return 0
+
+
+pip_map = None
+
+
+def get_installed_packages():
+    global pip_map
+
+    if pip_map is None:
+        try:
+            python = resolve_workspace_python(workspace_manager.workspace_path)
+            result = subprocess.check_output([python, "-m", "pip", "list"], universal_newlines=True)
+
+            pip_map = {}
+            for line in result.split("\n"):
+                x = line.strip()
+                if x:
+                    y = line.split()
+                    if y[0] == "Package" or y[0].startswith("-"):
+                        continue
+
+                    pip_map[y[0]] = y[1]
+        except subprocess.CalledProcessError:
+            print("[ScalifyUI-Manager] Failed to retrieve the information of installed pip packages.")
+            return set()
+
+    return pip_map
+
+
+def try_install_script(repo_path, install_cmd, instant_execution=False):
+    startup_script_path = os.path.join(workspace_manager.workspace_path, "startup-scripts")
+    # Windows always defers to the startup script. ScalifyUI-Manager additionally
+    # gated this on the ScalifyUI checkout being newer than a required commit;
+    # that comparison was deliberately dropped (Yoland) because scalify-cli tracks
+    # no required-commit datetime to compare against.
+    if not instant_execution and (
+        (len(install_cmd) > 0 and install_cmd[0].startswith("#")) or platform.system() == "Windows"
+    ):
+        if not os.path.exists(startup_script_path):
+            os.makedirs(startup_script_path)
+
+        script_path = os.path.join(startup_script_path, "install-scripts.txt")
+        with open(script_path, "a", encoding="utf-8") as file:
+            obj = [repo_path] + install_cmd
+            file.write(f"{obj}\n")
+
+        return True
+    else:
+        # ScalifyUI-Manager screened pip installs against a package blacklist here.
+        # Deliberately not carried over (Yoland): scalify-cli ships no blacklist,
+        # so every install command runs as given.
+        print(f"\n## ScalifyUI-Manager: EXECUTE => {install_cmd}")
+        code = run_script(install_cmd, cwd=repo_path)
+
+        # ScalifyUI-Manager also warned on non-Windows when the ScalifyUI checkout
+        # was older than the required commit. Dropped for the same reason as
+        # above — there is no required-commit datetime here.
+        if code != 0:
+            print("install script failed")
+            return False
+
+
+def execute_install_script(repo_path):
+    install_script_path = os.path.join(repo_path, "install.py")
+    requirements_path = os.path.join(repo_path, "requirements.txt")
+
+    # ScalifyUI-Manager's "lazy mode" — queueing a #LAZY-INSTALL-SCRIPT marker for
+    # the next startup instead of installing now — was deliberately not carried
+    # over (Yoland). scalify-cli installs eagerly so failures surface in the
+    # command that caused them rather than on some later launch.
+    if os.path.exists(requirements_path):
+        print("Install: pip packages")
+        python = resolve_workspace_python(workspace_manager.workspace_path)
+        # Absolute path so pip doesn't re-resolve it against cwd=repo_path
+        # in try_install_script, which would double the path if repo_path
+        # is relative.
+        install_cmd = [python, "-m", "pip", "install", "-r", os.path.abspath(requirements_path)]
+        try_install_script(repo_path, install_cmd)
+
+    if os.path.exists(install_script_path):
+        print("Install: install script")
+        python = resolve_workspace_python(workspace_manager.workspace_path)
+        install_cmd = [python, "install.py"]
+        try_install_script(repo_path, install_cmd)
+
+
+@app.command("save-snapshot", help="Save a snapshot of the current ScalifyUI environment")
+@tracking.track_command("node")
+def save_snapshot(
+    output: Annotated[
+        str | None,
+        typer.Option(show_default=False, help="Specify the output file path. (.json/.yaml)"),
+    ] = None,
+):
+    if output is None:
+        execute_cm_cli(["save-snapshot"])
+    else:
+        output = os.path.abspath(output)  # to compensate chdir
+        execute_cm_cli(["save-snapshot", "--output", output])
+
+
+@app.command("restore-snapshot", help="Restore snapshot from snapshot file")
+@tracking.track_command("node")
+def restore_snapshot(
+    path: str,
+    pip_non_url: bool | None = typer.Option(
+        default=None,
+        show_default=False,
+        help="Restore for pip packages registered on PyPI.",
+    ),
+    pip_non_local_url: bool | None = typer.Option(
+        default=None,
+        show_default=False,
+        help="Restore for pip packages registered at web URLs.",
+    ),
+    pip_local_url: bool | None = typer.Option(
+        default=None,
+        show_default=False,
+        help="Restore for pip packages specified by local paths.",
+    ),
+    fast_deps: Annotated[
+        bool,
+        typer.Option(
+            "--fast-deps",
+            show_default=False,
+            help="Use the fast (uv) dependency installer, matching `scalify install --fast-deps`. "
+            "For snapshot restore this runs the uv-compile fast path (requires ScalifyUI-Manager v4.1+).",
+        ),
+    ] = False,
+    uv_compile: Annotated[
+        bool | None,
+        typer.Option(
+            "--uv-compile/--no-uv-compile",
+            show_default=False,
+            help="After restoring, batch-resolve all dependencies via uv pip compile (requires ScalifyUI-Manager v4.1+)",
+        ),
+    ] = None,
+):
+    # `--fast-deps` mirrors the `scalify install --fast-deps` UX (issue #217). cm_cli's
+    # `restore-snapshot` does NOT accept `--no-deps`, so the DependencyCompiler-based
+    # fast path used by `install`/`reinstall` is unavailable here; the fast uv path
+    # restore-snapshot *does* support is `--uv-compile` (it sets no-deps + batch-resolves
+    # with uv internally). So `--fast-deps` forwards the uv-compile fast path. Passing it
+    # alongside an explicit `--no-uv-compile` is contradictory.
+    if fast_deps and uv_compile is False:
+        typer.echo("Cannot use --fast-deps with --no-uv-compile", err=True)
+        raise typer.Exit(code=1)
+
+    extras = []
+
+    if pip_non_url:
+        extras += ["--pip-non-url"]
+
+    if pip_non_local_url:
+        extras += ["--pip-non-local-url"]
+
+    if pip_local_url:
+        extras += ["--pip-local-url"]
+
+    effective_uv_compile = _resolve_uv_compile(uv_compile)
+    if fast_deps:
+        effective_uv_compile = True
+
+    path = os.path.abspath(path)
+    execute_cm_cli(["restore-snapshot", path] + extras, uv_compile=effective_uv_compile)
+
+
+@app.command("restore-dependencies", help="Restore dependencies from installed custom nodes")
+@tracking.track_command("node")
+def restore_dependencies(
+    uv_compile: Annotated[
+        bool | None,
+        typer.Option(
+            "--uv-compile/--no-uv-compile",
+            show_default=False,
+            help="After restoring, batch-resolve all dependencies via uv pip compile (requires ScalifyUI-Manager v4.1+)",
+        ),
+    ] = None,
+):
+    execute_cm_cli(["restore-dependencies"], uv_compile=_resolve_uv_compile(uv_compile))
+
+
+@manager_app.command("disable", help="Disable ScalifyUI-Manager completely")
+@tracking.track_command("node")
+def disable_manager():
+    """Disable ScalifyUI-Manager. No manager flags will be passed to ScalifyUI."""
+    config_manager = ConfigManager()
+    config_manager.set(constants.CONFIG_KEY_MANAGER_GUI_MODE, "disable")
+    print("[bold yellow]ScalifyUI-Manager has been disabled.[/bold yellow]")
+    print("No manager flags will be passed to ScalifyUI on next launch.")
+
+
+@manager_app.command("enable-gui", help="Enable ScalifyUI-Manager with new GUI")
+@tracking.track_command("node")
+def enable_gui():
+    """Enable ScalifyUI-Manager with new GUI."""
+    config_manager = ConfigManager()
+    config_manager.set(constants.CONFIG_KEY_MANAGER_GUI_MODE, "enable-gui")
+    print("[bold green]ScalifyUI-Manager GUI has been enabled.[/bold green]")
+    print("[dim]ScalifyUI will launch with: --enable-manager[/dim]")
+
+
+@manager_app.command("disable-gui", help="Disable the ScalifyUI-Manager GUI (Manager stays enabled, headless)")
+@tracking.track_command("node")
+def disable_gui():
+    """Disable the ScalifyUI-Manager GUI. Manager stays enabled, headless."""
+    config_manager = ConfigManager()
+    config_manager.set(constants.CONFIG_KEY_MANAGER_GUI_MODE, "disable-gui")
+    print("[bold green]ScalifyUI-Manager enabled with GUI disabled.[/bold green]")
+    print("[dim]ScalifyUI will launch with: --enable-manager --disable-manager-ui[/dim]")
+
+
+@manager_app.command("enable-legacy-gui", help="Enable ScalifyUI-Manager with legacy GUI")
+@tracking.track_command("node")
+def enable_legacy_gui():
+    """Enable ScalifyUI-Manager with legacy GUI."""
+    config_manager = ConfigManager()
+    config_manager.set(constants.CONFIG_KEY_MANAGER_GUI_MODE, "enable-legacy-gui")
+    print("[bold green]ScalifyUI-Manager legacy GUI has been enabled.[/bold green]")
+    print("[dim]ScalifyUI will launch with: --enable-manager --enable-manager-legacy-ui[/dim]")
+
+
+@manager_app.command("migrate-legacy", help="Migrate legacy git-cloned ScalifyUI-Manager to .disabled")
+@tracking.track_command("node")
+def migrate_legacy(
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Skip confirmation prompt"),
+    ] = False,
+):
+    """
+    Migrate legacy ScalifyUI-Manager from custom_nodes/ to custom_nodes/.disabled/
+
+    Detects .enable-cli-only-mode file to set appropriate mode:
+    - If .enable-cli-only-mode exists → mode = disable
+    - Otherwise → mode = enable-gui
+    """
+    if not workspace_manager.workspace_path:
+        print("[bold red]ScalifyUI workspace is not set.[/bold red]")
+        print("[dim]Use --workspace or run from a ScalifyUI directory.[/dim]")
+        raise typer.Exit(code=1)
+
+    custom_nodes_path = pathlib.Path(workspace_manager.workspace_path) / "custom_nodes"
+
+    # Find legacy manager with case-insensitive matching (must be a real directory, not symlink)
+    legacy_manager_path = None
+    if custom_nodes_path.exists():
+        for item in custom_nodes_path.iterdir():
+            if item.is_dir() and not item.is_symlink() and item.name.lower() == "scalifyui-manager":
+                legacy_manager_path = item
+                break
+
+    # Check if legacy manager exists
+    if legacy_manager_path is None:
+        print("[bold yellow]No legacy ScalifyUI-Manager found in custom_nodes/[/bold yellow]")
+        print("Nothing to migrate.")
+        return
+
+    # Verify it's a git-cloned repository
+    git_dir = legacy_manager_path / ".git"
+    if not git_dir.exists():
+        print(f"[bold yellow]Warning: {legacy_manager_path.name} does not appear to be a git repository.[/bold yellow]")
+        print("[dim]Expected a git-cloned ScalifyUI-Manager. Skipping migration.[/dim]")
+        return
+
+    # Detect CLI-only mode before any changes
+    cli_only_mode_file = legacy_manager_path / ".enable-cli-only-mode"
+    cli_only_mode = cli_only_mode_file.exists()
+
+    # Show what will happen and ask for confirmation
+    print(f"[bold]Found legacy ScalifyUI-Manager:[/bold] {legacy_manager_path}")
+    print(f"[dim]CLI-only mode: {cli_only_mode}[/dim]")
+    print()
+    print("[bold]This will:[/bold]")
+    print(f"  1. Move {legacy_manager_path.name} to custom_nodes/.disabled/")
+    print(f"  2. Set manager mode to: {'disable' if cli_only_mode else 'enable-gui'}")
+    print("  3. Install manager_requirements.txt (if present)")
+    print()
+
+    if not yes:
+        confirm = ui.prompt_confirm_action("Proceed with migration?", False)
+        if not confirm:
+            print("[dim]Migration cancelled.[/dim]")
+            return
+
+    # Create .disabled directory
+    disabled_path = custom_nodes_path / ".disabled"
+    disabled_path.mkdir(exist_ok=True)
+
+    # Check if target already exists (case-insensitive)
+    existing_target = None
+    for item in disabled_path.iterdir():
+        if item.is_dir() and item.name.lower() == "scalifyui-manager":
+            existing_target = item
+            break
+
+    if existing_target is not None:
+        print(f"[bold red]Target path already exists: {existing_target}[/bold red]")
+        print("Please remove it manually and try again.")
+        raise typer.Exit(code=1)
+
+    # Move legacy manager (preserve original directory name)
+    target_path = disabled_path / legacy_manager_path.name
+    try:
+        shutil.move(str(legacy_manager_path), str(target_path))
+    except OSError as e:
+        print(f"[bold red]Failed to move legacy manager: {e}[/bold red]")
+        raise typer.Exit(code=1)
+
+    # Install manager_requirements.txt if present
+    workspace_path = pathlib.Path(workspace_manager.workspace_path)
+    manager_req_path = workspace_path / constants.MANAGER_REQUIREMENTS_FILE
+    python = resolve_workspace_python(str(workspace_path))
+    install_success = False  # Default to failure, set True only on success
+    if manager_req_path.exists():
+        print("[dim]Installing ScalifyUI-Manager dependencies...[/dim]")
+        result = subprocess.run(
+            [python, "-m", "pip", "install", "-r", str(manager_req_path)],
+            check=False,
+        )
+        if result.returncode != 0:
+            print("[bold yellow]Warning: Failed to install ScalifyUI-Manager dependencies.[/bold yellow]")
+            print("[dim]You may need to run: pip install -r manager_requirements.txt[/dim]")
+        else:
+            install_success = True
+    else:
+        print("[bold yellow]Warning: manager_requirements.txt not found (older ScalifyUI version?).[/bold yellow]")
+        print("[dim]ScalifyUI-Manager pip package not installed.[/dim]")
+
+    # Set config mode
+    config_manager = ConfigManager()
+    if cli_only_mode or not install_success:
+        config_manager.set(constants.CONFIG_KEY_MANAGER_GUI_MODE, "disable")
+        print("[bold green]Legacy ScalifyUI-Manager migrated to .disabled/[/bold green]")
+        if cli_only_mode:
+            print("[dim]Detected .enable-cli-only-mode → Manager set to: disable[/dim]")
+        else:
+            print("[dim]Manager installation failed → Manager set to: disable[/dim]")
+            print("[dim]After fixing installation, run: scalify manager enable-gui[/dim]")
+    else:
+        config_manager.set(constants.CONFIG_KEY_MANAGER_GUI_MODE, "enable-gui")
+        print("[bold green]Legacy ScalifyUI-Manager migrated to .disabled/[/bold green]")
+        print("[dim]Manager set to: enable-gui (new GUI)[/dim]")
+
+    print("\n[bold]The new pip-installed ScalifyUI-Manager will be used on next launch.[/bold]")
+
+
+@manager_app.command(
+    "uv-compile-default", help="Set whether --uv-compile is used by default for custom node operations"
+)
+@tracking.track_command("node")
+def uv_compile_default(
+    enabled: Annotated[
+        bool,
+        typer.Argument(help="true to enable, false to disable"),
+    ],
+):
+    config_manager = ConfigManager()
+    config_manager.set(constants.CONFIG_KEY_UV_COMPILE_DEFAULT, str(enabled))
+    if enabled:
+        print("[bold green]uv-compile is now enabled by default.[/bold green]")
+        print("[dim]Use --no-uv-compile to override for individual commands.[/dim]")
+    else:
+        print("[bold yellow]uv-compile default has been disabled.[/bold yellow]")
+        print("[dim]Use --uv-compile to enable for individual commands.[/dim]")
+
+
+@manager_app.command(help="Clear reserved startup action in ScalifyUI-Manager")
+@tracking.track_command("node")
+def clear():
+    execute_cm_cli(["clear"])
+
+
+@app.command("update-cache", help="Force-fetch remote data and populate local Manager cache (blocking)")
+@tracking.track_command("node")
+def update_cache():
+    execute_cm_cli(["update-cache"])
+
+
+# completers
+mode_completer = utils.create_choice_completer(["remote", "local", "cache"])
+
+
+channel_completer = utils.create_choice_completer(["default", "recent", "dev", "forked", "tutorial", "legacy"])
+
+
+def node_completer(incomplete: str) -> list[str]:
+    try:
+        config_manager = ConfigManager()
+        tmp_path = os.path.join(config_manager.get_config_path(), "tmp", "node-cache.list")
+
+        with open(tmp_path, encoding="UTF-8", errors="ignore") as cache_file:
+            return [node_id for node_id in cache_file.readlines() if node_id.startswith(incomplete)]
+
+    except Exception:
+        return []
+
+
+def installed_pack_completer(incomplete: str) -> list[str]:
+    """Complete against *installed pack directory names*.
+
+    Deliberately not ``node_completer``: that one serves the registry node-id
+    cache, and a git-cloned pack's directory name is its repo name, not its
+    registry id. ``scalify node deps`` matches on directory name.
+    """
+    try:
+        from scalify_cli.command.pack_scan import iter_pack_dirs
+
+        workspace = workspace_manager.workspace_path
+        if not workspace:
+            return []
+        return [
+            p.name for p in iter_pack_dirs(pathlib.Path(workspace) / "custom_nodes") if p.name.startswith(incomplete)
+        ]
+    except Exception:
+        return []
+
+
+def node_or_all_completer(incomplete: str) -> list[str]:
+    try:
+        config_manager = ConfigManager()
+        tmp_path = os.path.join(config_manager.get_config_path(), "tmp", "node-cache.list")
+
+        all_opt = []
+        if "all".startswith(incomplete):
+            all_opt = ["all"]
+
+        with open(tmp_path, encoding="UTF-8", errors="ignore") as cache_file:
+            return [node_id for node_id in cache_file.readlines() if node_id.startswith(incomplete)] + all_opt
+
+    except Exception:
+        return []
+
+
+def validate_mode(mode):
+    valid_modes = ["remote", "local", "cache"]
+    if mode and mode.lower() not in valid_modes:
+        typer.echo(
+            f"Invalid mode: {mode}. Allowed modes are 'remote', 'local', 'cache'.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
+@app.command(help="Show node list")
+@tracking.track_command("node")
+def show(
+    arg: ShowTarget = typer.Argument(
+        help="Target to display",
+    ),
+    channel: Annotated[
+        str | None,
+        typer.Option(
+            show_default=False,
+            help="Specify the operation mode",
+            autocompletion=channel_completer,
+        ),
+    ] = None,
+    mode: str = typer.Option(
+        None,
+        help="\\[remote|local|cache]",
+        autocompletion=mode_completer,
+    ),
+):
+    validate_mode(mode)
+
+    execute_cm_cli(["show", arg.value], channel=channel, mode=mode)
+
+
+@app.command("simple-show", help="Show node list (simple mode)")
+@tracking.track_command("node")
+def simple_show(
+    arg: ShowTarget = typer.Argument(
+        help="Target to display",
+    ),
+    channel: Annotated[
+        str | None,
+        typer.Option(
+            show_default=False,
+            help="Specify the operation mode",
+            autocompletion=channel_completer,
+        ),
+    ] = None,
+    mode: str = typer.Option(
+        None,
+        help="\\[remote|local|cache]",
+        autocompletion=mode_completer,
+    ),
+):
+    validate_mode(mode)
+
+    execute_cm_cli(["simple-show", arg.value], channel=channel, mode=mode)
+
+
+# install, reinstall, uninstall
+@app.command(help="Install custom nodes")
+@tracking.track_command("node")
+def install(
+    nodes: list[str] = typer.Argument(..., help="List of custom nodes to install", autocompletion=node_completer),
+    channel: Annotated[
+        str | None,
+        typer.Option(
+            show_default=False,
+            help="Specify the operation mode",
+            autocompletion=channel_completer,
+        ),
+    ] = None,
+    fast_deps: Annotated[
+        bool,
+        typer.Option(
+            "--fast-deps",
+            show_default=False,
+            help="Use new fast dependency installer",
+        ),
+    ] = False,
+    no_deps: Annotated[
+        bool,
+        typer.Option(
+            "--no-deps",
+            show_default=False,
+            help="Skip dependency installation",
+        ),
+    ] = False,
+    uv_compile: Annotated[
+        bool | None,
+        typer.Option(
+            "--uv-compile/--no-uv-compile",
+            show_default=False,
+            help="After installing, batch-resolve all dependencies via uv pip compile (requires ScalifyUI-Manager v4.1+)",
+        ),
+    ] = None,
+    exit_on_fail: Annotated[
+        bool,
+        typer.Option(
+            "--exit-on-fail",
+            help="Exit on failure",
+        ),
+    ] = False,
+    mode: str = typer.Option(
+        None,
+        help="\\[remote|local|cache]",
+        autocompletion=mode_completer,
+    ),
+):
+    if "all" in nodes:
+        typer.echo("`install all` is not allowed", err=True)
+        raise typer.Exit(code=1)
+
+    exclusive_flags = [
+        name for name, val in [("--fast-deps", fast_deps), ("--no-deps", no_deps), ("--uv-compile", uv_compile)] if val
+    ]
+    if len(exclusive_flags) > 1:
+        typer.echo(f"Cannot use {' and '.join(exclusive_flags)} together", err=True)
+        raise typer.Exit(code=1)
+
+    effective_uv_compile = _resolve_uv_compile(uv_compile, fast_deps=fast_deps, no_deps=no_deps)
+
+    validate_mode(mode)
+
+    if exit_on_fail:
+        cmd = ["install", "--exit-on-fail"] + nodes
+    else:
+        cmd = ["install"] + nodes
+
+    renderer = get_renderer()
+    # execute_cm_cli streams cm-cli's raw output to sys.stdout; in JSON/NDJSON
+    # mode stdout is reserved for the single envelope, so route the stream to
+    # stderr (mirrors pack_scan._read_pyproject and outdated._core_latest).
+    stream_ctx = contextlib.nullcontext() if renderer.is_pretty() else contextlib.redirect_stdout(sys.stderr)
+    try:
+        with stream_ctx:
+            execute_cm_cli(
+                cmd,
+                channel=channel,
+                fast_deps=fast_deps,
+                no_deps=no_deps,
+                uv_compile=effective_uv_compile,
+                mode=mode,
+                raise_on_error=exit_on_fail,
+            )
+    except subprocess.CalledProcessError as e:
+        if not exit_on_fail:
+            # execute_cm_cli re-raises unexpected exit codes even with raise_on_error
+            # off; keep surfacing those instead of swallowing them here (mirrors the
+            # `scalify update all` handler in cmdline.py).
+            raise
+        raw = e.returncode
+        code = normalize_cm_cli_exit_code(raw)
+        failed_argv = e.cmd if isinstance(e.cmd, list | tuple) else [e.cmd]
+        ran_cm_cli = any(str(part).replace("-", "_") == "cm_cli" for part in failed_argv)
+        if fast_deps and not ran_cm_cli:
+            # With --fast-deps, execute_cm_cli runs DependencyCompiler after cm-cli
+            # succeeds; a pip/uv failure there is not a cm-cli failure — the packs
+            # themselves installed.
+            message = (
+                f"dependency installation after `cm-cli install` failed with exit code {raw} "
+                "(the packs installed; their dependencies did not)."
+            )
+            hint = (
+                "see the pip/uv output above for the failing dependency; "
+                "re-run `scalify node install --fast-deps --exit-on-fail ...` to retry"
+            )
+            details = {"returncode": raw, "failed_stage": "dependency-install"}
+        else:
+            if raw < 0:
+                message = f"`cm-cli install` was killed by signal {-raw}."
+            else:
+                message = f"`cm-cli install` failed with exit code {raw}."
+            hint = (
+                "see the cm-cli output above for the failing pack; "
+                "re-run `scalify node install --exit-on-fail ...` to retry"
+            )
+            details = {"cm_cli_returncode": raw, "failed_stage": "cm-cli"}
+        renderer.error(
+            code="node_install_failed",
+            message=message,
+            hint=hint,
+            details=details,
+            exit_code=code,
+            command="node install",
+        )
+        raise typer.Exit(code=code) from e
+
+
+@app.command(help="Reinstall custom nodes")
+@tracking.track_command("node")
+def reinstall(
+    nodes: list[str] = typer.Argument(..., help="List of custom nodes to reinstall", autocompletion=node_completer),
+    channel: Annotated[
+        str | None,
+        typer.Option(
+            show_default=False,
+            help="Specify the operation mode",
+            autocompletion=channel_completer,
+        ),
+    ] = None,
+    fast_deps: Annotated[
+        bool,
+        typer.Option(
+            "--fast-deps",
+            show_default=False,
+            help="Use new fast dependency installer",
+        ),
+    ] = False,
+    uv_compile: Annotated[
+        bool | None,
+        typer.Option(
+            "--uv-compile/--no-uv-compile",
+            show_default=False,
+            help="After reinstalling, batch-resolve all dependencies via uv pip compile (requires ScalifyUI-Manager v4.1+)",
+        ),
+    ] = None,
+    mode: str = typer.Option(
+        None,
+        help="\\[remote|local|cache]",
+        autocompletion=mode_completer,
+    ),
+):
+    if "all" in nodes:
+        typer.echo("`reinstall all` is not allowed", err=True)
+        raise typer.Exit(code=1)
+
+    exclusive_flags = [name for name, val in [("--fast-deps", fast_deps), ("--uv-compile", uv_compile)] if val]
+    if len(exclusive_flags) > 1:
+        typer.echo(f"Cannot use {' and '.join(exclusive_flags)} together", err=True)
+        raise typer.Exit(code=1)
+
+    effective_uv_compile = _resolve_uv_compile(uv_compile, fast_deps=fast_deps)
+
+    validate_mode(mode)
+
+    execute_cm_cli(
+        ["reinstall"] + nodes, channel=channel, fast_deps=fast_deps, uv_compile=effective_uv_compile, mode=mode
+    )
+
+
+@app.command(
+    "uv-sync",
+    help="Batch-resolve and install all custom node dependencies via uv (requires ScalifyUI-Manager v4.1+)",
+)
+@tracking.track_command("node")
+def uv_sync():
+    execute_cm_cli(["uv-sync"])
+
+
+@app.command(help="Uninstall custom nodes")
+@tracking.track_command("node")
+def uninstall(
+    nodes: list[str] = typer.Argument(..., help="List of custom nodes to uninstall", autocompletion=node_completer),
+    channel: Annotated[
+        str | None,
+        typer.Option(
+            show_default=False,
+            help="Specify the operation mode",
+            autocompletion=channel_completer,
+        ),
+    ] = None,
+    mode: str = typer.Option(
+        None,
+        help="\\[remote|local|cache]",
+        autocompletion=mode_completer,
+    ),
+):
+    if "all" in nodes:
+        typer.echo("`uninstall all` is not allowed", err=True)
+        raise typer.Exit(code=1)
+
+    validate_mode(mode)
+
+    execute_cm_cli(["uninstall"] + nodes, channel=channel, mode=mode)
+
+
+def update_node_id_cache():
+    config_manager = ConfigManager()
+    workspace_path = workspace_manager.workspace_path
+
+    if not find_cm_cli():
+        raise FileNotFoundError("cm-cli not found")
+
+    tmp_path = os.path.join(config_manager.get_config_path(), "tmp")
+    if not os.path.exists(tmp_path):
+        os.makedirs(tmp_path)
+
+    cache_path = os.path.join(tmp_path, "node-cache.list")
+    python = resolve_workspace_python(workspace_path)
+    cmd = [python, "-m", "cm_cli", "export-custom-node-ids", cache_path]
+
+    new_env = os.environ.copy()
+    new_env["SCALIFYUI_PATH"] = workspace_path
+    subprocess.run(cmd, env=new_env, check=True)
+
+
+# `update, disable, enable, fix` allows `all` param
+@app.command(help="Update custom nodes or ScalifyUI. To update ScalifyUI itself or the CLI, use `scalify update`.")
+@tracking.track_command("node")
+def update(
+    nodes: list[str] = typer.Argument(
+        ...,
+        help="\\[all|List of custom nodes to update]",
+        autocompletion=node_or_all_completer,
+    ),
+    channel: Annotated[
+        str | None,
+        typer.Option(
+            show_default=False,
+            help="Specify the operation mode",
+            autocompletion=channel_completer,
+        ),
+    ] = None,
+    uv_compile: Annotated[
+        bool | None,
+        typer.Option(
+            "--uv-compile/--no-uv-compile",
+            show_default=False,
+            help="After updating, batch-resolve all dependencies via uv pip compile (requires ScalifyUI-Manager v4.1+)",
+        ),
+    ] = None,
+    mode: str = typer.Option(
+        None,
+        help="\\[remote|local|cache]",
+        autocompletion=mode_completer,
+    ),
+):
+    validate_mode(mode)
+
+    execute_cm_cli(["update"] + nodes, channel=channel, uv_compile=_resolve_uv_compile(uv_compile), mode=mode)
+
+    update_node_id_cache()
+
+
+@app.command(help="Disable custom nodes")
+@tracking.track_command("node")
+def disable(
+    nodes: list[str] = typer.Argument(
+        ...,
+        help="\\[all|List of custom nodes to disable]",
+        autocompletion=node_or_all_completer,
+    ),
+    channel: Annotated[
+        str | None,
+        typer.Option(
+            show_default=False,
+            help="Specify the operation mode",
+            autocompletion=channel_completer,
+        ),
+    ] = None,
+    mode: str = typer.Option(
+        None,
+        help="\\[remote|local|cache]",
+        autocompletion=mode_completer,
+    ),
+):
+    validate_mode(mode)
+
+    execute_cm_cli(["disable"] + nodes, channel=channel, mode=mode)
+
+
+@app.command(help="Enable custom nodes")
+@tracking.track_command("node")
+def enable(
+    nodes: list[str] = typer.Argument(
+        ...,
+        help="\\[all|List of custom nodes to enable]",
+        autocompletion=node_or_all_completer,
+    ),
+    channel: Annotated[
+        str | None,
+        typer.Option(
+            show_default=False,
+            help="Specify the operation mode",
+            autocompletion=channel_completer,
+        ),
+    ] = None,
+    mode: str = typer.Option(
+        None,
+        help="\\[remote|local|cache]",
+        autocompletion=mode_completer,
+    ),
+):
+    validate_mode(mode)
+
+    execute_cm_cli(["enable"] + nodes, channel=channel, mode=mode)
+
+
+@app.command(help="Fix dependencies of custom nodes")
+@tracking.track_command("node")
+def fix(
+    nodes: list[str] = typer.Argument(
+        ...,
+        help="\\[all|List of custom nodes to fix]",
+        autocompletion=node_or_all_completer,
+    ),
+    channel: Annotated[
+        str | None,
+        typer.Option(
+            show_default=False,
+            help="Specify the operation mode",
+            autocompletion=channel_completer,
+        ),
+    ] = None,
+    uv_compile: Annotated[
+        bool | None,
+        typer.Option(
+            "--uv-compile/--no-uv-compile",
+            show_default=False,
+            help="After fixing, batch-resolve all dependencies via uv pip compile (requires ScalifyUI-Manager v4.1+)",
+        ),
+    ] = None,
+    mode: str = typer.Option(
+        None,
+        help="\\[remote|local|cache]",
+        autocompletion=mode_completer,
+    ),
+):
+    validate_mode(mode)
+
+    execute_cm_cli(["fix"] + nodes, channel=channel, uv_compile=_resolve_uv_compile(uv_compile), mode=mode)
+
+
+@app.command(
+    "install-deps",
+    help="Install dependencies from dependencies file(.json) or workflow(.png/.json)",
+)
+@tracking.track_command("node")
+def install_deps(
+    deps: Annotated[
+        str | None,
+        typer.Option(show_default=False, help="Dependency spec file (.json)"),
+    ] = None,
+    workflow: Annotated[
+        str | None,
+        typer.Option(show_default=False, help="Workflow file (.json/.png)"),
+    ] = None,
+    channel: Annotated[
+        str | None,
+        typer.Option(
+            show_default=False,
+            help="Specify the operation mode",
+            autocompletion=channel_completer,
+        ),
+    ] = None,
+    uv_compile: Annotated[
+        bool | None,
+        typer.Option(
+            "--uv-compile/--no-uv-compile",
+            show_default=False,
+            help="After installing, batch-resolve all dependencies via uv pip compile (requires ScalifyUI-Manager v4.1+)",
+        ),
+    ] = None,
+    mode: str = typer.Option(
+        None,
+        help="\\[remote|local|cache]",
+        autocompletion=mode_completer,
+    ),
+):
+    validate_mode(mode)
+
+    if deps is None and workflow is None:
+        print("[bold red]One of --deps or --workflow must be provided as an argument.[/bold red]\n")
+
+    effective_uv_compile = _resolve_uv_compile(uv_compile)
+
+    tmp_path = None
+    if workflow is not None:
+        workflow = os.path.abspath(os.path.expanduser(workflow))
+        tmp_path = os.path.join(workspace_manager.config_manager.get_config_path(), "tmp")
+        if not os.path.exists(tmp_path):
+            os.makedirs(tmp_path)
+        tmp_path = os.path.join(tmp_path, str(uuid.uuid4())) + ".json"
+
+        execute_cm_cli(
+            ["deps-in-workflow", "--workflow", workflow, "--output", tmp_path],
+            channel,
+            mode=mode,
+        )
+
+        deps_file = tmp_path
+    else:
+        deps_file = os.path.abspath(os.path.expanduser(deps))
+
+    execute_cm_cli(["install-deps", deps_file], channel=channel, uv_compile=effective_uv_compile, mode=mode)
+
+    if tmp_path is not None and os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
+
+@app.command("deps-in-workflow", help="Generate dependencies file from workflow (.json/.png)")
+@tracking.track_command("node")
+def deps_in_workflow(
+    workflow: Annotated[str, typer.Option(show_default=False, help="Workflow file (.json/.png)")],
+    output: Annotated[str, typer.Option(show_default=False, help="Output file (.json)")],
+    channel: Annotated[
+        str | None,
+        typer.Option(
+            show_default=False,
+            help="Specify the operation mode",
+            autocompletion=channel_completer,
+        ),
+    ] = None,
+    mode: str = typer.Option(
+        None,
+        help="\\[remote|local|cache]",
+        autocompletion=mode_completer,
+    ),
+):
+    validate_mode(mode)
+
+    workflow = os.path.abspath(os.path.expanduser(workflow))
+    output = os.path.abspath(os.path.expanduser(output))
+
+    execute_cm_cli(
+        ["deps-in-workflow", "--workflow", workflow, "--output", output],
+        channel,
+        mode=mode,
+    )
+
+
+@app.command(
+    "deps",
+    help="Report each pack's declared Python requirements vs the versions installed in the workspace venv (read-only).",
+)
+@tracking.track_command("node")
+def deps(
+    pack_names: Annotated[
+        list[str] | None,
+        typer.Argument(
+            show_default=False,
+            help="Pack directory names to report on (case-insensitive). Omit to report every installed pack.",
+            autocompletion=installed_pack_completer,
+        ),
+    ] = None,
+    registry: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--registry",
+            show_default=False,
+            help=(
+                "Registry node id of a NOT-yet-installed pack to include, so its declared dependencies can be "
+                "checked for conflicts before installing. Repeatable, and additive with the pack names above. "
+                "Always reports the pack's LATEST published version: the registry exposes no read-only endpoint "
+                "for a pinned version's dependencies. Installs nothing."
+            ),
+            autocompletion=node_completer,
+        ),
+    ] = None,
+    refresh: Annotated[
+        bool,
+        typer.Option(
+            "--refresh",
+            help="Bypass the 1h cache of registry lookups (only affects --registry).",
+        ),
+    ] = False,
+):
+    # Native + read-only on purpose: no cm-cli, no pip install, and no network
+    # at all unless --registry is passed (a side-effect-free GET /nodes/{id}) —
+    # so it works on a workspace that never installed ScalifyUI-Manager.
+    from scalify_cli.command import node_deps
+
+    node_deps.execute(
+        get_renderer(),
+        workspace_manager.workspace_path,
+        pack_names,
+        registry_ids=registry,
+        refresh=refresh,
+    )
+
+
+def validate_node_for_publishing():
+    """
+    Validates node configuration and runs security checks.
+    Returns the validated config if successful, raises typer.Exit if validation fails.
+    """
+    # Perform some validation logic here
+    typer.echo("Validating node configuration...")
+    config = extract_node_configuration()
+    if config is None:
+        raise typer.Exit(code=1)
+
+    if not config.project.version:
+        # Escape `[` chars so rich doesn't parse `[tool.scalify.version]` and
+        # `["version"]` as markup tags; `]` doesn't need escaping.
+        print(
+            "[red]Error: project version is empty. Set `project.version` in pyproject.toml, "
+            r'or configure `\[tool.scalify.version].path` if using `dynamic = \["version"]`.[/red]'
+        )
+        raise typer.Exit(code=1)
+
+    # Run security checks first
+    typer.echo("Running security checks...")
+    try:
+        # Run ruff check with security rules and --exit-zero to only warn
+        cmd = [sys.executable, "-m", "ruff", "check", ".", "-q", "--select", "S102,S307,E702", "--exit-zero"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.stdout:
+            print("[yellow]Security warnings found:[/yellow]")
+            print(result.stdout)
+            print(
+                "[bold yellow]We will soon disable exec and eval, and multiple statements in a single line, so this will be an error soon.[/bold yellow]"
+            )
+        else:
+            print("[green]✓ All validation checks passed successfully[/green]")
+
+    except FileNotFoundError:
+        print("[red]Ruff is not installed. Please install it with 'pip install ruff'[/red]")
+        raise typer.Exit(code=1)
+    except Exception as e:
+        print(f"[red]Error running security check: {e}[/red]")
+        raise typer.Exit(code=1)
+
+    return config
+
+
+@app.command("validate", help="Validate this custom node for registry publishing")
+@tracking.track_command("publish")
+def validate():
+    """
+    Run validation checks that would be performed during publishing.
+    """
+    validate_node_for_publishing()
+
+
+def resolve_publish_changelog(changelog: str | None, changelog_file: str | None) -> str:
+    """
+    Resolve the changelog text from --changelog, --changelog-file, or SCALIFY_NODE_CHANGELOG.
+
+    `--changelog-file -` reads stdin. The env var is read manually (not via the
+    option's `envvar`) so that either explicit flag overrides it and the two
+    flags only conflict when both are actually passed on the command line.
+    """
+    if changelog is not None and changelog_file is not None:
+        print("[red]Error: --changelog and --changelog-file are mutually exclusive.[/red]")
+        raise typer.Exit(code=1)
+
+    if changelog is not None:
+        return changelog.strip()
+
+    if changelog_file is None:
+        return os.environ.get("SCALIFY_NODE_CHANGELOG", "").strip()
+
+    if changelog_file == "-":
+        try:
+            return sys.stdin.buffer.read().decode("utf-8-sig").strip()
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"[red]Error: could not read changelog from stdin: {e}[/red]")
+            raise typer.Exit(code=1)
+
+    try:
+        # `utf-8-sig` strips a leading BOM, mirroring pyproject.toml parsing.
+        with open(changelog_file, encoding="utf-8-sig") as f:
+            return f.read().strip()
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"[red]Error: could not read changelog file `{changelog_file}`: {e}[/red]")
+        raise typer.Exit(code=1)
+
+
+@app.command("publish", help="Publish node to registry")
+@tracking.track_command("publish")
+def publish(
+    token: str | None = typer.Option(None, "--token", help="Personal Access Token for publishing", hide_input=True),
+    changelog: str | None = typer.Option(
+        None,
+        "--changelog",
+        help="Changelog text for this version, shown in the registry's Updates section "
+        "(env var: SCALIFY_NODE_CHANGELOG).",
+    ),
+    changelog_file: str | None = typer.Option(
+        None,
+        "--changelog-file",
+        help="Read the changelog for this version from a file; use '-' to read stdin. "
+        "Mutually exclusive with --changelog.",
+    ),
+):
+    """
+    Publish a node with optional validation.
+    """
+    if changelog_file == "-" and not token:
+        print(
+            "[red]Error: reading the changelog from stdin requires --token "
+            "(the API-key prompt cannot read from stdin).[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    changelog_text = resolve_publish_changelog(changelog, changelog_file)
+
+    config = validate_node_for_publishing()
+
+    # Prompt for API Key
+    if not token:
+        token = typer.prompt(
+            "Please enter your API Key (can be created on https://registry.scalify.khulnasoft.com)",
+            hide_input=True,
+        )
+
+    # Call API to fetch node version with the token in the body
+    typer.echo("Publishing node version...")
+    try:
+        response = registry_api.publish_node_version(config, token, changelog=changelog_text)
+        if changelog_text and (response.node_version.changelog or "").strip() != changelog_text:
+            print(
+                "[yellow]Warning: the registry did not echo the changelog back; "
+                "the Updates section may not show it for this version.[/yellow]"
+            )
+        # Zip up all files in the current directory, respecting .gitignore files.
+        signed_url = response.signedUrl
+        zip_filename = NODE_ZIP_FILENAME
+        typer.echo("Creating zip file...")
+
+        includes = config.tool_scalify.includes if config and config.tool_scalify else []
+
+        if includes:
+            typer.echo(f"Including additional directories: {', '.join(includes)}")
+
+        zip_files(zip_filename, includes=includes)
+
+        # Upload the zip file to the signed URL
+        typer.echo("Uploading zip file...")
+        upload_file_to_signed_url(signed_url, zip_filename)
+    except RegistryAPIError as e:
+        get_renderer().error(
+            code="node_publish_failed",
+            message=str(e),
+            details={"status": e.status, "body": e.body},
+        )
+        raise typer.Exit(code=1) from e
+    except Exception as e:
+        ui.display_error_message(str(e))
+        raise typer.Exit(code=1)
+
+
+@app.command("init", help="Init scaffolding for custom node")
+@tracking.track_command("node")
+def scaffold():
+    if os.path.exists("pyproject.toml"):
+        typer.echo("Warning: 'pyproject.toml' already exists. Will not overwrite.")
+        raise typer.Exit(code=1)
+
+    typer.echo("Initializing metadata...")
+    initialize_project_config()
+    typer.echo("pyproject.toml created successfully. Defaults were filled in. Please check before publishing.")
+
+
+@app.command("registry-list", help="List all nodes in the registry", hidden=True)
+@tracking.track_command("node")
+def display_all_nodes():
+    """
+    Display all nodes in the registry.
+    """
+
+    try:
+        nodes = registry_api.list_all_nodes()
+    except Exception as e:
+        logging.error(f"Failed to fetch nodes from the registry: {str(e)}")
+        ui.display_error_message("Failed to fetch nodes from the registry.")
+        return
+
+    # Map Node data class instances to tuples for display
+    node_data = [
+        (
+            node.id,
+            node.name,
+            node.description,
+            node.author or "N/A",
+            node.license or "N/A",
+            ", ".join(node.tags),
+            node.latest_version.version if node.latest_version else "N/A",
+        )
+        for node in nodes
+    ]
+    ui.display_table(
+        node_data,
+        [
+            "ID",
+            "Name",
+            "Description",
+            "Author",
+            "License",
+            "Tags",
+            "Latest Version",
+        ],
+        title="List of All Nodes",
+    )
+
+
+@app.command(
+    "registry-install",
+    help="Install a node from the registry",
+    hidden=True,
+)
+@tracking.track_command("node")
+def registry_install(
+    node_id: str,
+    version: str | None = None,
+    force_download: Annotated[
+        bool,
+        typer.Option(
+            "--force-download",
+            help="Force download the node even if it is already installed",
+        ),
+    ] = False,
+):
+    """
+    Install a node from the registry.
+    Args:
+      node_id: The ID of the node to install.
+      version: The version of the node to install. If not provided, the latest version will be installed.
+    """
+
+    # If the node ID is not provided, prompt the user to enter it
+    if not node_id:
+        node_id = typer.prompt("Enter the ID of the node you want to install")
+
+    node_version = None
+    try:
+        # Call the API to install the node
+        node_version = registry_api.install_node(node_id, version)
+    except RegistryAPIError as e:
+        logging.error(f"Encountered an error while installing the node. error: {str(e)}")
+        get_renderer().error(
+            code="registry_install_failed",
+            message=f"Failed to download the custom node {node_id}.",
+            details={"node_id": node_id, "status": e.status, "body": e.body},
+        )
+        raise typer.Exit(code=1) from e
+    except Exception as e:
+        logging.error(f"Encountered an error while installing the node. error: {str(e)}")
+        get_renderer().error(
+            code="registry_install_failed",
+            message=f"Failed to download the custom node {node_id}.",
+            details={"node_id": node_id},
+        )
+        raise typer.Exit(code=1) from e
+
+    # Checked outside the try: typer.Exit subclasses Exception, so raising it
+    # above would be swallowed by the broad handler and emit a second envelope.
+    if not node_version.download_url:
+        logging.error("Download URL not provided from the registry.")
+        get_renderer().error(
+            code="registry_install_failed",
+            message=f"Failed to download the custom node {node_id}.",
+            details={"node_id": node_id},
+        )
+        raise typer.Exit(code=1)
+
+    # Download the node archive
+    custom_nodes_path = pathlib.Path(workspace_manager.workspace_path) / "custom_nodes"
+    node_specific_path = custom_nodes_path / node_id  # Subdirectory for the node
+    if node_specific_path.exists():
+        print(
+            f"[bold red] The node {node_id} already exists in the workspace. This might delete any model files in the node.[/bold red]"
+        )
+
+        confirm = ui.prompt_confirm_action(
+            "Do you want to overwrite it?",
+            force_download,
+        )
+        if not confirm:
+            return
+    node_specific_path.mkdir(parents=True, exist_ok=True)  # Create the directory if it doesn't exist
+
+    local_filename = node_specific_path / f"{node_id}-{node_version.version}.zip"
+    logging.debug(f"Start downloading the node {node_id} version {node_version.version} to {local_filename}")
+    try:
+        download_file(node_version.download_url, local_filename)
+    except DownloadException as e:
+        logging.error(f"Failed to download node {node_id} version {node_version.version}: {e}")
+        ui.display_error_message(f"Failed to download the custom node {node_id}: {e}")
+        raise typer.Exit(code=1) from None
+
+    # Extract the downloaded archive to the custom_node directory on the workspace.
+    logging.debug(f"Start extracting the node {node_id} version {node_version.version} to {custom_nodes_path}")
+    extract_package_as_zip(local_filename, node_specific_path)
+
+    # TODO: temoporary solution to run requirement.txt and install script
+    execute_install_script(node_specific_path)
+
+    # Delete the downloaded archive
+    logging.debug(f"Deleting the downloaded archive {local_filename}")
+    os.remove(local_filename)
+
+    logging.info(f"Node {node_id} version {node_version.version} has been successfully installed.")
+
+
+@app.command(
+    "pack",
+    help="Pack the current node into a zip file using git-tracked files and honoring .scalifyignore patterns.",
+)
+@tracking.track_command("pack")
+def pack():
+    typer.echo("Validating node configuration...")
+    config = extract_node_configuration()
+    if not config:
+        raise typer.Exit(code=1)
+
+    zip_filename = NODE_ZIP_FILENAME
+    includes = config.tool_scalify.includes if config and config.tool_scalify else []
+
+    if includes:
+        typer.echo(f"Including additional directories: {', '.join(includes)}")
+
+    try:
+        zip_files(zip_filename, includes=includes)
+    except BinaryNotFoundError as e:
+        # git was found and refused; packing anyway would sweep in untracked and
+        # gitignored files. Abort with the reason rather than a traceback.
+        ui.display_error_message(str(e))
+        raise typer.Exit(code=1) from None
+
+    typer.echo(f"Created zip file: {NODE_ZIP_FILENAME}")
+    logging.info("Node has been packed successfully.")
+
+
+@app.command("scaffold", help="Create a new ScalifyUI custom node project using cookiecutter")
+@tracking.track_command("node")
+def scaffold_cookiecutter():
+    """Create a new ScalifyUI custom node project using cookiecutter."""
+    import cookiecutter.main
+
+    try:
+        cookiecutter.main.cookiecutter(
+            "gh:khulnasoft/cookiecutter-scalify-extension",
+            overwrite_if_exists=True,
+        )
+        console.print("[bold green]✓ Custom node project created successfully![/bold green]")
+    except Exception as e:
+        console.print(f"[bold red]Error creating project: {str(e)}[/bold red]")
+        raise typer.Exit(code=1)

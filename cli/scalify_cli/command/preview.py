@@ -1,0 +1,323 @@
+"""``scalify preview`` — turn a media file into a previewable image.
+
+Creative work is visual: an agent steers the user by showing the result, not by
+describing a path (see the ``scalify-relay`` skill). But a clip can't render in a
+chat and a long video buries its arc. This command produces a single PNG an
+agent (or human) can open/``Read`` immediately:
+
+* **image** → a width-bounded thumbnail,
+* **video** → a contact sheet (a grid of frames across the whole timeline),
+* **audio** → a waveform image (so you can *see* the dynamics you can't hear).
+
+Pure helpers (:func:`classify_streams`, :func:`build_preview_cmd`) are I/O-free
+and unit-tested; the Typer shell runs ffprobe/ffmpeg and renders the envelope.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+from typing import Annotated, Any
+
+import typer
+
+from scalify_cli import tracking
+from scalify_cli._safe_exec import BinaryNotFoundError, resolve_required_binary
+from scalify_cli.output import get_renderer, rprint
+
+_IMAGE_FORMAT_HINTS = ("_pipe", "image2", "png", "jpeg", "mjpeg", "gif", "webp", "bmp", "apng")
+
+# Both spawns capture output, so an ffmpeg/ffprobe that never exits on a corrupt
+# or crafted file would hang `scalify preview` forever while buffering. Bounded for
+# the same reason the sibling previewer in ``scalify_cli.output.preview`` is, with
+# a larger budget: that one grabs a single thumbnail frame, this one renders a
+# whole contact sheet or waveform.
+_PROBE_TIMEOUT_SECONDS = 30
+_RENDER_TIMEOUT_SECONDS = 120
+
+
+def _to_float(v: Any) -> float | None:
+    try:
+        f = float(v)
+        return f if f == f else None  # drop NaN
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(v: Any) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_fps(rate: Any) -> float | None:
+    """``"30/1"`` → 30.0; ``"0/0"`` / junk → None."""
+    if not isinstance(rate, str) or "/" not in rate:
+        return _to_float(rate)
+    num, _, den = rate.partition("/")
+    n, d = _to_float(num), _to_float(den)
+    if n is None or not d:
+        return None
+    return n / d
+
+
+def _is_image_format(format_name: str) -> bool:
+    fn = (format_name or "").lower()
+    return any(h in fn for h in _IMAGE_FORMAT_HINTS)
+
+
+def classify_streams(probe: dict) -> dict:
+    """Classify an ffprobe ``-show_streams -show_format`` JSON dict.
+
+    Returns ``{kind, width, height, fps, duration, has_audio}`` where ``kind`` is
+    ``"image" | "video" | "audio" | "unknown"``.
+    """
+    streams = probe.get("streams") or []
+    fmt = probe.get("format") or {}
+    vstreams = [s for s in streams if s.get("codec_type") == "video"]
+    astreams = [s for s in streams if s.get("codec_type") == "audio"]
+    duration = _to_float(fmt.get("duration"))
+    has_audio = bool(astreams)
+
+    if vstreams:
+        v = vstreams[0]
+        fps = _parse_fps(v.get("avg_frame_rate") or v.get("r_frame_rate"))
+        nb = _to_int(v.get("nb_frames"))
+        # A single frame, no real timeline, or an image container = a still.
+        is_image = nb == 1 or duration is None or fps is None or _is_image_format(fmt.get("format_name", ""))
+        return {
+            "kind": "image" if is_image else "video",
+            "width": _to_int(v.get("width")),
+            "height": _to_int(v.get("height")),
+            "fps": fps,
+            "duration": duration,
+            "has_audio": has_audio,
+        }
+    if astreams:
+        return {"kind": "audio", "width": None, "height": None, "fps": None, "duration": duration, "has_audio": True}
+    return {"kind": "unknown", "width": None, "height": None, "fps": None, "duration": duration, "has_audio": has_audio}
+
+
+def build_preview_cmd(
+    kind: str,
+    input_path: str,
+    out_path: str,
+    *,
+    grid: tuple[int, int],
+    width: int,
+    duration: float | None,
+    ffmpeg_bin: str,
+) -> list[str]:
+    """Build the ffmpeg argv for a preview of ``kind``. I/O-free.
+
+    ``ffmpeg_bin`` is the trusted absolute path from
+    :func:`scalify_cli._safe_exec.resolve_required_binary`; it is a *required*
+    keyword rather than one defaulting to ``"ffmpeg"`` so no caller can
+    reintroduce the bare-name spawn this argument exists to prevent.
+    """
+    base = [ffmpeg_bin, "-v", "error", "-y", "-i", input_path]
+    if kind == "video":
+        cols, rows = grid
+        n = max(1, cols * rows)
+        d = duration if duration and duration > 0 else 1.0
+        vf = f"fps={n}/{d:.4f},scale={width}:-1,tile={cols}x{rows}"
+        return base + ["-frames:v", "1", "-vf", vf, out_path]
+    if kind == "audio":
+        h = max(160, width // 3)
+        return base + ["-filter_complex", f"showwavespic=s={width}x{h}:colors=cyan", "-frames:v", "1", out_path]
+    # image (and unknown-but-has-a-frame): a width-bounded thumbnail
+    return base + ["-frames:v", "1", "-vf", f"scale='min({width},iw)':-1", out_path]
+
+
+def _ffprobe(path: Path, ffprobe_bin: str) -> dict:
+    try:
+        proc = subprocess.run(
+            [ffprobe_bin, "-v", "error", "-print_format", "json", "-show_streams", "-show_format", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=_PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"ffprobe timed out after {_PROBE_TIMEOUT_SECONDS}s") from exc
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "ffprobe failed")
+    return json.loads(proc.stdout or "{}")
+
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"}
+_AUDIO_EXTS = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
+_VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".flv", ".wmv", ".mpg", ".mpeg", ".ts", ".mts", ".3gp"}
+
+
+def _bundled_ffmpeg() -> str | None:
+    """The static ffmpeg bundled with imageio-ffmpeg, if that package is installed.
+
+    PATH resolution (and the CWD-planting refusal) is
+    :func:`scalify_cli._safe_exec.resolve_required_binary`'s job; this is only the
+    fallback for a box with no system ffmpeg, which is what `pip install
+    imageio-ffmpeg` exists to provide. The path comes from an installed
+    distribution rather than a PATH/CWD search, so it is not subject to the
+    planting attack the guard defends against.
+    """
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001 — package absent or no bundled build for this platform
+        return None
+
+
+def _classify_by_ext(path: Path) -> dict:
+    """Fallback classification when ffprobe is unavailable (e.g. only the
+    imageio-ffmpeg static ffmpeg is present): pick kind from the extension.
+
+    An unrecognized extension is ``"unknown"`` (not blindly ``"video"``) so a
+    non-media file still yields the clean ``preview_unsupported_media`` envelope
+    instead of being handed to ffmpeg and failing with a raw ffmpeg error — the
+    same outcome the ffprobe path produces for a file with no media stream."""
+    ext = path.suffix.lower()
+    if ext in _IMAGE_EXTS:
+        kind = "image"
+    elif ext in _AUDIO_EXTS:
+        kind = "audio"
+    elif ext in _VIDEO_EXTS:
+        kind = "video"
+    else:
+        kind = "unknown"
+    return {"kind": kind, "width": None, "height": None, "fps": None, "duration": None, "has_audio": None}
+
+
+@tracking.track_command("preview")
+def preview_cmd(
+    file: Annotated[Path, typer.Argument(help="Image, video, or audio file to preview.")],
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", "-o", show_default=False, help="Output PNG. Defaults to <file>.preview.png"),
+    ] = None,
+    grid: Annotated[str, typer.Option("--grid", help="Contact-sheet grid for video, COLSxROWS.")] = "4x3",
+    width: Annotated[int, typer.Option("--width", help="Preview width in pixels.")] = 480,
+):
+    """Render a previewable PNG from a media file (image → thumb, video → contact
+    sheet, audio → waveform) so the result can be shown, not just described."""
+    renderer = get_renderer()
+    if not file.is_file():
+        renderer.error(code="preview_input_not_found", message=f"File not found: {file}", hint="check the path")
+        raise typer.Exit(code=1)
+    # One resolution pass doubles as the presence check: both binaries are looked
+    # up once, to trusted absolute paths that are reused for every spawn below.
+    # A CWD-anchored match is refused, so running ``scalify preview`` from a
+    # directory holding a planted ``ffmpeg.exe`` reports it as unavailable rather
+    # than executing it.
+    try:
+        ffmpeg_bin = resolve_required_binary("ffmpeg")
+    except BinaryNotFoundError as exc:
+        # Absent from PATH: fall back to imageio-ffmpeg's bundled build before
+        # giving up. An UNTRUSTED match still errors — falling back there would
+        # let a planted binary downgrade us into a different code path.
+        ffmpeg_bin = _bundled_ffmpeg() if exc.is_absent else None
+        if ffmpeg_bin is None and exc.is_absent:
+            renderer.error(
+                code="ffmpeg_unavailable",
+                message="ffmpeg not found on PATH — `scalify preview` needs it to render.",
+                hint="install ffmpeg (`brew install ffmpeg` / `apt install ffmpeg`) or `pip install imageio-ffmpeg`",
+            )
+        else:
+            # Installed, but the match was refused. Saying "install ffmpeg" here
+            # would send a user who already has it down the wrong path *and* bury
+            # the interesting part: something named ffmpeg is sitting in the
+            # directory they ran from.
+            renderer.error(
+                code="ffmpeg_untrusted",
+                message=str(exc),
+                hint="run `scalify preview` from a directory that does not contain an ffmpeg/ffprobe binary",
+            )
+        if ffmpeg_bin is None:
+            raise typer.Exit(code=1) from None
+
+    # ffprobe is OPTIONAL: the imageio-ffmpeg static build ships ffmpeg without
+    # it. Resolve it under the same trust rule — an untrusted match is still
+    # refused, because falling back there would defeat the planting guard — but a
+    # genuinely absent ffprobe degrades to extension classification and still
+    # renders, which is what the pip-installed path depends on.
+    try:
+        ffprobe_bin = resolve_required_binary("ffprobe")
+    except BinaryNotFoundError as exc:
+        if not exc.is_absent:
+            renderer.error(
+                code="ffmpeg_untrusted",
+                message=str(exc),
+                hint="run `scalify preview` from a directory that does not contain an ffmpeg/ffprobe binary",
+            )
+            raise typer.Exit(code=1) from None
+        ffprobe_bin = None
+
+    if ffprobe_bin:
+        try:
+            info = classify_streams(_ffprobe(file, ffprobe_bin))
+        except (RuntimeError, json.JSONDecodeError) as e:
+            renderer.error(code="preview_failed", message=f"Could not probe {file}: {e}")
+            raise typer.Exit(code=1) from e
+    else:
+        info = _classify_by_ext(file)
+
+    if info["kind"] == "unknown":
+        renderer.error(
+            code="preview_unsupported_media",
+            message=f"{file} has no image/video/audio stream to preview.",
+            hint="pass an image, video, or audio file",
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        cols, rows = (int(x) for x in grid.lower().split("x", 1))
+    except ValueError:
+        renderer.error(code="preview_failed", message=f"--grid must be COLSxROWS (got {grid!r})", hint="e.g. 4x3")
+        raise typer.Exit(code=1)
+
+    out_path = out or (file.parent / f"{file.stem}.preview.png")
+    cmd = build_preview_cmd(
+        info["kind"],
+        str(file),
+        str(out_path),
+        grid=(cols, rows),
+        width=width,
+        duration=info["duration"],
+        ffmpeg_bin=ffmpeg_bin,
+    )
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_RENDER_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        renderer.error(
+            code="preview_failed",
+            message=f"ffmpeg did not finish within {_RENDER_TIMEOUT_SECONDS}s.",
+            hint="check the file isn't corrupt; try a smaller --grid/--width",
+        )
+        raise typer.Exit(code=1) from None
+    if proc.returncode != 0 or not out_path.is_file():
+        renderer.error(
+            code="preview_failed",
+            message=f"ffmpeg could not render a preview: {proc.stderr.strip()[:300]}",
+            hint="check the file isn't corrupt; try a different --grid/--width",
+        )
+        raise typer.Exit(code=1)
+
+    payload = {
+        "input": str(file),
+        "kind": info["kind"],
+        "preview": str(out_path),
+        "width": info["width"],
+        "height": info["height"],
+        "duration": info["duration"],
+        "fps": info["fps"],
+        "has_audio": info["has_audio"],
+        "hint": f"open/Read {out_path} to see it"
+        + ("" if info["kind"] == "image" else " (a contact sheet across the timeline)"),
+    }
+    if renderer.is_pretty():
+        rprint(f"[green]✓[/green] {info['kind']} preview → [bold]{out_path}[/bold]")
+        if info["kind"] != "image":
+            dur = f"{info['duration']:.1f}s" if info["duration"] else "?"
+            rprint(f"  duration: {dur}   audio: {'yes' if info['has_audio'] else 'no'}")
+    renderer.emit(payload, command="preview")

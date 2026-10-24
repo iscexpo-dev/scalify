@@ -1,0 +1,169 @@
+"""Regression tests for `scalify launch --background`.
+
+Guards against the Python 3.14 crash where `asyncio.get_event_loop()` raised
+`RuntimeError: There is no current event loop in thread 'MainThread'` because
+implicit main-thread loop creation was removed. `background_launch` now uses
+`asyncio.run(...)`, which works identically on 3.10-3.14+.
+"""
+
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from scalify_cli.caller import Caller
+from scalify_cli.command import launch
+from scalify_cli.output.renderer import (
+    OutputMode,
+    Renderer,
+    reset_renderer_for_testing,
+    set_renderer,
+)
+
+
+@pytest.fixture
+def pretty_renderer():
+    """Pin PRETTY mode: under pytest stdout is not a TTY, so the default
+    resolution would pick JSON and never render the failure Panel at all."""
+    reset_renderer_for_testing()
+    r = Renderer.resolve(
+        is_stdout_tty=True,
+        env={},
+        caller=Caller(kind="user", agentic=False, source_env=None),
+    )
+    r.mode = OutputMode.PRETTY
+    set_renderer(r)
+    yield r
+    reset_renderer_for_testing()
+
+
+@patch("scalify_cli.command.launch.os._exit")
+@patch("scalify_cli.command.launch.launch_and_monitor", new_callable=AsyncMock)
+@patch("scalify_cli.command.launch.check_scalify_server_running", return_value=False)
+@patch("scalify_cli.command.launch.ConfigManager")
+def test_background_launch_drives_coroutine_without_event_loop_error(
+    mock_config_manager, mock_check_running, mock_monitor, mock_exit
+):
+    """The background monitor path must run the coroutine without touching
+    the removed `asyncio.get_event_loop()` implicit-loop behavior."""
+    mock_config_manager.return_value.background = None
+    mock_monitor.return_value = None
+
+    # No RuntimeError should escape here on Python 3.14 (or any 3.10+ version),
+    # and the monitor coroutine must actually be awaited.
+    launch.background_launch(extra=[])
+
+    mock_monitor.assert_awaited_once()
+    mock_exit.assert_called_once_with(1)
+
+
+def test_background_launch_does_not_use_deprecated_get_event_loop():
+    """`asyncio.run` is the forward-compatible idiom; `asyncio.get_event_loop`
+    (removed-behavior on 3.14) must not reappear in the launch module."""
+    import inspect
+
+    source = inspect.getsource(launch)
+    assert "asyncio.get_event_loop()" not in source
+    assert "asyncio.run(" in source
+
+
+@patch("scalify_cli.command.launch.os._exit")
+@patch("scalify_cli.command.launch.launch_and_monitor", new_callable=AsyncMock)
+@patch("scalify_cli.command.launch.check_scalify_server_running", return_value=False)
+@patch("scalify_cli.command.launch.ConfigManager")
+def test_background_launch_surfaces_error_log(mock_config_manager, mock_check_running, mock_monitor, mock_exit):
+    """When the monitor returns a failure log, it is rendered and the process
+    exits non-zero."""
+    mock_config_manager.return_value.background = None
+    mock_monitor.return_value = ["boom\n"]
+
+    with patch("scalify_cli.command.launch.print") as mock_print:
+        launch.background_launch(extra=[])
+
+    mock_monitor.assert_awaited_once()
+    assert mock_print.called
+    mock_exit.assert_called_once_with(1)
+
+
+@patch("scalify_cli.command.launch.os._exit")
+@patch("scalify_cli.command.launch.launch_and_monitor", new_callable=AsyncMock)
+@patch("scalify_cli.command.launch.check_scalify_server_running", return_value=False)
+@patch("scalify_cli.command.launch.ConfigManager")
+def test_background_launch_error_panel_neutralizes_log_text(
+    mock_config_manager, mock_check_running, mock_monitor, mock_exit, pretty_renderer, capsys
+):
+    """The failure Panel parses its content as Rich markup, so the captured log
+    goes through `sanitize_markup`: an unbalanced `[/red]` used to raise
+    MarkupError from inside the failure handler (and any other bracketed run was
+    silently deleted), while escape bytes reached the terminal unfiltered."""
+    mock_config_manager.return_value.background = None
+    mock_monitor.return_value = ["[/red] boom\n", "\x1b[2Jerased\n", "[INFO] tail\n"]
+
+    launch.background_launch(extra=[])
+
+    out = capsys.readouterr().out
+    # No MarkupError escaped, and the bracket text is visible rather than eaten.
+    assert "[/red]" in out
+    assert "[INFO]" in out
+    assert "boom" in out
+    assert "erased" in out
+    # ...with nothing the terminal would act on left in the rendered panel.
+    assert "\x1b[2J" not in out
+    mock_exit.assert_called_once_with(1)
+
+
+@patch("scalify_cli.command.launch.os._exit")
+@patch("scalify_cli.command.launch.launch_and_monitor", new_callable=AsyncMock)
+@patch("scalify_cli.command.launch.check_scalify_server_running", return_value=False)
+@patch("scalify_cli.command.launch.ConfigManager")
+def test_background_launch_error_panel_survives_a_stray_escape_introducer(
+    mock_config_manager, mock_check_running, mock_monitor, mock_exit, pretty_renderer, capsys
+):
+    """A crashed process can dump a bare `\\x1b]` into the captured output. The
+    panel exists to show the traceback under it, so the sanitizer bounds that
+    introducer at its line (`sanitize_log_markup`) instead of letting it eat the
+    rest of the capture the way the authored-message `sanitize` does."""
+    mock_config_manager.return_value.background = None
+    mock_monitor.return_value = [
+        "Traceback (most recent call last):\n",
+        "\x1b]0;stray introducer\n",
+        '  File "node.py", line 42\n',
+        "RuntimeError: boom\n",
+    ]
+
+    launch.background_launch(extra=[])
+
+    out = capsys.readouterr().out
+    assert "RuntimeError: boom" in out
+    assert "node.py" in out
+    assert "\x1b]" not in out
+    mock_exit.assert_called_once_with(1)
+
+
+@patch("scalify_cli.command.launch.launch_and_monitor", new_callable=AsyncMock)
+@patch("scalify_cli.command.launch.check_scalify_server_running", return_value=False)
+@patch("scalify_cli.command.launch.ConfigManager")
+def test_background_launch_rejects_non_integer_port(mock_config_manager, mock_check_running, mock_monitor):
+    """A non-integer --port is rejected before it can be interpolated into the
+    log path (`scalifyui_<port>.log`), where a value like `../../x` would escape
+    the workspace."""
+    import typer
+
+    mock_config_manager.return_value.background = None
+
+    with pytest.raises(typer.Exit):
+        launch.background_launch(extra=["--port", "../../etc/pwn"])
+
+    # Never reached the launch path.
+    mock_monitor.assert_not_awaited()
+
+
+@patch("scalify_cli.command.launch.utils.is_running", return_value=True)
+@patch("scalify_cli.command.launch.ConfigManager")
+def test_background_launch_refuses_when_already_running(mock_config_manager, mock_is_running):
+    """A second background launch is rejected before reaching the asyncio path."""
+    import typer
+
+    mock_config_manager.return_value.background = ("127.0.0.1", 8188, 4242)
+
+    with pytest.raises(typer.Exit):
+        launch.background_launch(extra=[])

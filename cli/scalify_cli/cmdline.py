@@ -1,0 +1,3142 @@
+import contextlib
+import contextvars
+import json
+import os
+import re
+import subprocess
+import sys
+import webbrowser
+from collections.abc import Iterator
+from typing import Annotated
+
+import click
+import typer
+from rich.console import Console
+
+from scalify_cli import cancellation, constants, env_checker, logging, tracking, ui, utils
+from scalify_cli import where as where_module
+from scalify_cli._lazy import LazyCommand, LazyModule, LazySubcommand, LazyTyperGroup
+from scalify_cli._safe_exec import resolve_required_binary
+from scalify_cli.caller import stream_is_tty
+from scalify_cli.command.version_validators import validate_optional_version, validate_version
+from scalify_cli.config_manager import ConfigManager
+from scalify_cli.constants import GPU_OPTION, CUDAVersion, ROCmVersion
+from scalify_cli.cuda_detect import DEFAULT_CUDA_TAG, detect_cuda_driver_version, resolve_cuda_wheel
+from scalify_cli.discovery import build_discovery
+from scalify_cli.env_checker import EnvChecker
+from scalify_cli.help_json import build_help_json
+from scalify_cli.host_port import report_usage_error, validate_host
+from scalify_cli.output import Renderer, get_renderer, rprint, set_renderer
+from scalify_cli.resolve_python import resolve_workspace_python
+from scalify_cli.uv import DependencyCompiler, ensure_pip
+from scalify_cli.workspace_manager import WorkspaceManager, check_scalify_repo
+
+# Deferred imports. These modules are only needed inside the command bodies
+# below, and together they were most of the CLI's startup import graph. The
+# proxies keep the flat module-level names so `patch("scalify_cli.cmdline.run_inner.execute")`
+# and friends keep working; see scalify_cli/_lazy.py. Subcommand *groups* are
+# deferred separately via the table at the bottom of this file.
+install_inner = LazyModule("scalify_cli.command.install")
+run_inner = LazyModule("scalify_cli.command.run")
+run_cli_inner = LazyModule("scalify_cli.command.run_cli")
+transfer_inner = LazyModule("scalify_cli.command.transfer")
+custom_nodes = LazyModule("scalify_cli.command.custom_nodes")
+
+logging.setup_logging()
+
+
+def _click_error_is(error: BaseException, name: str) -> bool:
+    """Whether ``error`` is click's ``name`` exception, from either copy of click.
+
+    typer >= 0.24 runs on a vendored click, so ``isinstance`` against the
+    installed ``click`` is false for every exception typer raises and a usage
+    error would leave the ``--json`` stream with no terminating envelope at all.
+    Walking the MRO by class name and owning package covers both copies, and
+    keeps the subclass matching ``isinstance`` gave.
+    """
+    return any(
+        cls.__name__ == name and cls.__module__.partition(".")[0] in ("click", "typer") for cls in type(error).__mro__
+    )
+
+
+def _emit_usage_error_envelope(error: click.UsageError, args: list[str] | None = None) -> None:
+    """Write the terminating ``ok:false`` envelope for a click parse failure.
+
+    Click validates argv before any command body runs, so these never reached a
+    ``renderer.error`` call site and left stdout empty — indistinguishable, to a
+    JSON consumer, from a transport failure. The caller re-raises, so click still
+    prints its panel and still exits 2; only stdout changes.
+
+    The sibling for errors raised *inside* a command body is
+    ``host_port.report_usage_error``.
+    """
+    renderer = get_renderer()
+    if not renderer.is_json():
+        # Click resolves the subcommand BEFORE the root callback runs, so an
+        # unknown command fails while the renderer is still the pretty default.
+        # The root options did parse, so re-run the decision from their values.
+        renderer = Renderer.resolve(version=ConfigManager().get_cli_version(), **_output_flags(error.ctx, args))
+    # Pretty mode already gets click's panel; rendering again would double it.
+    if not renderer.is_json() or renderer._envelope_emitted:
+        return
+    path = _command_path(error.ctx)
+    invocation = f"scalify {path}".strip()
+    details: dict[str, object] = {"command": invocation, "exit_code": error.exit_code}
+    if _click_error_is(error, "NoSuchOption"):
+        details["option"] = error.option_name
+        if error.possibilities:
+            details["did_you_mean"] = list(error.possibilities)
+    renderer.error(
+        code="usage_error",
+        message=error.format_message(),
+        hint=f"run `{invocation} --help` for the accepted arguments and options",
+        details=details,
+        exit_code=error.exit_code,
+        command=path,
+    )
+
+
+def _output_flags(ctx: click.Context | None, args: list[str] | None = None) -> dict[str, bool]:
+    """The root ``--json`` / ``--json-stream`` / ``--no-json`` values, as parsed.
+
+    Read off the root context, not ``sys.argv``, so an in-process caller is
+    answered about ITS arguments. An unknown ROOT option is the exception: it
+    raises inside ``parse_args`` before click binds a parameter, leaving
+    ``ctx.params`` empty, so ``args`` is the only record of what was asked for.
+    """
+    while ctx is not None and ctx.parent is not None:
+        ctx = ctx.parent
+    params = ctx.params if ctx is not None else {}
+    if not params:
+        supplied = args if args is not None else sys.argv[1:]
+        params = {
+            "json_output": "--json" in supplied,
+            "json_stream": "--json-stream" in supplied,
+            "no_json": "--no-json" in supplied,
+        }
+    return {
+        "json_flag": bool(params.get("json_output")),
+        "json_stream_flag": bool(params.get("json_stream")),
+        "no_json_flag": bool(params.get("no_json")),
+    }
+
+
+def _command_path(ctx: click.Context | None) -> str:
+    """The subcommand path, root excluded — ``build release show``.
+
+    Not ``ctx.command_path``: that leads with ``info_name``, which is however the
+    CLI was launched, so it would not match the ``command`` on the success line.
+    """
+    names: list[str] = []
+    while ctx is not None and ctx.parent is not None:
+        if ctx.info_name:
+            names.append(ctx.info_name)
+        ctx = ctx.parent
+    return " ".join(reversed(names))
+
+
+def _emit_internal_error_envelope(error: BaseException, ctx: click.Context | None) -> None:
+    """Write the terminating ``ok:false`` envelope for an exception no command caught.
+
+    `workflow set-widget` could escape with a Python
+    traceback and no envelope. Edit commands catch only ``ValueError``, and
+    nothing above them did anything with the rest. A ``--json`` caller then sees
+    a stack dump and an empty stdout, indistinguishable from a transport failure.
+    The caller re-raises, so the traceback still reaches stderr for debugging
+    and the exit code stays 1. Pretty mode is left exactly as it was.
+    """
+    try:
+        context_command = _command_path(ctx)
+        if not context_command and ctx is not None and ctx.invoked_subcommand:
+            context_command = str(ctx.invoked_subcommand)
+        renderer = get_renderer()
+        if not renderer.is_json():
+            # The root callback installs the renderer, so a crash in it (or
+            # before it) still sees the pretty default. The root flags did
+            # parse, so decide the mode from them. No version lookup: that
+            # lookup is one of the things that can have crashed.
+            renderer = Renderer.resolve(command=context_command, **_output_flags(ctx))
+        if not renderer.is_json() or renderer._envelope_emitted:
+            return
+        command = getattr(renderer, "command", None) or context_command or ""
+        renderer.error(
+            code="internal_error",
+            message=_internal_error_message(error),
+            details={
+                "exception": type(error).__name__,
+                "command": f"scalify {command}".strip(),
+                "traceback": _traceback_tail(error),
+            },
+            exit_code=1,
+            command=command,
+        )
+    except Exception:  # noqa: BLE001 — never mask the original crash
+        pass
+
+
+#: The envelope goes to stdout, i.e. into a model's context, where the raw
+#: traceback on stderr never went. So the exception text is capped and scrubbed
+#: of the secret shapes an exception message plausibly carries: a URL query
+#: string (`?api_key=...`), a bearer token, an `Authorization:` header value
+#: (scheme and credential together), `key=value` / `key: value` token pairs,
+#: and `user:pass@` userinfo.
+_INTERNAL_ERROR_MESSAGE_CAP = 500
+_INTERNAL_ERROR_SCRUB_INPUT_CAP = _INTERNAL_ERROR_MESSAGE_CAP * 8
+_SECRET_KEY_PATTERN = (
+    r"(?:proxy-)?authorization|auth|api[ ._-]?keys?|api[ ._-]?tokens?|token|access[ ._-]?tokens?|"
+    r"refresh[ ._-]?tokens?|secrets?|passwords?|passphrases?|private[ ._-]?keys?|"
+    r"(?:auth|api|access|client|consumer|db|pg|secret|service)(?:tokens?|keys?|secrets?|passwords?)|"
+    r"session(?:[ ._-]?(?:id|key))?|sid|sig|signature|passphrase|passwd|pwd|credentials?|creds|jwt|oauth|"
+    r"(?:set-)?cookies?"
+)
+_SECRET_KEY_QUALIFIER = (
+    r"scalify|org|organization|workspace|project|account|user|client|partner|service|cloud|api|access|refresh|"
+    r"auth|key|id|token|secret|credentials?|cookies?|session|value|private|public|signing|oauth|jwt|aws|"
+    r"encryption|decryption|master|hmac|app|consumer|subscription|shared|ssh|license|db"
+)
+_CAMEL_SECRET_KEY_PATTERN = (
+    r"(?:(?!(?-i:(?:max|prompt|completion|total|input|output|maxOutput|maxCompletion|maxNew)Tokens?)\b)"
+    r"[a-z][A-Za-z0-9]{0,63}(?:(?-i:(?:Api|API)Keys?|Passwords?|Secrets?|Tokens?|Passphrases?))|"
+    r"(?:api|app|auth|access|refresh|token|client|consumer|session|secret|private|signing|oauth|jwt|aws|scalify|"
+    r"proxy|credential|master|subscription|hmac|encryption|account|sharedAccess|sshPrivate|service|db)"
+    r"[A-Za-z0-9]{0,32}(?:(?-i:KeyIds?|Keys?|Authorization|Cookies?|Signatures?|SessionIds?))|"
+    r"(?!(?i:(?:max|prompt|completion|total|input|output|maxoutput|maxcompletion|maxnew)tokens?)\b)"
+    r"(?:(?-i:[A-Z][A-Z0-9]{0,63}(?:APIKEYS?|PASSWORDS?|SECRETS?|TOKENS?|PASSPHRASES?))|"
+    r"(?-i:[a-z][a-z0-9]{0,63}(?:passwords?|secrets?|tokens?|passphrases?))))"
+    r"(?:(?-i:Backup|Value|V[0-9]+))?"
+)
+_ORDINARY_KEY_WORD = (
+    r"(?<!primary_)(?<!primary-)(?<!foreign_)(?<!foreign-)(?<!sort_)(?<!sort-)"
+    r"(?<!cache_)(?<!cache-)(?<!hash_)(?<!hash-)keys?"
+)
+_SECRET_KEY_TAIL = r"(?:[_.-]+(?!(?:counts?|counters?|lengths?|algorithms?)\b)[^\W_]+){0,8}"
+_SECRET_ASSIGNMENT_KEY_PATTERN = (
+    rf"(?<![\w-])(?:"
+    rf"(?:[\w-]+[_.-]{_ORDINARY_KEY_WORD}"
+    rf"(?:[_.-](?:{_SECRET_KEY_QUALIFIER})){{0,8}}{_SECRET_KEY_TAIL})"
+    rf"|(?:(?:{_SECRET_KEY_QUALIFIER})(?:[ ._-]+(?:{_SECRET_KEY_QUALIFIER})){{0,8}}[ ._-]+keys?"
+    rf"(?:[_.-](?:{_SECRET_KEY_QUALIFIER})){{0,8}}{_SECRET_KEY_TAIL})"
+    rf"|{_CAMEL_SECRET_KEY_PATTERN}"
+    rf"|(?:[\w-]*[_.-])?(?:{_SECRET_KEY_PATTERN})"
+    rf"{_SECRET_KEY_TAIL}"
+    rf")"
+)
+_OPTIONAL_KEY_CLOSING_QUOTE = r"(?:[\"'](?=[^\S\r\n]*[:=]))?"
+_SECRET_NEXT_LINE_VALUE = (
+    r"(?:[bBuUrR]{0,2}[\"']|[\[{]|"
+    r"(?!(?:\(|[A-Za-z_][\w .-]{0,63}[ \t]*:(?=[ \t\r\n]|$)))[^\s])"
+)
+_SECRET_VALUE_SPACE = rf"(?:[^\S\r\n]*|[^\S\r\n]*(?:\r\n|\r|\n)[ \t]+(?:-[ \t]+)?(?={_SECRET_NEXT_LINE_VALUE}))"
+_SECRET_CONSTRUCTOR_START = re.compile(
+    rf"(?P<prefix>{_SECRET_ASSIGNMENT_KEY_PATTERN}{_OPTIONAL_KEY_CLOSING_QUOTE}[^\S\r\n]*[:=]{_SECRET_VALUE_SPACE})"
+    r"[A-Za-z_][\w.]*\(",
+    re.IGNORECASE,
+)
+
+
+def _scrub_secret_constructors(text: str) -> str:
+    """Mask constructor-shaped secret values without stopping at an inner call."""
+    chunks: list[str] = []
+    cursor = 0
+    search_from = 0
+    while match := _SECRET_CONSTRUCTOR_START.search(text, search_from):
+        index = match.end()
+        depth = 1
+        quote: str | None = None
+        escaped = False
+        while index < len(text) and depth:
+            char = text[index]
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif quote is not None:
+                if char == quote:
+                    quote = None
+            elif char in {"'", '"'}:
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            elif char in "\r\n":
+                break
+            index += 1
+        if depth:
+            # A multiline or truncated constructor has no trustworthy end.
+            # Mask the full tail so a later value cannot escape through the
+            # simpler single-line constructor pattern.
+            chunks.extend((text[cursor : match.start()], match.group("prefix"), "***"))
+            return "".join(chunks)
+        chunks.extend((text[cursor : match.start()], match.group("prefix"), "***"))
+        cursor = index
+        search_from = index
+    if not chunks:
+        return text
+    chunks.append(text[cursor:])
+    return "".join(chunks)
+
+
+_SECRET_CONTAINER_START = re.compile(
+    rf"(?P<prefix>{_SECRET_ASSIGNMENT_KEY_PATTERN}{_OPTIONAL_KEY_CLOSING_QUOTE}[^\S\r\n]*[:=]{_SECRET_VALUE_SPACE})"
+    r"(?P<opener>[\[({<])",
+    re.IGNORECASE,
+)
+
+
+def _scrub_secret_containers(text: str) -> str:
+    """Mask balanced or truncated secret containers, including multiline values."""
+    chunks: list[str] = []
+    cursor = 0
+    search_from = 0
+    closers = {"[": "]", "(": ")", "{": "}", "<": ">"}
+    while match := _SECRET_CONTAINER_START.search(text, search_from):
+        stack = [closers[match.group("opener")]]
+        index = match.end()
+        quote: str | None = None
+        escaped = False
+        while index < len(text) and stack:
+            char = text[index]
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif quote is not None:
+                if char == quote:
+                    quote = None
+            elif char in {"'", '"'}:
+                quote = char
+            elif char in closers:
+                stack.append(closers[char])
+            elif char == stack[-1]:
+                stack.pop()
+            index += 1
+        chunks.extend((text[cursor : match.start()], match.group("prefix"), "***"))
+        if stack:
+            # A truncated wrapper has no safe boundary. Mask the full tail.
+            return "".join(chunks)
+        cursor = index
+        search_from = index
+    if not chunks:
+        return text
+    chunks.append(text[cursor:])
+    return "".join(chunks)
+
+
+_SECRET_QUOTED_START = re.compile(
+    rf"(?P<prefix>{_SECRET_ASSIGNMENT_KEY_PATTERN}{_OPTIONAL_KEY_CLOSING_QUOTE}[^\S\r\n]*[:=]{_SECRET_VALUE_SPACE})"
+    r"(?P<wrapper>[bBuUrR]{0,2})(?P<quote>\"\"\"|'''|[\"'])",
+    re.IGNORECASE,
+)
+
+
+def _scrub_secret_quoted_values(text: str) -> str:
+    """Mask a quoted secret through its matching quote, including newlines."""
+    chunks: list[str] = []
+    cursor = 0
+    search_from = 0
+    while match := _SECRET_QUOTED_START.search(text, search_from):
+        quote = match.group("quote")
+        index = match.end()
+        escaped = False
+        while index < len(text):
+            char = text[index]
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif len(quote) == 1 and text.startswith(quote * 2, index):
+                # YAML/SQL single-quoted scalars escape a quote by doubling it.
+                # The pair is data, not the end of the secret value.
+                index += 2
+                continue
+            elif text.startswith(quote, index):
+                break
+            index += 1
+        chunks.extend(
+            (
+                text[cursor : match.start()],
+                match.group("prefix"),
+                match.group("wrapper"),
+                quote,
+                "***",
+            )
+        )
+        if index >= len(text):
+            return "".join(chunks)
+        chunks.append(quote)
+        cursor = index + len(quote)
+        search_from = cursor
+    if not chunks:
+        return text
+    chunks.append(text[cursor:])
+    return "".join(chunks)
+
+
+_ESCAPED_SECRET_QUOTED_START = re.compile(
+    rf"(?P<prefix>\\+[\"'](?:{_SECRET_ASSIGNMENT_KEY_PATTERN})"
+    r"\\+[\"']\s*[:=]\s*)(?P<slashes>\\+)(?P<quote>[\"'])",
+    re.IGNORECASE,
+)
+
+
+def _scrub_escaped_secret_quoted_values(text: str) -> str:
+    """Mask nested JSON-string secrets with a deterministic linear scan."""
+    chunks: list[str] = []
+    cursor = 0
+    search_from = 0
+    while match := _ESCAPED_SECRET_QUOTED_START.search(text, search_from):
+        slashes = match.group("slashes")
+        closer = slashes + match.group("quote")
+        index = match.end()
+        end = -1
+        while index < len(text):
+            if text[index] != "\\":
+                index += 1
+                continue
+            run_start = index
+            while index < len(text) and text[index] == "\\":
+                index += 1
+            if index < len(text) and text[index] == match.group("quote"):
+                if index - run_start == len(slashes):
+                    end = run_start
+                    break
+                index += 1
+        chunks.extend((text[cursor : match.start()], match.group("prefix"), closer, "***"))
+        if end < 0:
+            return "".join(chunks)
+        chunks.append(closer)
+        cursor = end + len(closer)
+        search_from = cursor
+    if not chunks:
+        return text
+    chunks.append(text[cursor:])
+    return "".join(chunks)
+
+
+_YAML_SECRET_LINE = re.compile(
+    rf"(?P<prefix>{_SECRET_ASSIGNMENT_KEY_PATTERN}{_OPTIONAL_KEY_CLOSING_QUOTE}[^\S\r\n]*:)"
+    r"(?P<space>[^\S\r\n]*)(?P<value>[^\r\n]*)$",
+    re.IGNORECASE,
+)
+_YAML_MAPPING_LINE = re.compile(r"[A-Za-z_][\w .-]{0,63}[ \t]*:(?=[ \t]|$)")
+
+
+def _scrub_yaml_secret_blocks(text: str) -> str:
+    """Mask YAML block scalars and every item in a secret sequence.
+
+    The scalar/sequence body is indentation-delimited. Handling it line by
+    line avoids a closer-dependent regex and preserves the next sibling
+    diagnostic verbatim, including CR-only input.
+    """
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        content = line.rstrip("\r\n")
+        ending = line[len(content) :]
+        search_from = 0
+        match = _YAML_SECRET_LINE.search(content, search_from)
+        while match is not None:
+            # Secret-shaped labels can also be ordinary URL authority labels
+            # (``https://auth.example.com:443/...``). Skip only that match so
+            # a real secret block later on the same line is still found.
+            authority_labels = _authority_labels_before(content[: match.start()])
+            key = match.group("prefix").rstrip(" \t")[:-1].strip("\"'")
+            port = re.split(r"[\s/?#;&,]", match.group("value").lstrip(), maxsplit=1)[0]
+            if authority_labels is None or not _looks_like_numbered_network_authority(
+                f"{authority_labels}{key}:{port}"
+            ):
+                break
+            search_from = match.end("prefix")
+            match = _YAML_SECRET_LINE.search(content, search_from)
+        if match is None:
+            out.append(line)
+            index += 1
+            continue
+        value = match.group("value").strip()
+        key_indent = len(content) - len(content.lstrip(" \t"))
+        block_scalar = bool(
+            re.fullmatch(
+                r"(?:(?:![^\s]+|&[^\s]+)[ \t]+)*[|>](?:[1-9][+-]?|[+-][1-9]?)?(?:[ \t]+#.*)?",
+                value,
+            )
+        )
+        next_is_sequence = False
+        next_is_continuation = False
+        probe = index + 1
+        while probe < len(lines) and not lines[probe].rstrip("\r\n").strip():
+            probe += 1
+        if probe < len(lines):
+            next_content = lines[probe].rstrip("\r\n")
+            next_indent = len(next_content) - len(next_content.lstrip(" \t"))
+            stripped_next = next_content.lstrip(" \t")
+            next_is_sequence = (
+                (not value or value.startswith("#")) and next_indent >= key_indent and stripped_next.startswith("- ")
+            )
+            quoted_mapping = re.match(
+                r"""(?:"(?:\\[^\r\n]|[^"\\\r\n])*"|'(?:''|[^'\r\n])*')[ \t]*:""",
+                stripped_next,
+            )
+            next_is_continuation = next_indent > key_indent and (
+                not stripped_next.startswith(("(", "'", '"')) or quoted_mapping is not None
+            )
+        if not block_scalar and not next_is_sequence and not next_is_continuation:
+            out.append(line)
+            index += 1
+            continue
+        out.append(content[: match.start("value")] + "***" + ending)
+        index += 1
+        while index < len(lines):
+            child = lines[index].rstrip("\r\n")
+            if not child.strip():
+                index += 1
+                continue
+            child_indent = len(child) - len(child.lstrip(" \t"))
+            stripped_child = child.lstrip(" \t")
+            child_is_sequence = stripped_child.startswith("- ")
+            if next_is_sequence:
+                if child_indent < key_indent or (child_indent == key_indent and not child_is_sequence):
+                    break
+            elif child_indent <= key_indent:
+                break
+            elif not block_scalar and stripped_child.startswith("("):
+                break
+            index += 1
+    return "".join(out)
+
+
+_ARMORED_BLOCK_BEGIN = re.compile(r"-----BEGIN ", re.IGNORECASE)
+_ARMORED_BLOCK_LABEL = re.compile(r"[A-Z0-9][A-Z0-9 -]*", re.IGNORECASE)
+
+
+def _scrub_armored_blocks(text: str) -> str:
+    """Mask complete or truncated key/certificate armor without eating later diagnostics."""
+    chunks: list[str] = []
+    cursor = 0
+    search_from = 0
+    while match := _ARMORED_BLOCK_BEGIN.search(text, search_from):
+        label_start = match.end()
+        label_end = text.find("-----", label_start, label_start + 165)
+        if label_end < 0:
+            search_from = label_start
+            continue
+        label = text[label_start:label_end]
+        if not _ARMORED_BLOCK_LABEL.fullmatch(label) or not re.search(r"key|certificate", label, re.IGNORECASE):
+            # ``label_end`` can itself be the opening dashes of a later valid
+            # header. Resume inside the rejected label so that header is seen.
+            search_from = label_start
+            continue
+        end_marker = re.compile(re.escape(f"-----END {label}-----"), re.IGNORECASE)
+        end_match = end_marker.search(text, label_end + 5)
+        chunks.extend((text[cursor : match.start()], "***"))
+        if end_match is None:
+            return "".join(chunks)
+        cursor = end_match.end()
+        search_from = cursor
+    if not chunks:
+        return text
+    chunks.append(text[cursor:])
+    return "".join(chunks)
+
+
+_URL_SCHEME_START = re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+._-]*(?:://|:\\/\\/)")
+
+
+def _looks_like_numbered_network_authority(authority: str) -> bool:
+    """Whether ``authority`` is an unambiguous host plus a 1-5 digit port."""
+    if authority.startswith("["):
+        close = authority.find("]")
+        if close < 0 or close + 1 >= len(authority) or authority[close + 1] != ":":
+            return False
+        host = authority[: close + 1]
+        port = authority[close + 2 :]
+    else:
+        host, separator, port = authority.rpartition(":")
+        if not separator:
+            return False
+    valid_host = bool(
+        host
+        and (
+            (host.startswith("[") and host.endswith("]"))
+            or all(
+                label
+                and label[0].isalnum()
+                and label[-1].isalnum()
+                and all(char.isalnum() or char == "-" for char in label)
+                for label in host.split(".")
+            )
+        )
+    )
+    return valid_host and bool(re.fullmatch(r"[0-9]{1,5}", port)) and int(port) <= 65_535
+
+
+def _looks_like_hostname(authority: str) -> bool:
+    return bool(
+        authority
+        and len(authority) <= 253
+        and all(
+            label
+            and label[0].isalnum()
+            and label[-1].isalnum()
+            and all(char.isalnum() or char == "-" for char in label)
+            for label in authority.split(".")
+        )
+    )
+
+
+def _authority_labels_before(context: str) -> str | None:
+    """Return the dotted authority prefix immediately before a matched label."""
+    last_space = max(context.rfind(" "), context.rfind("\t"), context.rfind("\r"), context.rfind("\n"))
+    token = context[last_space + 1 :]
+    embedded_url = re.search(
+        r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+._-]*(?:://|:\\/\\/)(?P<labels>[A-Za-z0-9.-]*)$",
+        token,
+    )
+    if embedded_url is not None:
+        labels = embedded_url.group("labels")
+        if (labels and not labels.endswith(".")) or ".." in labels:
+            return None
+        return labels
+    separator = ":\\/\\/" if ":\\/\\/" in token else "://"
+    if separator in token:
+        scheme, labels = token.rsplit(separator, 1)
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9+._-]*", scheme):
+            return None
+    else:
+        labels = token
+        words = context[: last_space + 1].rstrip().lower().rsplit(maxsplit=1)
+        if words[-1:] != ["host"]:
+            return None
+    if (labels and not labels.endswith(".")) or any(char.isspace() or char in ":/" for char in labels):
+        return None
+    return labels
+
+
+def _render_assignment_siblings(prefix: str, value: str, *, mask_leading: bool) -> str | None:
+    """Mask secret-shaped assignments after the leading value on one line."""
+    siblings = list(
+        re.finditer(
+            rf"(?P<sep>[&;]|,[ \t]*|[ \t]+)"
+            rf"(?P<key>[\"']?(?:{_SECRET_ASSIGNMENT_KEY_PATTERN}|[A-Za-z_][\w.-]*)[\"']?)"
+            r"(?P<assign>[:=])",
+            value,
+            re.IGNORECASE,
+        )
+    )
+    if not siblings:
+        return None
+    safe_keys = {
+        "request",
+        "request_id",
+        "request-id",
+        "x-request-id",
+        "trace",
+        "trace_id",
+        "trace-id",
+        "content-type",
+    }
+    rendered = [f"{prefix}***" if mask_leading else f"{prefix}{value[: siblings[0].start()]}"]
+    for idx, sibling in enumerate(siblings):
+        key = sibling.group("key").strip("\"'")
+        end = siblings[idx + 1].start() if idx + 1 < len(siblings) else len(value)
+        secret_key = re.fullmatch(_SECRET_ASSIGNMENT_KEY_PATTERN, key, re.IGNORECASE) is not None
+        separator = sibling.group("sep")
+        quoted_mapping_key = separator.startswith(",") and sibling.group("key").startswith(("'", '"'))
+        if key.lower() in safe_keys or (not secret_key and (separator[0].isspace() or quoted_mapping_key)):
+            rendered.append(_scrub_secret_tail(value[sibling.start() : end]))
+        else:
+            rendered.append(f"{separator}{sibling.group('key')}{sibling.group('assign')}***")
+    return "".join(rendered)
+
+
+_SCRUB_SECRET_TAIL_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "scalify_cli_scrub_secret_tail_depth", default=0
+)
+_MAX_SCRUB_SECRET_TAIL_DEPTH = 32
+
+
+def _scrub_secret_tail(text: str) -> str:
+    """Re-run scalar rules over a suffix preserved by a broader match."""
+    depth = _SCRUB_SECRET_TAIL_DEPTH.get()
+    if depth >= _MAX_SCRUB_SECRET_TAIL_DEPTH:
+        return "***"
+    token = _SCRUB_SECRET_TAIL_DEPTH.set(depth + 1)
+    try:
+        for pattern, replacement in _SECRET_PATTERNS:
+            text = pattern.sub(replacement, text)
+        return text
+    finally:
+        _SCRUB_SECRET_TAIL_DEPTH.reset(token)
+
+
+def _scrub_url_userinfo(text: str) -> str:
+    """Mask URL userinfo while leaving ``host:port/path?...@...`` URLs intact.
+
+    Raw ``/``, ``?`` and ``#`` can occur in a malformed password, so a simple
+    authority regex cannot stop on them. We allow those characters through to
+    the last ``@`` unless the pre-delimiter segment is unambiguously a numbered
+    network authority; that preserves ordinary URLs whose path/query contains
+    an ``@`` without weakening credential masking.
+    """
+    chunks: list[str] = []
+    cursor = 0
+    search_from = 0
+    while match := _URL_SCHEME_START.search(text, search_from):
+        token_end_match = re.search(r'[\s"]', text[match.end() :])
+        token_end = match.end() + token_end_match.start() if token_end_match is not None else len(text)
+        token = text[match.end() : token_end]
+        delimiters = [index for char in "/?#" if (index := token.find(char)) >= 0]
+        first_delimiter = min(delimiters) if delimiters else len(token)
+        # Prefer an @ inside the real authority. A later @ in a path, query,
+        # fragment, or VCS ref must not pull the mask past the delimiter and
+        # erase the query anchor. Only malformed passwords that themselves
+        # crossed a raw delimiter fall back to the final token-wide @.
+        authority_at = token.rfind("@", 0, first_delimiter)
+        standard_userinfo = authority_at >= 0
+        if standard_userinfo:
+            candidate_host = token[authority_at + 1 : first_delimiter]
+            later_at = token.rfind("@")
+            # An email-form username supplies an early @. If what follows it
+            # cannot be a host (``corp.com:pa``), a later @ owns the authority
+            # and everything before it is malformed userinfo.
+            if later_at > authority_at:
+                crossed = token[first_delimiter:later_at]
+                query_shaped = "?" in crossed and "=" in crossed
+                early_userinfo = token[:authority_at]
+                candidate_is_host = _looks_like_hostname(candidate_host) or _looks_like_numbered_network_authority(
+                    candidate_host
+                )
+                # A later delimiter owns malformed userinfo when the early
+                # prefix already has a password, or a host:port-looking middle
+                # is followed by a fragment. Keep token-only userinfo to
+                # underscore/trailing-dot hosts masked through the early @.
+                if (":" in early_userinfo and not query_shaped) or (
+                    _looks_like_numbered_network_authority(candidate_host) and "#" in crossed
+                ):
+                    standard_userinfo = False
+                elif not candidate_is_host and ":" in candidate_host:
+                    standard_userinfo = False
+        at = authority_at if standard_userinfo else token.rfind("@")
+        if at < 0:
+            search_from = match.end()
+            continue
+        later_scheme = _URL_SCHEME_START.search(token, first_delimiter, at)
+        if not standard_userinfo and later_scheme is not None:
+            # A joined/nested URL owns that later @. Let the outer URL go and
+            # resume at the inner scheme rather than treating the entire span
+            # as one malformed password. If the outer URL also had userinfo,
+            # mask it before preserving the proxy path.
+            inner_start = match.end() + later_scheme.start()
+            outer_at = token.rfind("@", 0, later_scheme.start())
+            outer_authority = token[:first_delimiter]
+            outer_crossed_tail = token[first_delimiter:outer_at]
+            clear_outer_network_tail = (
+                _looks_like_numbered_network_authority(outer_authority)
+                and "?" in outer_crossed_tail
+                and "=" in outer_crossed_tail
+            )
+            outer_has_userinfo = authority_at >= 0 or (
+                outer_at >= first_delimiter and ":" in outer_authority and not clear_outer_network_tail
+            )
+            if outer_has_userinfo and outer_at >= 0:
+                chunks.extend(
+                    (
+                        text[cursor : match.end()],
+                        "***@",
+                        token[outer_at + 1 : later_scheme.start()],
+                    )
+                )
+                cursor = inner_start
+            search_from = inner_start
+            continue
+        authority = token[:first_delimiter]
+        numbered_authority = _looks_like_numbered_network_authority(authority)
+        crossed_tail = token[first_delimiter:at]
+        # A valid host:port followed by a query-shaped @ belongs to a normal
+        # path/query, including single-label Docker and Kubernetes services.
+        # A bare path/fragment remains ambiguous with a password and therefore
+        # fails closed.
+        clear_network_tail = numbered_authority and "?" in crossed_tail and "=" in crossed_tail
+        malformed_password = ":" in authority and not clear_network_tail
+        if not standard_userinfo and not malformed_password:
+            # A whitespace-free token can contain another URL (proxy wrappers,
+            # comma-joined indexes). Resume immediately after this scheme so
+            # the next scheme remains discoverable.
+            search_from = match.end()
+            continue
+        post_at = token[at + 1 :]
+        if (
+            not standard_userinfo
+            and any(char in token[:at] for char in "?#")
+            and re.search(r"[&;][A-Za-z_][\w.-]*[:=]", post_at)
+        ):
+            # The fallback crossed a query or fragment anchor. Keeping the
+            # post-@ tail could expose another key/value pair that no later
+            # query scrubber can recognize, so mask the rest of this token.
+            chunks.extend((text[cursor : match.end()], "***"))
+            cursor = token_end
+        else:
+            chunks.extend((text[cursor : match.end()], "***@"))
+            cursor = match.end() + at + 1
+        search_from = cursor
+    if not chunks:
+        return text
+    chunks.append(text[cursor:])
+    return "".join(chunks)
+
+
+def _mask_unquoted_secret_assignment(match: re.Match) -> str:
+    """Mask a whitespace-delimited secret token without leaking punctuation.
+
+    Commas, apostrophes, semicolons, and ampersands can all be part of an
+    unquoted credential. Preserve a delimiter only when it unambiguously opens
+    the next ``name=value`` pair, plus structural closing punctuation.
+    """
+    prefix = match.group("prefix")
+    value = match.group("value")
+    host_match = re.fullmatch(r"(?P<host>[^\s:=]+):", prefix)
+    port = re.split(r"[\s/?#;&,]", value.lstrip(), maxsplit=1)[0]
+    context = match.string[: match.start()]
+    authority_labels = _authority_labels_before(context) if host_match is not None else None
+    full_host = f"{authority_labels}{host_match.group('host')}" if authority_labels is not None and host_match else ""
+    if (
+        host_match is not None
+        and authority_labels is not None
+        and _looks_like_numbered_network_authority(f"{full_host}:{port}")
+    ):
+        # Only an actual URL/``host ...`` authority earns the exemption. An
+        # ``=`` assignment with a numeric value is still a credential. Preserve
+        # only the authority/path token, then rescan its query, fragment, and
+        # following diagnostics for credentials.
+        boundaries = [idx for idx, char in enumerate(value) if char.isspace() or char in "/?#;&,"]
+        safe_end = min(boundaries) if boundaries else len(value)
+        return f"{prefix}{value[:safe_end]}{_scrub_secret_tail(value[safe_end:])}"
+    already_masked = re.match(r"""[ \t]*(?:\*{3}|(["'])\*{3}\1)[}\])]*(?=$|\s)""", value) is not None
+    rendered_siblings = _render_assignment_siblings(prefix, value, mask_leading=not already_masked)
+    if rendered_siblings is not None:
+        return rendered_siblings
+    opening_wrapper = (
+        match.string[match.start() - 1] if match.start() and match.string[match.start() - 1] in "\"'" else ""
+    )
+    closing = next(
+        (
+            idx
+            for idx in range(len(value) - 1, -1, -1)
+            if value[idx] == opening_wrapper
+            and (idx + 1 == len(value) or value[idx + 1].isspace() or value[idx + 1] in ",;)]}")
+        ),
+        -1,
+    )
+    if opening_wrapper and closing >= 0:
+        suffix = value[closing:]
+    else:
+        explanation = re.search(r"[ \t]+\([^\r\n()]*\)$", value)
+        if explanation is not None:
+            suffix = value[explanation.start() :]
+        else:
+            structural = re.search(r"[\"']?[}\]),]+$", value)
+            suffix = value[structural.start() :] if structural is not None else ""
+    return f"{prefix}***{_scrub_secret_tail(suffix)}"
+
+
+_SECRET_PATTERNS = (
+    (
+        re.compile(r'([A-Za-z][A-Za-z0-9+._-]*(?:://|:\\/\\/)[^\s?#"]+)\?[^\s"]*', re.IGNORECASE),
+        r"\1?***",
+    ),
+    (re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/=\-]+", re.IGNORECASE), r"\1***"),
+    # An `Authorization:` value is `<scheme> <credential>` for ANY scheme
+    # (Basic, Bearer, Token, Digest with its quoted comma-separated params,
+    # ...), so scheme and credential are masked as one value. A quoted value
+    # (a dict repr) is masked up to its MATCHING quote, so the other quote
+    # kind inside it (Digest's response="...") is covered, and an escaped
+    # quote (a JSON-encoded value) does not end it; an unquoted header
+    # line is masked to the end of the line, quotes included. Both shapes are
+    # ONE alternation applied in one pass, so each value is masked exactly
+    # once: as two passes, the unquoted one re-matched the quoted one's output
+    # and swallowed the headers after it.
+    (
+        re.compile(
+            r"((?:proxy-)?authorization[\"']?\s*[:=]\s*)"
+            r"(?:([\"'])(?:\\.|(?!\2)[^\r\n\\])*"
+            r"(?:(?:\r\n|\r|\n)(?![ \t]+[A-Za-z][A-Za-z0-9 _-]{0,63}[ \t]*:)[ \t]+[^\r\n]*)*\2?|[^\r\n]+"
+            r"(?:(?:\r\n|\r|\n)(?![ \t]+[A-Za-z][A-Za-z0-9 _-]{0,63}[ \t]*:)[ \t]+[^\r\n]*)*)",
+            re.IGNORECASE,
+        ),
+        lambda m: f"{m[1]}{m[2]}***{m[2]}" if m[2] else f"{m[1]}***",
+    ),
+    (
+        # Constructor reprs are balanced and normally followed by useful
+        # diagnostics, so consume just the constructor (never whitespace plus
+        # an ordinary explanatory parenthetical).
+        re.compile(
+            rf"({_SECRET_ASSIGNMENT_KEY_PATTERN}{_OPTIONAL_KEY_CLOSING_QUOTE}[^\S\r\n]*[:=]{_SECRET_VALUE_SPACE})"
+            r"[A-Za-z_][\w.]*\([^\r\n)]*\)",
+            re.IGNORECASE,
+        ),
+        r"\1***",
+    ),
+    (
+        # A container may be nested, truncated by the message cap, or pretty
+        # printed. Once a secret value opens a container, conservatively mask
+        # the rest of that line and its indented continuations. This is linear
+        # and cannot leak later elements through a premature closer.
+        re.compile(
+            rf"({_SECRET_ASSIGNMENT_KEY_PATTERN}{_OPTIONAL_KEY_CLOSING_QUOTE}[^\S\r\n]*[:=]{_SECRET_VALUE_SPACE})"
+            r"(?:[\[({]|[A-Za-z_][\w.]*\()[^\r\n]*"
+            r"(?:(?:\r\n|\r|\n)(?![ \t]+[A-Za-z][A-Za-z0-9 _-]{0,63}[ \t]*:)[ \t]+[^\r\n]*)*",
+            re.IGNORECASE,
+        ),
+        r"\1***",
+    ),
+    (
+        # Quoted values stop at their matching quote so later diagnostics stay
+        # visible. Constructors and containers were handled above.
+        re.compile(
+            rf"({_SECRET_ASSIGNMENT_KEY_PATTERN}{_OPTIONAL_KEY_CLOSING_QUOTE}[^\S\r\n]*[:=]{_SECRET_VALUE_SPACE})"
+            r"([bBuUrR]{0,2})((?:\\)?(?:\"\"\"|'''|[\"']))(?:(?!\3)(?:\\.|[^\r\n]))*\3?",
+            re.IGNORECASE,
+        ),
+        lambda m: f"{m[1]}{m[2]}{m[3]}***{m[3]}",
+    ),
+    (
+        # The Bearer scrubber above preserves the scheme; do not remask it as
+        # an unquoted token. Mask punctuation inside every other credential.
+        re.compile(
+            rf"(?P<prefix>{_SECRET_ASSIGNMENT_KEY_PATTERN}{_OPTIONAL_KEY_CLOSING_QUOTE}"
+            rf"[^\S\r\n]*[:=]{_SECRET_VALUE_SPACE})"
+            r"(?!Bearer\s)(?![bBuUrR]{0,2}(?:\"\"\"|'''|[\"']))(?P<value>[^\r\n]+)",
+            re.IGNORECASE,
+        ),
+        _mask_unquoted_secret_assignment,
+    ),
+    (
+        # JSON that has itself been escaped can still carry a nested,
+        # truncated, or pretty-printed container. Mask its remainder without
+        # a closer-dependent regex, so backslash runs stay linear-time.
+        re.compile(
+            rf"(\\+[\"'](?:{_SECRET_ASSIGNMENT_KEY_PATTERN})"
+            r"\\+[\"']\s*[:=]\s*)[\[({][^\r\n]*(?:(?:\r\n|\r|\n)[ \t]+[^\r\n]*)*",
+            re.IGNORECASE,
+        ),
+        r"\1***",
+    ),
+    (
+        re.compile(
+            rf"(\\+[\"'](?:{_SECRET_ASSIGNMENT_KEY_PATTERN})"
+            r"\\+[\"']\s*[:=]\s*)(?!\\+[\"'])(?:\\(?![\"'])|[^\s,}])+",
+            re.IGNORECASE,
+        ),
+        r"\1***",
+    ),
+    (
+        re.compile(
+            r"((?:set-)?cookie[\"']\s*[:=]\s*)(?:([\"'])(?:\\.|(?!\2)[^\r\n\\])*\2?|[^\r\n,]+)",
+            re.IGNORECASE,
+        ),
+        lambda m: f"{m[1]}{m[2]}***{m[2]}" if m[2] else f"{m[1]}***",
+    ),
+    (
+        re.compile(
+            r"((?:set-)?cookie\s*[:=]\s*)[^\r\n]*"
+            r"(?:(?:\r\n|\r|\n)(?![ \t]+[A-Za-z][A-Za-z0-9 _-]{0,63}[ \t]*:)[ \t]+[^\r\n]*)*",
+            re.IGNORECASE,
+        ),
+        r"\1***",
+    ),
+)
+
+
+def _internal_error_message(error: BaseException) -> str:
+    prefix = f"{type(error).__name__}: "
+    if len(prefix) >= _INTERNAL_ERROR_MESSAGE_CAP:
+        return prefix[: _INTERNAL_ERROR_MESSAGE_CAP - 1] + "…"
+    try:
+        detail = str(error)
+    except Exception:
+        detail = "unprintable exception"
+    detail_cap = max(0, _INTERNAL_ERROR_SCRUB_INPUT_CAP - len(prefix))
+    scrub_input_truncated = len(detail) > detail_cap
+    # ``str(error)`` necessarily materializes the exception's value, but do not
+    # create a second unbounded copy merely to prepend its type name.
+    text = detail[:detail_cap]
+    if scrub_input_truncated:
+        # A userinfo scrub needs its closing ``@``. If the input cap removed
+        # that anchor, drop the incomplete credential token before earlier
+        # scrubbers contract the message and pull it into the visible prefix.
+        partial_userinfo = next(
+            (
+                scheme
+                for scheme in reversed(list(_URL_SCHEME_START.finditer(text)))
+                if re.fullmatch(r'[^\s"]*', text[scheme.end() :])
+            ),
+            None,
+        )
+        if partial_userinfo is not None:
+            tail = text[partial_userinfo.end() :]
+            authority = re.split(r"[/?#]", tail, maxsplit=1)[0]
+            if "@" in tail:
+                # The cap may have removed a later ``@host``. Even a DNS-like
+                # suffix after the last visible @ can still be part of the
+                # password, so the only safe boundary is the URL start.
+                should_trim = True
+            else:
+                boundary_visible = len(authority) < len(tail)
+                looks_like_bare_ipv6 = authority.startswith("[") and authority.endswith("]")
+                complete_network_authority = boundary_visible and _looks_like_hostname(authority)
+                # With no visible path/query/fragment boundary, a dotted token
+                # or ``user:common-port`` cut before ``@host`` is
+                # indistinguishable from a complete hostname. Fail closed; an
+                # IPv6 closing bracket remains an unambiguous terminator.
+                should_trim = not looks_like_bare_ipv6 and not complete_network_authority
+        else:
+            should_trim = False
+        if should_trim:
+            text = text[: partial_userinfo.start()]
+    text = _scrub_yaml_secret_blocks(text)
+    text = _scrub_secret_constructors(text)
+    text = _scrub_secret_containers(text)
+    text = _scrub_secret_quoted_values(text)
+    text = _scrub_escaped_secret_quoted_values(text)
+    text = _scrub_armored_blocks(text)
+    text = _scrub_url_userinfo(text)
+    for pattern, repl in _SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    visible_detail_cap = max(0, _INTERNAL_ERROR_MESSAGE_CAP - len(prefix))
+    if len(text) > visible_detail_cap:
+        text = text[: max(0, visible_detail_cap - 1)] + "…"
+    elif scrub_input_truncated:
+        text = text[: max(0, visible_detail_cap - 1)] + "…"
+    return prefix + text
+
+
+def _traceback_tail(error: BaseException, frames: int = 3) -> list[str]:
+    """The innermost ``frames`` frames as ``file:line:func`` — enough to locate
+    the crash from the envelope alone, with no source text (which can hold
+    literals the caller should not see)."""
+    import traceback
+
+    tail = traceback.extract_tb(error.__traceback__)[-frames:]
+    return [f"{os.path.basename(f.filename)}:{f.lineno}:{f.name}" for f in tail]
+
+
+def _is_click_control_flow(error: BaseException) -> bool:
+    """Click/typer's own exceptions (usage errors, ``typer.Exit``, ``Abort``) —
+    they already carry their exit semantics and are not crashes."""
+    return any(_click_error_is(error, name) for name in ("ClickException", "Exit", "Abort"))
+
+
+@contextlib.contextmanager
+def _usage_errors_as_envelopes(args: list[str] | None = None, ctx: click.Context | None = None) -> Iterator[None]:
+    try:
+        yield
+    except Exception as error:
+        if _click_error_is(error, "UsageError"):
+            _emit_usage_error_envelope(error, args)
+        elif ctx is not None and not _is_click_control_flow(error):
+            _emit_internal_error_envelope(error, ctx)
+        raise
+
+
+class _RootGroup(LazyTyperGroup):
+    """Root click group. Subcommand groups are declared in ``lazy_subcommands``
+    (assigned at the bottom of this module) and imported on first use.
+
+    ``make_context`` and ``invoke`` are both wrapped so a usage error anywhere in
+    the tree ends the ``--json`` stream with an envelope: the first covers
+    root-level argv, the second every nested command, since click builds a
+    subcommand's context inside the parent group's ``invoke``.
+    """
+
+    def make_context(self, info_name, args, parent=None, **kwargs):
+        # A COPY, taken before parsing: click's parser consumes `args` IN PLACE,
+        # so by the time the error propagates the original is empty.
+        with _usage_errors_as_envelopes(list(args)):
+            return super().make_context(info_name, args, parent=parent, **kwargs)
+
+    def invoke(self, ctx: click.Context):
+        # `ctx` turns on the crash envelope too: every command body runs inside
+        # this call, so an exception no command caught ends `--json` with an
+        # `internal_error` envelope instead of an empty stdout.
+        with _usage_errors_as_envelopes(ctx=ctx):
+            return super().invoke(ctx)
+
+
+app = typer.Typer(cls=_RootGroup)
+# The lazy builders below pass this to typer's command/group factories; read it
+# off the root app rather than assuming typer's default.
+_RootGroup.pretty_exceptions_short = app.pretty_exceptions_short
+workspace_manager = WorkspaceManager()
+
+console = Console()
+
+
+def main():
+    # Install the SIGINT handler BEFORE Typer parses argv and runs the
+    # subcommand. Otherwise a Ctrl-C during the first ~100ms (argv parsing,
+    # the lazy imports of auth/cql/cloud, ConfigManager construction) hits
+    # Python's default handler and the user sees a bare KeyboardInterrupt
+    # traceback instead of the documented `cancelled` envelope.
+    cancellation.install_sigint_handler()
+    # Run the Typer app. If the command path called renderer.error(...) and
+    # returned without raising typer.Exit, we still need to surface the
+    # non-zero exit code at the OS level — otherwise the envelope says
+    # ok:false but the shell sees 0 and downstream tools think we succeeded.
+    try:
+        app()
+    except KeyboardInterrupt:
+        # SIGINT path: emit a cancelled envelope if one hasn't been written yet.
+        try:
+            from scalify_cli.output import get_renderer
+
+            r = get_renderer()
+            if not r._envelope_emitted and r.is_json():
+                r.error(code="cancelled", message="Cancelled by user", exit_code=130)
+        except Exception:
+            pass
+        sys.exit(130)
+    except (typer.Exit, SystemExit):
+        raise
+    # No exception → command returned cleanly. If the renderer recorded a
+    # non-zero exit code (from a `renderer.error(...)` that forgot to also
+    # `raise typer.Exit(...)`), honor it.
+    try:
+        from scalify_cli.output import get_renderer
+
+        rc = get_renderer().exit_code
+    except Exception:  # noqa: BLE001 — never break the success path on renderer issues
+        rc = 0
+    if rc:
+        sys.exit(rc)
+
+
+class MutuallyExclusiveValidator:
+    def __init__(self):
+        self.group = []
+
+    def reset_for_testing(self):
+        self.group.clear()
+
+    def validate(self, _ctx: typer.Context, param: typer.CallbackParam, value: str):
+        # Add cli option to group if it was called with a value
+        if value is not None and param.name not in self.group:
+            self.group.append(param.name)
+        if len(self.group) > 1:
+            raise typer.BadParameter(f"option `{param.name}` is mutually exclusive with option `{self.group.pop()}`")
+        return value
+
+
+g_exclusivity = MutuallyExclusiveValidator()
+g_gpu_exclusivity = MutuallyExclusiveValidator()
+
+
+@app.command(help="Display help for commands")
+def help(ctx: typer.Context):
+    rprint(ctx.find_root().get_help())
+    ctx.exit(0)
+
+
+def _maybe_nudge_setup(ctx: typer.Context, renderer) -> None:
+    """First-run only: nudge a brand-new, unconfigured user toward `scalify setup`.
+
+    Heavily gated so it never touches the machine contract or repeats: skips the
+    bare/`setup` invocations, anything but interactive pretty output, signed-in
+    users, and installs already nudged. Prints one line to stderr, then marks the
+    install. Onboarding must never break a command — failures are swallowed.
+    """
+    sub = ctx.invoked_subcommand
+    # Guarded stderr probe: this runs from the main Typer callback, and stderr
+    # can be closed independently of stdout (`scalify install 2>&-`, where CPython
+    # sets `sys.stderr = None`). A bare `.isatty()` there would kill the command
+    # from the onboarding nudge of all places. See `caller.stream_is_tty`.
+    if sub in (None, "setup") or not renderer.is_pretty() or not stream_is_tty(getattr(sys, "stderr", None)):
+        return
+    try:
+        from scalify_cli.credentials import get_session
+        from scalify_cli.onboarding import NUDGE_TEXT, mark_setup_nudged, should_nudge_setup
+
+        session = get_session(refresh=False)
+        signed_in = session is not None and not session.is_expired()
+        if should_nudge_setup(signed_in=signed_in):
+            print(NUDGE_TEXT, file=sys.stderr)
+            mark_setup_nudged()
+    except Exception:  # noqa: BLE001 — a nudge must never break the actual command
+        pass
+
+
+@app.callback(
+    invoke_without_command=True,
+    epilog=(
+        "Cloud quickstart (no local GPU required):\n\n"
+        "scalify cloud login  →  scalify run --workflow wf.json --where cloud  "
+        "(prints a prompt_id)  →  scalify jobs wait <prompt_id> --where cloud  →  "
+        "scalify download <prompt_id> --where cloud\n\n"
+        "Cloud generation consumes Scalify Cloud credits (needs an active subscription); "
+        "discovery commands (jobs status, templates ls, generate list) don't. See the README."
+    ),
+)
+def entry(
+    ctx: typer.Context,
+    workspace: Annotated[
+        str | None,
+        typer.Option(
+            show_default=False,
+            help="Path to ScalifyUI workspace",
+            callback=g_exclusivity.validate,
+        ),
+    ] = None,
+    recent: Annotated[
+        bool | None,
+        typer.Option(
+            show_default=False,
+            help="Execute from recent path",
+            callback=g_exclusivity.validate,
+        ),
+    ] = None,
+    here: Annotated[
+        bool | None,
+        typer.Option(
+            show_default=False,
+            help="Execute from current path",
+            callback=g_exclusivity.validate,
+        ),
+    ] = None,
+    skip_prompt: Annotated[
+        bool,
+        typer.Option(
+            show_default=False,
+            help="Do not prompt user for input, use default options",
+        ),
+    ] = False,
+    enable_telemetry: Annotated[
+        bool,
+        typer.Option(
+            show_default=False,
+            hidden=True,
+            help="Enable tracking",
+        ),
+    ] = False,
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-v",
+        help="Print version and exit",
+    ),
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            show_default=False,
+            help="Emit a structured JSON envelope on stdout. Side messages go to stderr.",
+        ),
+    ] = False,
+    json_stream: Annotated[
+        bool,
+        typer.Option(
+            "--json-stream",
+            show_default=False,
+            help="Emit one NDJSON event per line; final line is the envelope.",
+        ),
+    ] = False,
+    no_json: Annotated[
+        bool,
+        typer.Option(
+            "--no-json",
+            show_default=False,
+            help="Force pretty output even when auto-detection would pick JSON.",
+        ),
+    ] = False,
+    help_json: Annotated[
+        bool,
+        typer.Option(
+            "--help-json",
+            show_default=False,
+            help="Print machine-readable help for the entire CLI and exit.",
+        ),
+    ] = False,
+    where: Annotated[
+        str | None,
+        typer.Option(
+            "--where",
+            show_default=False,
+            help="Routing mode for this invocation: 'local' or 'cloud'. "
+            "Overrides SCALIFY_WHERE and the persisted default (`scalify set-default --where`). "
+            "Subcommands inherit this — no need to repeat it on each one.",
+        ),
+    ] = None,
+):
+    # 1. Resolve output mode and install the process-wide renderer. This must
+    #    happen before any rprint() call so all output is routed correctly.
+    cli_version = ConfigManager().get_cli_version()
+    renderer = Renderer.resolve(
+        json_flag=json_output or None,
+        json_stream_flag=json_stream or None,
+        no_json_flag=no_json,
+        command=ctx.invoked_subcommand or "",
+        version=cli_version,
+    )
+    set_renderer(renderer)
+
+    # Global `--where` is sugar over SCALIFY_WHERE. Setting the env var here so
+    # the existing precedence chain in ``where.resolve()`` picks it up for
+    # every subcommand without each one having to wire its own flag.
+    if where:
+        try:
+            where_module._parse(where)  # validate now — fail fast on `--where cloudy`
+        except ValueError as e:
+            get_renderer().error(code="where_invalid", message=str(e), hint="use --where local or --where cloud")
+            raise typer.Exit(code=1) from e
+        os.environ["SCALIFY_WHERE"] = where.strip().lower()
+
+    # 2. Install SIGINT → cancellation token. Idempotent; safe to call before
+    #    any long-running operation in subcommands.
+    cancellation.install_sigint_handler()
+
+    # 3. Agentic callers shouldn't get interactive prompts.
+    if renderer.caller.agentic:
+        skip_prompt = True
+
+    if help_json:
+        doc = build_help_json(app)
+        # In JSON mode, wrap in the standard envelope so consumers can parse
+        # the same shape they get from every other command. In pretty mode
+        # (rare for --help-json but possible), emit the raw doc — there's no
+        # envelope to compete with on stdout.
+        if renderer.is_json():
+            renderer.emit(doc, command="help")
+        else:
+            sys.stdout.write(json.dumps(doc, indent=2, default=str) + "\n")
+        ctx.exit(0)
+
+    if version:
+        if renderer.is_json():
+            renderer.emit({"version": cli_version}, command="version")
+        else:
+            rprint(cli_version)
+        ctx.exit(0)
+
+    workspace_manager.setup_workspace_manager(workspace, here, recent, skip_prompt)
+
+    # `scalify setup` owns the telemetry consent decision as a branded wizard step
+    # (with full disclosure). Suppress the bare global prompt for that one command
+    # so the user is asked exactly once, in the right place — not pre-empted here.
+    if ctx.invoked_subcommand != "setup":
+        tracking.prompt_tracking_consent(skip_prompt, default_value=enable_telemetry)
+
+    _maybe_nudge_setup(ctx, renderer)
+
+    if ctx.invoked_subcommand is None:
+        # The welcome screen is human-facing: agents read `discover` / `--help-json`,
+        # and a JSON welcome envelope helps no one. Emit JSON only when machine
+        # output was actually *requested* — explicit `--json`/`--json-stream`,
+        # `SCALIFY_OUTPUT` env, or a real detected agent — NOT merely because stdout
+        # isn't a TTY. A human who pipes `scalify` (caller kind "pipe") still wants
+        # the banner, so the non-TTY auto-JSON rule is overridden here only.
+        _env_json = (os.environ.get("SCALIFY_OUTPUT") or "").strip().lower() in {"json", "ndjson"}
+        _real_agent = renderer.caller.agentic and renderer.caller.kind != "pipe"
+        _machine_welcome = bool(json_output) or bool(json_stream) or _env_json or _real_agent
+        if _machine_welcome:
+            renderer.emit(
+                {
+                    "welcome": "Scalify CLI",
+                    "homepage": "https://github.com/Khulnasoft/scalify-cli",
+                    "hint": "run `scalify setup` to get started, `scalify --help-json` for the full surface, or `scalify --help` for human help.",
+                },
+                command="welcome",
+            )
+        else:
+            from rich.console import Console
+
+            from scalify_cli.credentials import get_session as _get_session
+            from scalify_cli.output.branding import intro_banner
+            from scalify_cli.update import latest_upgrade_version
+
+            _session = _get_session(refresh=False)
+            _signed_in = _session is not None and not _session.is_expired()
+            _base_url = _session.base_url if _session else ""
+            if not _base_url:
+                from scalify_cli.cloud import get_base_url as _get_base_url
+
+                _base_url = _get_base_url()
+            _update_hint = latest_upgrade_version(cli_version, ConfigManager().get_config_path())
+            # Render to stdout regardless of the resolved mode: a non-TTY human
+            # pipe resolves to JSON, but we're deliberately showing the human banner.
+            _console = renderer.console() if renderer.is_pretty() else Console(file=sys.stdout)
+            _console.print(
+                intro_banner(
+                    version=ConfigManager().get_cli_version(),
+                    signed_in=_signed_in,
+                    base_url=_base_url,
+                    update_hint=_update_hint,
+                )
+            )
+        ctx.exit()
+
+
+def validate_commit_and_version(commit: str | None, ctx: typer.Context) -> str | None:
+    """
+    Validate that the commit is not specified unless the version is 'nightly'.
+    """
+    version = ctx.params.get("version")
+    if commit and version != "nightly":
+        raise typer.BadParameter("You can only specify the commit if the version is 'nightly'.")
+    return commit
+
+
+def _resolve_cuda(
+    gpu: GPU_OPTION | None,
+    cuda_version: CUDAVersion | None,
+) -> tuple[CUDAVersion | None, str | None]:
+    """Resolve the CUDA wheel tag for an NVIDIA install.
+
+    Returns (cuda_version_enum_or_None, cuda_tag_string_or_None).
+    When the user passed an explicit --cuda-version, that is used as-is.
+    Otherwise auto-detection is attempted.
+    """
+    if gpu != GPU_OPTION.NVIDIA:
+        return cuda_version, None
+
+    if cuda_version is not None:
+        tag = f"cu{cuda_version.value.replace('.', '')}"
+        rprint(f"[bold]Using explicit CUDA version:[/bold] {cuda_version.value} ({tag})")
+        return cuda_version, tag
+
+    drv = detect_cuda_driver_version()
+    if drv is not None:
+        tag = resolve_cuda_wheel(drv)
+        if tag is not None:
+            rprint(f"[bold green]Detected CUDA driver version:[/bold green] {drv[0]}.{drv[1]} → using {tag}")
+            return None, tag
+        rprint(
+            f"[bold yellow]Warning:[/bold yellow] CUDA driver {drv[0]}.{drv[1]} is too old for any known PyTorch wheel. "
+            f"Falling back to {DEFAULT_CUDA_TAG}. Use `--cuda-version` to override."
+        )
+        return None, DEFAULT_CUDA_TAG
+
+    rprint(
+        f"[bold yellow]Warning:[/bold yellow] Could not detect CUDA driver version. "
+        f"Falling back to {DEFAULT_CUDA_TAG}. Use `--cuda-version` to override."
+    )
+    return None, DEFAULT_CUDA_TAG
+
+
+@app.command(help="Download and install ScalifyUI and ScalifyUI-Manager")
+@tracking.track_command()
+def install(
+    url: Annotated[
+        str,
+        typer.Option(
+            show_default=False,
+            help="url or local path pointing to the ScalifyUI core git repo to be installed. A specific branch can optionally be specified using a setuptools-like syntax, eg https://foo.git@bar",
+        ),
+    ] = constants.SCALIFY_GITHUB_URL,
+    version: Annotated[
+        str,
+        typer.Option(
+            show_default=False,
+            help="Specify version of ScalifyUI to install. Default is nightl, which is the latest commit on master branch. Other options include: latest, which is the latest stable release. Or a specific version number, eg. 0.2.0",
+            callback=validate_version,
+        ),
+    ] = "nightly",
+    restore: Annotated[
+        bool,
+        typer.Option(
+            show_default=False,
+            help="Restore dependencies for installed ScalifyUI if not installed",
+        ),
+    ] = False,
+    skip_manager: Annotated[
+        bool,
+        typer.Option(show_default=False, help="Skip installing the manager component"),
+    ] = False,
+    skip_torch_or_directml: Annotated[
+        bool,
+        typer.Option(show_default=False, help="Skip installing PyTorch Or DirectML"),
+    ] = False,
+    skip_requirement: Annotated[
+        bool, typer.Option(show_default=False, help="Skip installing requirements.txt")
+    ] = False,
+    nvidia: Annotated[
+        bool | None,
+        typer.Option(
+            show_default=False,
+            help="Install for Nvidia gpu",
+            callback=g_gpu_exclusivity.validate,
+        ),
+    ] = None,
+    cuda_version: Annotated[CUDAVersion | None, typer.Option(show_default=False)] = None,
+    rocm_version: Annotated[ROCmVersion, typer.Option(show_default=True)] = ROCmVersion.v7_2,
+    amd: Annotated[
+        bool | None,
+        typer.Option(
+            show_default=False,
+            help="Install for AMD gpu",
+            callback=g_gpu_exclusivity.validate,
+        ),
+    ] = None,
+    m_series: Annotated[
+        bool | None,
+        typer.Option(
+            show_default=False,
+            help="Install for Mac M-Series gpu",
+            callback=g_gpu_exclusivity.validate,
+        ),
+    ] = None,
+    intel_arc: Annotated[
+        bool | None,
+        typer.Option(
+            hidden=True,
+            show_default=False,
+            help="Install for Intel Arc gpu",
+            callback=g_gpu_exclusivity.validate,
+        ),
+    ] = None,
+    cpu: Annotated[
+        bool | None,
+        typer.Option(
+            show_default=False,
+            help="Install for CPU",
+            callback=g_gpu_exclusivity.validate,
+        ),
+    ] = None,
+    commit: Annotated[
+        str | None, typer.Option(help="Specify commit hash for ScalifyUI", callback=validate_commit_and_version)
+    ] = None,
+    fast_deps: Annotated[
+        bool,
+        typer.Option(
+            "--fast-deps",
+            show_default=False,
+            help="Use uv instead of pip for dependency resolution (scalify-cli built-in resolver)",
+        ),
+    ] = False,
+    pr: Annotated[
+        str | None,
+        typer.Option(
+            show_default=False,
+            help="Install from a specific PR. Supports formats: username:branch, #123, or PR URL",
+        ),
+    ] = None,
+):
+    checker = EnvChecker()
+
+    scalify_path, _ = workspace_manager.get_workspace_path()
+
+    is_scalify_installed_at_path, resolved_path = check_scalify_repo(scalify_path)
+    if is_scalify_installed_at_path and not restore:
+        rprint(f"[bold red]ScalifyUI is already installed at the specified path:[/bold red] {scalify_path}\n")
+        rprint(
+            "[bold yellow]If you want to restore dependencies, add the '--restore' option.[/bold yellow]",
+        )
+        raise typer.Exit(code=1)
+
+    if resolved_path is not None:
+        scalify_path = resolved_path
+
+    if checker.python_version.major < 3 or checker.python_version.minor < 9:
+        rprint("[bold red]Python version 3.9 or higher is required to run ScalifyUI.[/bold red]")
+        rprint(f"You are currently using Python version {env_checker.format_python_version(checker.python_version)}.")
+    platform = utils.get_os()
+
+    if pr and (version not in {None, "nightly"} or commit):
+        rprint("--pr cannot be used with --version or --commit")
+        raise typer.Exit(code=1)
+
+    if cpu:
+        rprint("[bold yellow]Installing for CPU[/bold yellow]")
+        install_inner.execute(
+            url,
+            scalify_path,
+            restore,
+            skip_manager,
+            commit=commit,
+            version=version,
+            gpu=None,
+            cuda_version=cuda_version,
+            cuda_tag=None,
+            rocm_version=rocm_version,
+            plat=platform,
+            skip_torch_or_directml=skip_torch_or_directml,
+            skip_requirement=skip_requirement,
+            fast_deps=fast_deps,
+            pr=pr,
+        )
+        rprint(f"ScalifyUI is installed at: {scalify_path}")
+        return None
+
+    if nvidia and platform == constants.OS.MACOS:
+        rprint(
+            "[bold red]--nvidia was passed but this is macOS, which has no NVIDIA GPU. "
+            "Re-run with --m-series (Apple silicon) or --cpu, or omit the GPU flag to select interactively.[/bold red]"
+        )
+        raise typer.Exit(code=1)
+
+    if m_series and platform != constants.OS.MACOS:
+        # Warning-only here used to fall through to `elif m_series:` below and
+        # set GPU_OPTION.MAC_M_SERIES, which installs the nightly CPU torch
+        # wheels — silently giving a Linux/Windows user a CPU-only nightly and
+        # no GPU support. Exit like the symmetric --nvidia-on-macOS check.
+        rprint(
+            f"[bold red]--m-series is a macOS (Apple Silicon) option; detected platform is {platform}.[/bold red]\n"
+            "[bold red]Use --nvidia, --amd or --intel-arc for a GPU install, or --cpu for CPU-only.[/bold red]"
+        )
+        raise typer.Exit(code=1)
+
+    gpu = None
+
+    if nvidia:
+        gpu = GPU_OPTION.NVIDIA
+    elif amd:
+        gpu = GPU_OPTION.AMD
+    elif m_series:
+        gpu = GPU_OPTION.MAC_M_SERIES
+    elif intel_arc:
+        gpu = GPU_OPTION.INTEL_ARC
+    else:
+        if platform == constants.OS.MACOS:
+            gpu = ui.prompt_select_enum(
+                "What type of Mac do you have?",
+                [GPU_OPTION.MAC_M_SERIES, GPU_OPTION.MAC_INTEL],
+            )
+        else:
+            gpu = ui.prompt_select_enum(
+                "What GPU do you have?",
+                [GPU_OPTION.NVIDIA, GPU_OPTION.AMD, GPU_OPTION.INTEL_ARC],
+            )
+
+    if gpu is None and not cpu:
+        rprint(
+            "[bold red]No GPU option selected or `--cpu` enabled, use --\\[gpu option] flag (e.g. --nvidia) to pick GPU. use `--cpu` to install for CPU. Exiting...[/bold red]"
+        )
+        raise typer.Exit(code=1)
+
+    cuda_version, cuda_tag = _resolve_cuda(gpu, cuda_version) if not skip_torch_or_directml else (cuda_version, None)
+
+    install_inner.execute(
+        url,
+        scalify_path,
+        restore,
+        skip_manager,
+        commit=commit,
+        gpu=gpu,
+        version=version,
+        cuda_version=cuda_version,
+        cuda_tag=cuda_tag,
+        rocm_version=rocm_version,
+        plat=platform,
+        skip_torch_or_directml=skip_torch_or_directml,
+        skip_requirement=skip_requirement,
+        fast_deps=fast_deps,
+        pr=pr,
+    )
+
+    rprint(f"ScalifyUI is installed at: {scalify_path}")
+
+
+def _switch_scalify_version(scalify_path: str, version: str, *, stash: bool) -> None:
+    """`scalify update scalify --version X` — move the workspace, then reinstall its deps.
+
+    Torch is deliberately left alone: a version switch is ScalifyUI-version-specific
+    while the torch build is machine-specific, so re-resolving it would need the
+    GPU input this headless path exists to avoid.
+    """
+    renderer = get_renderer()
+
+    try:
+        result = install_inner.switch_scalifyui_version(scalify_path, version, stash=stash)
+    except install_inner.VersionSwitchError as e:
+        renderer.error(code=e.code, message=e.message, hint=e.hint)
+        raise typer.Exit(code=1)
+
+    python = resolve_workspace_python(scalify_path)
+    # A uv-managed venv may have no pip — bootstrap it first so the install
+    # below doesn't crash with `No module named pip` (no-op if pip exists).
+    ensure_pip(python, cwd=scalify_path)
+    deps = subprocess.run(
+        [python, "-m", "pip", "install", "-r", "requirements.txt"],
+        cwd=scalify_path,
+        check=False,
+    )
+    if deps.returncode != 0:
+        renderer.error(
+            code="version_switch_deps_failed",
+            message=(
+                f"ScalifyUI is now on {result['current']}, but installing its requirements.txt failed — "
+                "dependencies may be incomplete."
+            ),
+            hint="re-run the same command once the cause is fixed; it is idempotent and safe to repeat",
+        )
+        raise typer.Exit(code=1)
+
+    if renderer.is_pretty():
+        rprint(f"Switched ScalifyUI: [bold]{result['previous']}[/bold] -> [bold]{result['current']}[/bold]")
+        if result["stashed"]:
+            rprint(
+                f"[yellow]Uncommitted changes were stashed as {result['stash_ref']} and left there — "
+                "restore them with `git stash pop`.[/yellow]"
+            )
+        if version != "nightly":
+            rprint(
+                "[dim]This is a tag checkout, so the workspace is on a detached HEAD. "
+                "Roll forward with `scalify update scalify --version nightly` (or `--version latest`).[/dim]"
+            )
+    renderer.emit(result, command="update")
+
+
+def _refresh_node_id_cache() -> None:
+    """Re-export the custom-node id cache that backs shell tab-completion.
+
+    Best-effort: a stale cache only degrades completion, so a failure here is a
+    warning, never the command's outcome.
+    """
+    try:
+        custom_nodes.command.update_node_id_cache()
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        rprint(f"[yellow]Failed to update node id cache: {e}[/yellow]")
+
+
+@app.command(help="Update ScalifyUI Environment \\[all|scalify|cli]. To update custom nodes, use `scalify node update`.")
+@tracking.track_command()
+def update(
+    target: str = typer.Argument(
+        "scalify",
+        help="\\[all|scalify|cli]",
+        autocompletion=utils.create_choice_completer(["all", "scalify", "cli"]),
+    ),
+    version: Annotated[
+        str | None,
+        typer.Option(
+            "--version",
+            show_default=False,
+            callback=validate_optional_version,
+            help=(
+                "Switch the existing ScalifyUI workspace to a specific version instead of pulling the current "
+                "branch. Accepts 'nightly' (the default branch), 'latest' (newest stable release), or a version "
+                "number such as 0.3.0. Only valid for target 'scalify'. Uncommitted changes are stashed first and "
+                "never popped automatically; a version number checks out a tag, leaving a detached HEAD — roll "
+                "forward again with --version nightly. Dependencies are reinstalled from requirements.txt; torch "
+                "is left untouched."
+            ),
+        ),
+    ] = None,
+    no_stash: Annotated[
+        bool,
+        typer.Option(
+            "--no-stash",
+            show_default=False,
+            help=(
+                "With --version, refuse to switch when the ScalifyUI workspace has uncommitted changes "
+                "instead of stashing them."
+            ),
+        ),
+    ] = False,
+    exit_on_fail: Annotated[
+        bool,
+        typer.Option(
+            "--exit-on-fail",
+            help=(
+                "Exit on failure. Only affects target 'all': without it a failing custom-node update is "
+                "printed but still exits 0. Targets 'scalify' and 'cli' already exit non-zero on failure."
+            ),
+        ),
+    ] = False,
+):
+    if target not in ["all", "scalify", "cli"]:
+        typer.echo(
+            f"Invalid target: {target}. Allowed targets are 'all', 'scalify', 'cli'.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    if version is not None and target != "scalify":
+        get_renderer().error(
+            code="update_version_target_invalid",
+            message=f"--version is only supported for target 'scalify', not '{target}'.",
+            hint="run `scalify update scalify --version <version>`",
+        )
+        raise typer.Exit(code=1)
+
+    if "cli" == target:
+        from scalify_cli.update import upgrade_cli
+
+        rprint("Updating scalify-cli...")
+        upgrade_cli()
+        return
+
+    scalify_path = workspace_manager.workspace_path
+
+    if "all" == target:
+        # Without raise_on_error, execute_cm_cli swallows a cm-cli exit 1 and returns None,
+        # so `scalify update all` would report success for a failed pack update. Mirrors the
+        # --exit-on-fail plumbing in `scalify node install`.
+        #
+        # Unlike `node install`, the flag is deliberately NOT forwarded to cm-cli: its
+        # `update` subcommand takes only (nodes, channel, mode, user_directory) — no
+        # --exit-on-fail — so passing it would be a Typer usage error and make the flag
+        # fail every invocation. Only `cm-cli install` has one.
+        try:
+            custom_nodes.command.execute_cm_cli(["update", "all"], raise_on_error=exit_on_fail)
+        except subprocess.CalledProcessError as e:
+            if not exit_on_fail:
+                # execute_cm_cli re-raises unexpected exit codes even with raise_on_error off;
+                # keep surfacing those instead of swallowing them here.
+                raise
+            # `cm-cli update all` is non-atomic — packs that did update stayed updated — so
+            # refresh the id cache exactly as the no-flag path below does before bailing out.
+            _refresh_node_id_cache()
+            from scalify_cli.command.custom_nodes.cm_cli_util import normalize_cm_cli_exit_code
+
+            code = normalize_cm_cli_exit_code(e.returncode)
+            get_renderer().error(
+                code="update_custom_nodes_failed",
+                message=f"`cm-cli update all` failed with exit code {e.returncode}.",
+                hint="re-run `scalify update all` to retry; it is safe to repeat",
+                details={"cm_cli_returncode": e.returncode},
+                exit_code=code,
+            )
+            raise typer.Exit(code=code) from e
+    else:
+        rprint(f"Updating ScalifyUI in {scalify_path}...")
+        if scalify_path is None:
+            rprint("ScalifyUI path is not found.")
+            raise typer.Exit(code=1)
+        if version is not None:
+            _switch_scalify_version(scalify_path, version, stash=not no_stash)
+        else:
+            # Resolved before the chdir so a ``git`` planted in ``scalify_path``
+            # can neither be picked up nor shadow the real one.
+            git_bin = resolve_required_binary("git")
+            os.chdir(scalify_path)
+            subprocess.run([git_bin, "pull"], check=True)
+            python = resolve_workspace_python(scalify_path)
+            # A uv-managed venv may have no pip — bootstrap it first so the install
+            # below doesn't crash with `No module named pip` (no-op if pip exists).
+            ensure_pip(python, cwd=scalify_path)
+            subprocess.run(
+                [python, "-m", "pip", "install", "-r", "requirements.txt"],
+                check=True,
+            )
+
+    _refresh_node_id_cache()
+
+
+@app.command(help="Report installed-vs-latest versions for ScalifyUI core and custom node packs (read-only).")
+@tracking.track_command()
+def outdated(
+    refresh: Annotated[
+        bool,
+        typer.Option("--refresh", help="Bypass the 1h latest-version cache and re-query the network."),
+    ] = False,
+):
+    from scalify_cli.command import outdated as outdated_command
+
+    outdated_command.execute(get_renderer(), workspace_manager.workspace_path, refresh=refresh)
+
+
+@app.command(help="Run an API workflow. Submits and returns immediately by default; pass --wait to block.")
+def run(
+    workflow: Annotated[
+        str | None,
+        typer.Option(
+            help=(
+                "Path to the workflow JSON file. Both ScalifyUI API format and "
+                "exported UI format are accepted; UI workflows are converted "
+                "to API format client-side. Optional: omit it and pass --prompt "
+                "to run the bundled default text2img workflow."
+            )
+        ),
+    ] = None,
+    prompt: Annotated[
+        str | None,
+        typer.Option(
+            "--prompt",
+            show_default=False,
+            help=(
+                "Positive text prompt for the bundled default text2img workflow "
+                "(used when --workflow is omitted). Cannot be combined with --workflow. "
+                "The bundled graph prefers an SD1.5 checkpoint "
+                "(v1-5-pruned-emaonly-fp16.safetensors); if the target doesn't have it, "
+                "an installed checkpoint is substituted and reported. Pin your own with "
+                "--set checkpoint=<name>."
+            ),
+        ),
+    ] = None,
+    set_overrides: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--set",
+            show_default=False,
+            help=(
+                "Override a field in the bundled default workflow, repeatable. "
+                "Form: alias=VALUE (checkpoint/negative/seed/steps/cfg/width/height/…) "
+                "or NODE_ID.field=VALUE (e.g. 4.ckpt_name=model.safetensors). "
+                "Cannot be combined with --workflow."
+            ),
+        ),
+    ] = None,
+    wait: Annotated[
+        bool,
+        typer.Option(
+            "--wait",
+            show_default=False,
+            help="Block until the workflow completes (old default). Without this, the command submits and exits.",
+        ),
+    ] = False,
+    notify: Annotated[
+        bool | None,
+        typer.Option(
+            "--notify/--no-notify",
+            show_default=False,
+            help="Fire a desktop notification when a background job completes. Default: on for humans, off for agents.",
+        ),
+    ] = None,
+    verbose: Annotated[
+        bool,
+        typer.Option(help="Enables verbose output of the execution process."),
+    ] = False,
+    host: Annotated[
+        str | None,
+        typer.Option(help="The IP/hostname where the ScalifyUI instance is running, e.g. 127.0.0.1 or localhost."),
+    ] = None,
+    port: Annotated[
+        int | None,
+        typer.Option(help="The port where the ScalifyUI instance is running, e.g. 8188."),
+    ] = None,
+    timeout: Annotated[
+        int,
+        typer.Option(
+            help=(
+                "Per-event timeout in seconds: bails out if the server is silent "
+                "for this long (measured against the wall clock, so it still fires "
+                "after the machine wakes from sleep). Also caps HTTP connect, "
+                "/prompt POST, and websocket handshake. NOT a wall-clock execution "
+                "deadline — a workflow that streams progress events faster than the "
+                "timeout can run indefinitely. For long local batches, prevent sleep "
+                "with `caffeinate` (macOS)."
+            ),
+        ),
+    ] = 120,
+    where: Annotated[
+        str | None,
+        typer.Option(
+            "--where",
+            show_default=False,
+            help="Routing target: 'local' or 'cloud'.",
+        ),
+    ] = None,
+    api_key: Annotated[
+        str | None,
+        typer.Option(
+            "--api-key",
+            envvar="SCALIFY_API_KEY",
+            help=(
+                "Scalify API key for API Nodes (Partner Nodes). "
+                "Embedded in the POST /prompt request body as extra_data.api_key_scalify_org. "
+                "For scripting, prefer the SCALIFY_API_KEY environment variable so the secret "
+                "stays out of shell history."
+            ),
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help=(
+                "Stream NDJSON events to stdout instead of human-readable output: "
+                'one `{"schema": "event/1", "type": ...}` object per line, '
+                'with a final `type: "envelope"` line carrying ok/error. Same '
+                "dialect as the global --json-stream flag; see docs/json-output.md "
+                "for the event reference and stability contract. In this mode, "
+                "--verbose has no effect and Rich progress is suppressed. "
+                "Workflow input accepts both API and UI format JSON (UI input "
+                "triggers a `converted` event before `queued`). The converted "
+                "workflow graph is always emitted as a `prompt_preview` event "
+                "before `queued`, so agents have a full audit trail of what "
+                "the CLI submitted."
+            ),
+        ),
+    ] = False,
+    print_prompt: Annotated[
+        bool,
+        typer.Option(
+            "--print-prompt",
+            help=(
+                "Print the API-format workflow graph that WOULD be sent to /prompt and exit. "
+                "Does not POST and does not execute. For UI-format input the workflow is "
+                "converted first (requires a reachable ScalifyUI for /object_info); API input "
+                "is printed as-is with no server hit. In --json mode emits a `prompt_preview` "
+                "event; otherwise pretty-prints to stdout."
+            ),
+        ),
+    ] = False,
+    workflow_id: Annotated[
+        str | None,
+        typer.Option(
+            "--workflow-id",
+            show_default=False,
+            help="Cloud workflow entity id to associate this run with (enables draft auto-save on run).",
+        ),
+    ] = None,
+    no_watch: Annotated[
+        bool,
+        typer.Option(
+            "--no-watch",
+            show_default=False,
+            help=(
+                "Suppress the detached background watcher subprocess for non-blocking "
+                "runs (equivalent to setting SCALIFY_NO_WATCH=1). Agentic callers with "
+                "their own job-wait loop don't need a second process polling in the "
+                "background; it just holds onto credentials after the parent exits."
+            ),
+        ),
+    ] = False,
+    allow_spend: Annotated[
+        bool,
+        typer.Option(
+            "--allow-spend",
+            help=(
+                "Consent to running partner-API (paid) nodes that spend Scalify credits. "
+                "Required for workflows embedding partner nodes when not confirming interactively."
+            ),
+        ),
+    ] = False,
+    client_id: Annotated[
+        str | None,
+        typer.Option(
+            "--client-id",
+            show_default=False,
+            help=(
+                "Local-only: submit as this already-connected WebSocket clientId instead of a fresh "
+                "one. ScalifyUI sends a prompt's execution events only to the socket that submitted it, "
+                "so passing a browser tab's clientId is what makes that tab show node highlights, "
+                "progress and outputs for a run it did not start. This invocation then cannot watch "
+                "the run itself, so it cannot be combined with --wait."
+            ),
+        ),
+    ] = None,
+):
+    # Snapshot kwargs before the body mutates api_key/host/port — analytics should record what user actually supplied.
+    _track_props = tracking.filter_command_kwargs(dict(locals()))
+    tracking.track_event("execution_start", _track_props, mixpanel_name="run")
+
+    # Resolved outside the try so `renderer` is always bound by the time the
+    # `finally` below unstamps `where`, however early the body dies.
+    renderer = get_renderer()
+    # `Renderer` is a process-wide singleton, so a routed target stamped by an
+    # earlier in-process invocation would otherwise still be sitting here and
+    # would mislabel any envelope emitted before *this* run routes (e.g.
+    # `where_invalid`). Start every invocation unrouted.
+    renderer.where = None
+    if no_watch:
+        os.environ["SCALIFY_NO_WATCH"] = "1"
+
+    try:
+        if api_key:
+            api_key = api_key.strip() or None
+
+        config = ConfigManager()
+
+        # Command-local --json means "stream the run": upgrade the renderer
+        # (resolved once in the entry callback) into NDJSON mode so every
+        # renderer.event(...) line plus the final envelope reaches stdout.
+        # One dialect — same shape as the global --json-stream flag.
+        if json_output:
+            renderer.force_stream()
+
+        try:
+            decision = where_module.resolve(flag=where, config_value=config.get(where_module.CONFIG_KEY_WHERE_DEFAULT))
+        except ValueError as e:
+            renderer.error(code="where_invalid", message=str(e), hint="use --where local or --where cloud")
+            raise typer.Exit(code=1)
+
+        # The routing target is now known, so every downstream error envelope
+        # can carry it. Explicit ``emit(..., where=...)`` calls still win; this
+        # only fills the fallback (``where or self.where``) that error() and
+        # emit() resolve against.
+        renderer.where = decision.target.value
+        # Record the RESOLVED routing target so submission analytics can tell a
+        # cloud run from a local one even when --where was defaulted (the raw
+        # `where` kwarg is None then). Rides on the execution_success/_error events.
+        _track_props["target"] = "cloud" if decision.target is where_module.WhereTarget.CLOUD else "local"
+
+        if client_id is not None and not client_id.strip():
+            renderer.error(
+                code="client_id_rejected",
+                message="--client-id must not be empty",
+                hint="pass the connected browser client's id, or omit --client-id",
+                details={"reason": "empty"},
+            )
+            raise typer.Exit(code=1)
+        client_id = client_id.strip() if client_id is not None else None
+        if client_id:
+            rejection = None
+            if decision.target is where_module.WhereTarget.CLOUD:
+                rejection = ("cloud", "--client-id addresses a local ScalifyUI socket and has no meaning on cloud")
+            elif wait:
+                rejection = (
+                    "wait",
+                    "--client-id hands this run's events to another client, so --wait would watch a silent socket",
+                )
+            if rejection is not None:
+                reason, message = rejection
+                renderer.error(
+                    code="client_id_rejected",
+                    message=message,
+                    hint="drop --client-id, or drop the conflicting flag",
+                    details={"reason": reason},
+                )
+                raise typer.Exit(code=1)
+
+        # Default for --notify: on when a human is at the terminal, off for
+        # agents (they shouldn't get surprise side-channel processes they didn't
+        # ask for). The user can override either way with --notify/--no-notify.
+        effective_notify = notify if notify is not None else (renderer.is_pretty() and not wait)
+
+        # --prompt/--set build an in-memory API-format graph from the bundled
+        # default text2img workflow (no --workflow file). The aliases resolve
+        # against OUR pinned node ids, so mixing them with a user --workflow —
+        # whose node ids are arbitrary — is rejected rather than silently
+        # misapplied. `preloaded` is handed straight to run's execute path.
+        preloaded: tuple[dict, str, bool, bool] | None = None
+        if prompt is not None or set_overrides:
+            if workflow is not None:
+                renderer.error(
+                    code="prompt_rejected",
+                    message="--prompt/--set apply to the bundled default workflow and cannot be combined with --workflow",
+                    hint="drop --workflow to use the bundled default, or edit the workflow file directly",
+                )
+                raise typer.Exit(code=1)
+            from scalify_cli.cql.default_workflow import (
+                PromptInjectionError,
+                build_default_workflow,
+                overrides_set_checkpoint,
+            )
+
+            try:
+                injected = build_default_workflow(prompt=prompt, overrides=set_overrides)
+            except PromptInjectionError as e:
+                renderer.error(code=e.code, message=str(e), hint=e.hint)
+                raise typer.Exit(code=1) from e
+            # If the user pinned the checkpoint (--set checkpoint=… / 4.ckpt_name=…),
+            # honor it verbatim: runtime resolution is skipped downstream.
+            checkpoint_user_set = overrides_set_checkpoint(set_overrides, injected)
+            preloaded = (injected, "default_text2img", False, checkpoint_user_set)
+        elif workflow is None:
+            renderer.error(
+                code="prompt_rejected",
+                message="run requires --workflow, or --prompt (with optional --set) to use the bundled default workflow",
+                hint="e.g. scalify run --prompt 'a red fox in snow' --wait",
+            )
+            raise typer.Exit(code=1)
+
+        if decision.target is where_module.WhereTarget.CLOUD:
+            where_module.cloud_preflight_or_exit()
+            # Cloud path uses HTTPS + Bearer auth; host/port aren't applicable.
+            # NOTE: do NOT `return` here — falling through to the try's `else`
+            # is what fires `execution_success`. An early return skipped it, so
+            # successful cloud submissions emitted `execution_start` but never
+            # `execution_success` (local runs were unaffected).
+            run_inner.execute_cloud(
+                workflow,
+                wait=wait,
+                verbose=verbose,
+                timeout=timeout,
+                notify=effective_notify,
+                print_prompt=print_prompt,
+                workflow_id=workflow_id,
+                preloaded=preloaded,
+                allow_spend=allow_spend,
+            )
+        else:
+            # Both targets must fall off the END of this try suite: Python skips
+            # a try's `else:` clause when the suite leaves via `return`, so an
+            # early return here would silently drop the `execution_success`
+            # tracking below (it only ever fired on the cloud branch by way of
+            # the `except typer.Exit` handler).
+            from scalify_cli.host_port import parse_host_port_arg, report_usage_error, resolve_host_port
+
+            # ``report_usage_error``: a bad ``--host``/``--port`` is a
+            # ``typer.BadParameter``, which click turns into a stderr usage panel +
+            # exit 2 — leaving stdout empty in JSON/NDJSON mode while every other
+            # failure here ends with an envelope. Emit the terminating envelope
+            # first; the exception still propagates, so exit 2 is unchanged.
+            with report_usage_error(renderer):
+                if host:
+                    host, parsed_port = parse_host_port_arg(host)
+                    # ``port is None``, not ``not port``: a typed ``--port`` always wins
+                    # over one embedded in ``--host h:p``, including ``--port 0``, which
+                    # ``resolve_host_port`` then rejects as out of range instead of
+                    # silently running against the embedded port.
+                    if port is None and parsed_port is not None:
+                        port = parsed_port
+
+                host, port = resolve_host_port(host, port)
+
+            run_inner.execute(
+                workflow,
+                host,
+                port,
+                wait=wait,
+                verbose=verbose,
+                timeout=timeout,
+                notify=effective_notify,
+                api_key=api_key,
+                print_prompt=print_prompt,
+                preloaded=preloaded,
+                allow_spend=allow_spend,
+                client_id=client_id,
+            )
+    except typer.Exit as e:
+        if (e.exit_code or 0) == 0:
+            tracking.track_event("execution_success", _track_props)
+        else:
+            tracking.track_event(
+                "execution_error",
+                {**_track_props, "error_type": type(e).__name__, "exit_code": e.exit_code},
+            )
+        raise
+    except Exception as e:
+        tracking.track_event(
+            "execution_error",
+            {**_track_props, "error_type": type(e).__name__},
+        )
+        raise
+    else:
+        tracking.track_event("execution_success", _track_props)
+    finally:
+        # Every envelope this invocation emits has already been written by now
+        # (renderer.error/emit flush inline), so unstamp the singleton rather
+        # than leaving `run`'s routed target visible to whatever emits next in
+        # this process — an atexit/tracking path, or a second invocation.
+        renderer.where = None
+
+
+@app.command(
+    hidden=True,
+    help=(
+        "[DEPRECATED — use 'scalify workflow validate'] Validate a workflow without submitting "
+        "(UI exports are converted to API format first). Checks class_types, input shapes, enum "
+        "values, edge wiring, and the dotted sub-inputs a dynamic combo's selected option requires."
+    ),
+)
+@tracking.track_command()
+def validate(
+    workflow: Annotated[
+        str,
+        typer.Option(help="Path to the workflow JSON file (API format or a frontend/canvas graph)."),
+    ],
+    where: Annotated[
+        str | None,
+        typer.Option("--where", show_default=False, help="Routing target for object_info: 'local' or 'cloud'."),
+    ] = None,
+    host: Annotated[
+        str | None,
+        typer.Option(
+            show_default=False, help="ScalifyUI host (defaults to SCALIFY_LOCAL_URL, the background server, or 127.0.0.1)."
+        ),
+    ] = None,
+    port: Annotated[
+        int | None,
+        typer.Option(
+            show_default=False, help="ScalifyUI port (defaults to SCALIFY_LOCAL_URL, the background server, or 8188)."
+        ),
+    ] = None,
+    input_path: Annotated[
+        str | None,
+        typer.Option("--input", show_default=False, help="Path to a saved object_info JSON (offline mode)."),
+    ] = None,
+):
+    # Deprecated alias for `scalify workflow validate` (its canonical home). Kept
+    # functional for backward compatibility; warns and delegates to the shared
+    # implementation. The warning routes to stderr in JSON modes, so structured
+    # output stays clean.
+    from scalify_cli.command.workflow import validate_api_workflow
+
+    get_renderer().warn("`scalify validate` is deprecated — use `scalify workflow validate` instead.")
+    validate_api_workflow(workflow, where=where, host=host, port=port, input_path=input_path, command="validate")
+
+
+# How a `cloud` routing decision was reached, in words, for the --host/--port
+# rejection message. Keys are `where.WhereResolution.source` values.
+_WHERE_SOURCE_PHRASES = {
+    "flag": "targeting cloud via --where cloud",
+    "env": "targeting cloud via the SCALIFY_WHERE environment variable",
+    "project": "targeting cloud via this project's configured default",
+    "config": "targeting cloud via your saved `where_default` setting",
+    "auto": "targeting cloud because you're signed in (no explicit --where)",
+}
+
+
+@app.command(help="Upload files to the ScalifyUI server's input directory.")
+@tracking.track_command()
+def upload(
+    files: Annotated[list[str], typer.Argument(help="Local file paths to upload.")],
+    where: Annotated[
+        str | None,
+        typer.Option("--where", show_default=False, help="Routing target: 'local' or 'cloud'."),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite/--no-overwrite", help="Overwrite existing files on the server."),
+    ] = True,
+    host: Annotated[
+        str | None,
+        typer.Option(help="Server host (defaults to SCALIFY_LOCAL_URL or 127.0.0.1). Local targets only."),
+    ] = None,
+    port: Annotated[
+        int | None,
+        typer.Option(help="Server port (defaults to SCALIFY_LOCAL_URL or 8188). Local targets only."),
+    ] = None,
+):
+    config = ConfigManager()
+    renderer = get_renderer()
+
+    # Validate the flags before resolving anything: the host lands verbatim in
+    # ``http://{host}:{port}/upload/image``, so a URL-special or control
+    # character is a usage error (BadParameter, exit 2) regardless of target.
+    # ``report_usage_error`` emits the terminating envelope for that rejection
+    # in JSON/NDJSON mode; the exception still escapes, so exit stays 2.
+    with report_usage_error(renderer):
+        if host is not None:
+            host = validate_host(host)
+        if port is not None and not (1 <= port <= 65535):
+            raise typer.BadParameter(f"invalid port: {port} is out of range (1-65535)")
+
+    try:
+        decision = where_module.resolve(flag=where, config_value=config.get(where_module.CONFIG_KEY_WHERE_DEFAULT))
+    except ValueError as e:
+        renderer.error(code="where_invalid", message=str(e), hint="use --where local or --where cloud")
+        raise typer.Exit(code=1)
+
+    effective_where = "cloud" if decision.target is where_module.WhereTarget.CLOUD else "local"
+    # Routing is decided, so every error envelope from here down can name the
+    # target — including the `host_flag_cloud` rejection immediately below,
+    # which never reaches `execute_upload`. The `where_invalid` above stays
+    # `where: null`: it failed before there was a decision to report.
+    renderer.where = effective_where
+    # --host/--port address a local ScalifyUI; the cloud target's address comes
+    # from the signed-in account's base URL and ignores them entirely
+    # (``Target.host``/``Target.port`` are documented local-only). Rejecting
+    # the combination beats silently uploading somewhere the user didn't name.
+    # Checked before the preflight so the flag error isn't masked by a
+    # "not signed in" error.
+    if effective_where == "cloud" and (host is not None or port is not None):
+        # The cloud target can come from an explicit --where, but equally from
+        # SCALIFY_WHERE, a project/config default, or credential auto-detection —
+        # so name the source rather than accusing the user of passing a flag
+        # they may never have typed.
+        source = _WHERE_SOURCE_PHRASES.get(decision.source, f"resolved to cloud by {decision.source}")
+        renderer.error(
+            code="host_flag_cloud",
+            message=f"--host/--port target a local ScalifyUI server, but this run is {source}",
+            hint=(
+                "pass --where local to aim at a local server; to reach a different cloud address "
+                "set SCALIFY_CLOUD_BASE_URL or run `scalify cloud set-base-url`"
+            ),
+            details={"host": host, "port": port, "where": effective_where, "where_source": decision.source},
+        )
+        raise typer.Exit(code=1)
+    if effective_where == "cloud":
+        where_module.cloud_preflight_or_exit()
+
+    transfer_inner.execute_upload(files, where=effective_where, overwrite=overwrite, host=host, port=port)
+
+
+@app.command(help="Download outputs from a completed job. Reads prompt_id from argument or piped stdin.")
+@tracking.track_command()
+def download(
+    prompt_id: Annotated[
+        str | None,
+        typer.Argument(help="Prompt ID to download outputs for. Omit to read from piped stdin.", show_default=False),
+    ] = None,
+    out_dir: Annotated[
+        str,
+        typer.Option("--out-dir", "-o", help="Directory to save outputs to."),
+    ] = "./outputs",
+    where: Annotated[
+        str | None,
+        typer.Option("--where", show_default=False, help="Routing target: 'local' or 'cloud'."),
+    ] = None,
+    url_only: Annotated[
+        bool,
+        typer.Option(
+            "--url-only",
+            show_default=False,
+            help="Emit output URLs without downloading files. Useful for agents that pass URLs to other tools.",
+        ),
+    ] = False,
+):
+    config = ConfigManager()
+    renderer = get_renderer()
+    try:
+        decision = where_module.resolve(flag=where, config_value=config.get(where_module.CONFIG_KEY_WHERE_DEFAULT))
+    except ValueError as e:
+        renderer.error(code="where_invalid", message=str(e), hint="use --where local or --where cloud")
+        raise typer.Exit(code=1)
+
+    effective_where = "cloud" if decision.target is where_module.WhereTarget.CLOUD else "local"
+    # As in `upload`: stamped once routing resolves, so the preflight failure
+    # below and `execute_download`'s stdin-parsing errors (which run before it
+    # resolves its own target) all name the backend this invocation routed to.
+    renderer.where = effective_where
+    if effective_where == "cloud":
+        where_module.cloud_preflight_or_exit()
+
+    transfer_inner.execute_download(prompt_id, out_dir=out_dir, where=effective_where, url_only=url_only)
+
+
+@app.command("run-cli", help="Walk through the CLI surface in realtime with a tiny no-model workflow.")
+@tracking.track_command()
+def run_cli(
+    pause_seconds: Annotated[
+        float,
+        typer.Option(
+            "--pause-seconds",
+            help="Seconds to pause between steps for readability. Use 0 for fast/CI runs.",
+        ),
+    ] = 3.0,
+    no_pause: Annotated[
+        bool,
+        typer.Option("--no-pause", help="Equivalent to --pause-seconds 0."),
+    ] = False,
+    show_agent: Annotated[
+        bool,
+        typer.Option(
+            "--show-agent/--no-show-agent",
+            help="Also show the --json envelope an agent would parse for each command. On by default.",
+        ),
+    ] = True,
+    no_cleanup: Annotated[
+        bool,
+        typer.Option("--no-cleanup", help="Keep the temporary demo workflow file after the run."),
+    ] = False,
+):
+    effective_pause = 0.0 if no_pause else pause_seconds
+    raise typer.Exit(
+        code=run_cli_inner.execute(pause_seconds=effective_pause, no_cleanup=no_cleanup, show_agent=show_agent)
+    )
+
+
+@app.command(
+    "system-stats",
+    help="Show ScalifyUI system stats: per-device VRAM + system RAM/version (GET /system_stats).",
+)
+@tracking.track_command()
+def system_stats(
+    where: Annotated[
+        str | None,
+        typer.Option("--where", show_default=False, help="Routing target: 'local' (default) or 'cloud'."),
+    ] = None,
+):
+    from scalify_cli.command import system as system_command
+
+    system_command.system_stats_execute(get_renderer(), where=where)
+
+
+@app.command(
+    help="Ask ScalifyUI to unload models / free the executor cache (POST /free). "
+    "Applies on the worker's next iteration — never interrupts a running job."
+)
+@tracking.track_command()
+def free(
+    unload_models: Annotated[
+        bool,
+        typer.Option("--unload-models/--no-unload-models", help="Unload all models from VRAM."),
+    ] = True,
+    free_memory: Annotated[
+        bool,
+        typer.Option(
+            "--free-memory",
+            help="Also reset the executor cache; implies --unload-models on the server side.",
+        ),
+    ] = False,
+    where: Annotated[
+        str | None,
+        typer.Option("--where", show_default=False, help="Routing target: 'local' (default) or 'cloud'."),
+    ] = None,
+):
+    from scalify_cli.command import system as system_command
+
+    system_command.free_execute(get_renderer(), where=where, unload_models=unload_models, free_memory=free_memory)
+
+
+@app.command(help="Stop background ScalifyUI. Use --port to stop an untracked local ScalifyUI this CLI didn't start.")
+@tracking.track_command()
+def stop(
+    port: Annotated[
+        int | None,
+        typer.Option(
+            "--port",
+            show_default=False,
+            min=1,
+            max=65535,
+            help="Stop whatever local ScalifyUI is listening on this port, even if this CLI didn't start it. "
+            "Refuses anything it cannot positively identify as ScalifyUI.",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Report the process that would be stopped and exit 0 without stopping it.",
+        ),
+    ] = False,
+):
+    renderer = get_renderer()
+
+    if port is not None:
+        from scalify_cli.command import stop_port
+
+        stop_port.stop_port_execute(renderer, port=port, dry_run=dry_run)
+        return
+
+    config = ConfigManager()
+    bg_info = config.background if constants.CONFIG_KEY_BACKGROUND in config.config["DEFAULT"] else None
+    if not bg_info:
+        rprint("[bold red]No ScalifyUI is running in the background.[/bold red]\n")
+        if renderer.is_json():
+            renderer.error(
+                code="no_background_server",
+                message="No ScalifyUI is running in the background.",
+                command="stop",
+            )
+        raise typer.Exit(code=1)
+
+    if dry_run:
+        rprint(
+            f"[bold yellow]Would stop background ScalifyUI.[/bold yellow] ({bg_info[0]}:{bg_info[1]}, pid={bg_info[2]})"
+        )
+        renderer.emit(
+            {
+                "stopped": False,
+                "dry_run": True,
+                "untracked": False,
+                "host": bg_info[0],
+                "port": bg_info[1],
+                "pid": bg_info[2],
+            },
+            command="stop",
+            changed=False,
+        )
+        return
+
+    is_killed = utils.kill_all(bg_info[2])
+
+    if not is_killed:
+        # The kill failed (permissions, a race, or the process is still alive).
+        # Do NOT remove the background record — it is the only handle a retried
+        # `scalify stop` has to target this PID/host/port; dropping it here would
+        # orphan a live server. Surface a non-zero exit in BOTH pretty and JSON
+        # mode so `$?`-checking scripts see the failure (pretty mode otherwise
+        # printed the error yet returned 0).
+        rprint("[bold red]Failed to stop ScalifyUI in the background.[/bold red]\n")
+        if renderer.is_json():
+            renderer.error(
+                code="stop_failed",
+                message="Failed to stop ScalifyUI in the background.",
+                command="stop",
+                details={"pid": bg_info[2]},
+            )
+        raise typer.Exit(code=1)
+
+    rprint(f"[bold yellow]Background ScalifyUI is stopped.[/bold yellow] ({bg_info[0]}:{bg_info[1]})")
+    config.remove_background()
+
+    if renderer.is_json():
+        renderer.emit(
+            {"stopped": True, "host": bg_info[0], "port": bg_info[1], "pid": bg_info[2]},
+            command="stop",
+            changed=True,
+        )
+
+
+@app.command(help="Launch ScalifyUI: ?[--background] ?[-- <extra args ...>]")
+@tracking.track_command()
+def launch(
+    extra: list[str] = typer.Argument(None),
+    background: Annotated[bool, typer.Option(help="Launch ScalifyUI in background")] = False,
+    frontend_pr: Annotated[
+        str | None,
+        typer.Option(
+            "--frontend-pr",
+            show_default=False,
+            help="Use a specific frontend PR. Supports formats: username:branch, #123, or PR URL",
+        ),
+    ] = None,
+):
+    from scalify_cli.command.launch import launch as launch_command
+
+    launch_command(background, extra, frontend_pr)
+
+
+@app.command(help="Show a captured ScalifyUI log (from `scalify launch --background`, or ScalifyUI-Manager's own logfile).")
+@tracking.track_command()
+def logs(
+    tail: Annotated[
+        int,
+        typer.Option("--tail", help="Number of trailing log lines to show (capped for JSON payloads)."),
+    ] = 200,
+    where: Annotated[
+        str | None,
+        typer.Option("--where", show_default=False, help="Routing target. Only 'local' is supported."),
+    ] = None,
+    port: Annotated[
+        int | None,
+        typer.Option(
+            "--port",
+            show_default=False,
+            help="Show the log for this port instead of auto-resolving "
+            "(falls back to user/scalifyui.log, which is where a server started "
+            "without an explicit --port logs).",
+        ),
+    ] = None,
+):
+    from scalify_cli.command.launch import logs as logs_command
+
+    logs_command(tail=tail, where=where, port=port)
+
+
+@app.command("setup", help="Interactive setup wizard — routing, auth, and agent skills in one step.")
+@tracking.track_command()
+def setup(
+    where: Annotated[
+        str | None,
+        typer.Option(
+            "--where", show_default=False, help="Routing target: 'local' or 'cloud'. Skips the interactive prompt."
+        ),
+    ] = None,
+    api_key: Annotated[
+        str | None,
+        typer.Option("--api-key", show_default=False, help="Scalify Cloud API key. Implies --where cloud."),
+    ] = None,
+    project_dir: Annotated[
+        str | None,
+        typer.Option("--project-dir", show_default=False, help="Project directory for workflows, inputs, and outputs."),
+    ] = None,
+    non_interactive: Annotated[
+        bool,
+        typer.Option(
+            "--non-interactive",
+            "-y",
+            show_default=False,
+            help="No prompts — use flags for all choices. For CI, devcontainers, and scripted installs.",
+        ),
+    ] = False,
+    skip_skills: Annotated[
+        bool,
+        typer.Option("--skip-skills", show_default=False, help="Skip agent skill installation."),
+    ] = False,
+    skip_verify: Annotated[
+        bool,
+        typer.Option("--skip-verify", show_default=False, help="Skip connectivity verification."),
+    ] = False,
+):
+    from scalify_cli.command import setup as setup_inner
+
+    setup_inner.execute(
+        where=where,
+        api_key=api_key,
+        project_dir=project_dir,
+        non_interactive=non_interactive,
+        skip_skills=skip_skills,
+        skip_verify=skip_verify,
+    )
+
+
+@app.command("set-default", help="Persist defaults: ScalifyUI workspace path and/or `--where` mode.")
+@tracking.track_command()
+def set_default(
+    workspace_path: Annotated[
+        str | None,
+        typer.Argument(help="Path to ScalifyUI workspace (optional — pass to set the default workspace)."),
+    ] = None,
+    launch_extras: Annotated[
+        str | None,
+        typer.Option(help="Extra options forwarded to `scalify launch`."),
+    ] = None,
+    where: Annotated[
+        str | None,
+        typer.Option(
+            "--where",
+            show_default=False,
+            help="Persist the default routing mode: 'local' or 'cloud'. "
+            "Once set, every command honors it without a per-invocation flag.",
+        ),
+    ] = None,
+    clear_where: Annotated[
+        bool,
+        typer.Option(
+            "--clear-where",
+            show_default=False,
+            help="Clear the persisted --where so commands fall back to env / local default.",
+        ),
+    ] = False,
+):
+    renderer = get_renderer()
+    config = ConfigManager()
+    changed_workspace = False
+    changed_where = False
+
+    if where is not None:
+        try:
+            where_module._parse(where)
+        except ValueError as e:
+            renderer.error(code="where_invalid", message=str(e), hint="use --where local or --where cloud")
+            raise typer.Exit(code=1) from e
+        config.set(where_module.CONFIG_KEY_WHERE_DEFAULT, where.strip().lower())
+        changed_where = True
+
+    if clear_where:
+        config.set(where_module.CONFIG_KEY_WHERE_DEFAULT, "")
+        changed_where = True
+
+    if workspace_path is not None:
+        scalify_path = os.path.abspath(os.path.expanduser(workspace_path))
+        if not os.path.exists(scalify_path):
+            renderer.error(
+                code="not_in_workspace", message=f"Path not found: {scalify_path}", hint="pass a real workspace path"
+            )
+            raise typer.Exit(code=1)
+        is_scalify_repo, resolved_path = check_scalify_repo(scalify_path)
+        if not is_scalify_repo:
+            renderer.error(
+                code="not_in_workspace",
+                message=f"Not a ScalifyUI workspace: {scalify_path}",
+                hint="`scalify install` to scaffold one, or pass a different path",
+            )
+            raise typer.Exit(code=1)
+        assert resolved_path is not None
+        workspace_manager.set_default_workspace(resolved_path)
+        if launch_extras is not None:
+            workspace_manager.set_default_launch_extras(launch_extras)
+        changed_workspace = True
+
+    if not (changed_workspace or changed_where):
+        renderer.error(
+            code="missing_argument",
+            message="set-default needs at least one of: <workspace_path>, --where, or --clear-where.",
+            hint="example: `scalify set-default --where cloud`",
+        )
+        raise typer.Exit(code=1)
+
+    persisted_where = config.get(where_module.CONFIG_KEY_WHERE_DEFAULT) or None
+    workspace_value = config.get(constants.CONFIG_KEY_DEFAULT_WORKSPACE) if changed_workspace else None
+    if renderer.is_pretty():
+        if changed_workspace:
+            rprint(f"[bold green]✓[/bold green] Default workspace → [cyan]{workspace_value or '?'}[/cyan]")
+        if changed_where:
+            if clear_where:
+                rprint(
+                    "[bold green]✓[/bold green] Cleared persisted [bold]where[/bold] (falls back to env / local default)."
+                )
+            else:
+                rprint(f"[bold green]✓[/bold green] Default [bold]where[/bold] → [cyan]{persisted_where}[/cyan]")
+    renderer.emit(
+        {
+            "default_workspace": workspace_value,
+            "default_launch_extras": launch_extras if changed_workspace else None,
+            "default_where": persisted_where,
+        },
+        command="set-default",
+        changed=True,
+    )
+
+
+@app.command(help="Show which ScalifyUI is selected.")
+@tracking.track_command()
+def which():
+    renderer = get_renderer()
+    scalify_path = workspace_manager.workspace_path
+    if scalify_path is None:
+        renderer.error(
+            code="not_in_workspace",
+            message="ScalifyUI not found, please run 'scalify install', run 'scalify' in a ScalifyUI directory, or specify the workspace path with '--workspace'.",
+            hint="run: scalify install   (or pass --workspace /path/to/ScalifyUI)",
+        )
+        raise typer.Exit(code=1)
+
+    workspace_type_value = (
+        workspace_manager.workspace_type.value if workspace_manager.workspace_type is not None else None
+    )
+    if renderer.is_pretty():
+        import sys as _sys
+
+        from scalify_cli.env_checker import _display_url
+        from scalify_cli.local_address import resolve_local_host_port
+        from scalify_cli.output.panels import which_panel
+
+        host, port = resolve_local_host_port(None, None, background=ConfigManager().background)
+        try:
+            server_running = env_checker.check_scalify_server_running(host=host, port=port, timeout=0.5)
+        except Exception:  # noqa: BLE001
+            server_running = False
+        renderer.console().print(
+            which_panel(
+                workspace_path=str(scalify_path),
+                workspace_type=workspace_type_value,
+                python_executable=_sys.executable,
+                python_version=f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}",
+                server_running=server_running,
+                server_url=_display_url(host, port),
+                version=ConfigManager().get_cli_version(),
+            )
+        )
+    renderer.emit(
+        {
+            "workspace_path": str(scalify_path),
+            "workspace_type": workspace_type_value,
+        },
+        command="which",
+    )
+
+
+@app.command(help="Emit a self-describing surface (commands, schemas, error codes) for agents.")
+@tracking.track_command()
+def discover(
+    schemas_only: Annotated[
+        bool,
+        typer.Option(
+            "--schemas-only",
+            show_default=False,
+            help="Emit only the schemas bundle, omitting the command tree.",
+        ),
+    ] = False,
+):
+    renderer = get_renderer()
+    cli_version = ConfigManager().get_cli_version()
+    doc = build_discovery(app, version=cli_version)
+    if schemas_only:
+        doc = {
+            "prog": doc["prog"],
+            "version": doc["version"],
+            "schemas": doc["schemas"],
+            "command_schemas": doc["command_schemas"],
+            "stream_event_schemas": doc["stream_event_schemas"],
+            "capabilities": doc["capabilities"],
+        }
+    if renderer.is_json():
+        renderer.emit(doc, command="discover")
+        return
+    from scalify_cli.output.panels import discover_panel
+
+    renderer.console().print(discover_panel(doc, command_count=_count_commands(doc.get("commands", {}))))
+
+
+def _count_commands(tree: dict) -> int:
+    total = 0
+    for entry in tree.values():
+        total += 1
+        subs = entry.get("subcommands") if isinstance(entry, dict) else None
+        if subs:
+            total += _count_commands(subs)
+    return total
+
+
+@app.command(help="Print out current environment variables.")
+@tracking.track_command()
+def env():
+    renderer = get_renderer()
+    # Only do the upgrade-check side-effect in pretty mode; agents asking for
+    # a snapshot don't want a network call they didn't request.
+    if renderer.is_pretty():
+        from rich.table import Table
+
+        from scalify_cli.output.branding import branded_panel
+
+        env_data = EnvChecker().fill_print_table()
+        workspace_data = workspace_manager.fill_print_table()
+        all_data = env_data + workspace_data
+
+        tbl = Table(
+            show_header=True,
+            header_style="bold magenta",
+            border_style="dim",
+            pad_edge=False,
+            expand=True,
+        )
+        tbl.add_column("Environment", style="bold cyan", no_wrap=True, overflow="fold")
+        tbl.add_column("Value", overflow="fold")
+        for label, value in all_data:
+            tbl.add_row(label, str(value))
+
+        renderer.console().print(branded_panel(tbl, title="env", version=ConfigManager().get_cli_version()))
+        return
+    # JSON path: collect structured data without printing the table.
+    data = EnvChecker().fill_data()
+    data["workspace"] = workspace_manager.fill_data()
+    renderer.emit(data, command="env")
+
+
+_FEEDBACK_DISABLED_NOTICE = (
+    "[yellow]Feedback not sent — telemetry is opted out via DO_NOT_TRACK / SCALIFY_NO_TELEMETRY.[/yellow]\n"
+    "Unset that to send, or open an issue: https://github.com/Khulnasoft/scalify-cli/issues/new/choose"
+)
+
+
+def _relay_feedback(renderer: Renderer, sent: bool, *, message: str) -> None:
+    """Surface the feedback outcome: JSON envelope for agents, a line for humans."""
+    if renderer.is_json():
+        renderer.emit({"sent": sent, "message": message}, command="feedback")
+        return
+    rprint("Thank you for your feedback!" if sent else _FEEDBACK_DISABLED_NOTICE)
+
+
+@app.command(help="Provide feedback on the Scalify CLI tool. Pass it inline to send in one shot.")
+@tracking.track_command()
+def feedback(
+    message: Annotated[
+        str | None,
+        typer.Argument(
+            show_default=False,
+            help='Your feedback, e.g. scalify feedback "run is great but jobs watch needs an ETA". '
+            "Omit (interactive only) to answer a few quick questions.",
+        ),
+    ] = None,
+):
+    renderer = get_renderer()
+
+    # One-shot — the path agents (Claude, etc.) and scripts should use.
+    if message:
+        _relay_feedback(renderer, tracking.submit_feedback(message), message=message)
+        return
+
+    # No inline message: the interactive prompts need a human at a TTY. In
+    # JSON/agentic mode there's nobody to prompt — tell the caller to pass it inline.
+    if not renderer.is_pretty():
+        renderer.error(
+            code="feedback_message_required",
+            message="Feedback requires an inline message in JSON mode.",
+            hint='scalify feedback "your feedback here"',
+        )
+        raise typer.Exit(code=1)
+
+    rprint("Feedback Collection for Scalify CLI Tool\n")
+
+    general_satisfaction_score = ui.prompt_select(
+        question="On a scale of 1 to 5, how satisfied are you with the Scalify CLI tool? (1 being very dissatisfied and 5 being very satisfied)",
+        choices=["1", "2", "3", "4", "5"],
+        force_prompting=True,
+    )
+    usability_satisfaction_score = ui.prompt_select(
+        question="On a scale of 1 to 5,  how satisfied are you with the usability and user experience of the Scalify CLI tool? (1 being very dissatisfied and 5 being very satisfied)",
+        choices=["1", "2", "3", "4", "5"],
+        force_prompting=True,
+    )
+    free_text = ui.prompt_input(
+        question="Anything else you'd like to share? (optional — press Enter to skip)",
+        force_prompting=True,
+    )
+
+    sent = tracking.submit_feedback(
+        free_text or "",
+        scores={
+            "general_satisfaction": None if general_satisfaction_score is None else str(general_satisfaction_score),
+            "usability_satisfaction": None
+            if usability_satisfaction_score is None
+            else str(usability_satisfaction_score),
+        },
+    )
+    # Imported lazily: questionary pulls in prompt_toolkit (~50ms) and is only
+    # needed on this interactive feedback path.
+    import questionary
+
+    if (
+        sent
+        and questionary.confirm("Do you want to provide additional feature-specific feedback on our GitHub page?").ask()
+    ):
+        tracking.track_event("feedback_additional")
+        webbrowser.open("https://github.com/Khulnasoft/scalify-cli/issues/new/choose")
+
+    _relay_feedback(renderer, sent, message=free_text or "")
+
+
+@app.command(
+    name="agent-review",
+    hidden=True,
+    help="For agents: submit a short summary of how the session went. Fully consent-gated.",
+)
+@tracking.track_command()
+def agent_review(
+    summary: Annotated[
+        str,
+        typer.Argument(help="A brief, factual summary of the session — your assessment, not the user's words."),
+    ],
+):
+    renderer = get_renderer()
+    sent = tracking.submit_agent_review(summary)
+    if renderer.is_json():
+        renderer.emit({"sent": sent, "summary": summary}, command="agent-review")
+        return
+    rprint(
+        "Session review recorded — thanks."
+        if sent
+        else "[yellow]Review not sent — telemetry is disabled or opted out.[/yellow]"
+    )
+
+
+@app.command(
+    hidden=True,
+    help="Given an existing installation of scalify core and any custom nodes, installs any needed python dependencies",
+)
+@tracking.track_command()
+def dependency():
+    scalify_path, _ = workspace_manager.get_workspace_path()
+
+    python = resolve_workspace_python(scalify_path)
+    depComp = DependencyCompiler(cwd=scalify_path, executable=python)
+    depComp.compile_deps()
+    depComp.install_deps()
+
+
+@app.command(
+    help="Download a standalone Python interpreter and dependencies based on an existing scalifyui workspace. "
+    "This bundles an interpreter; it does not update ScalifyUI or custom nodes."
+)
+@tracking.track_command()
+def standalone(
+    cli_spec: Annotated[
+        str,
+        typer.Option(
+            show_default=False,
+            help="setuptools-style requirement specificer pointing to an instance of scalify-cli",
+        ),
+    ] = "scalify-cli",
+    pack_wheels: Annotated[
+        bool,
+        typer.Option(
+            show_default=False,
+            help="Pack requirement wheels in archive when creating standalone bundle",
+        ),
+    ] = False,
+    platform: Annotated[
+        constants.OS | None,
+        typer.Option(
+            show_default=False,
+            help="Create standalone Python for specified platform",
+        ),
+    ] = None,
+    proc: Annotated[
+        constants.PROC | None,
+        typer.Option(
+            show_default=False,
+            help="Create standalone Python for specified processor",
+        ),
+    ] = None,
+    rehydrate: Annotated[
+        bool,
+        typer.Option(
+            show_default=False,
+            help="Create standalone Python for CPU",
+        ),
+    ] = False,
+):
+    from scalify_cli.standalone import StandalonePython
+
+    scalify_path, _ = workspace_manager.get_workspace_path()
+
+    platform = utils.get_os() if platform is None else platform
+    proc = utils.get_proc() if proc is None else proc
+
+    if rehydrate:
+        sty = StandalonePython.FromTarball(fpath="python.tgz")
+        sty.rehydrate_scalify_deps(packWheels=pack_wheels)
+    else:
+        sty = StandalonePython.FromDistro(platform=platform, proc=proc)
+        sty.dehydrate_scalify_deps(scalifyDir=scalify_path, extraSpecs=[], packWheels=pack_wheels)
+        sty.to_tarball()
+
+
+# Subcommands imported on first use: three top-level commands whose modules
+# are heavy, then every subcommand group. Order matters: it is the order
+# `scalify --help` lists them in (after the commands defined above), so a new
+# entry goes where it should appear, not at the end.
+_RootGroup.lazy_subcommands = {
+    # `generate` registers itself (its command is a closure); see register_with.
+    "generate": LazyCommand("scalify_cli.command.generate", register="register_with"),
+    "run-template": LazyCommand(
+        "scalify_cli.command.templates",
+        attr="run_template_cmd",
+        help=(
+            "Fetch a gallery template, fill its parameterized inputs (--param KEY=VALUE), "
+            "and run it to completion on local ScalifyUI. Paid partner-API templates require --allow-spend."
+        ),
+    ),
+    "preview": LazyCommand(
+        "scalify_cli.command.preview",
+        attr="preview_cmd",
+        help="Render a previewable PNG from a media file (image → thumb, video → contact sheet, audio → waveform).",
+    ),
+    # The `model` noun owns BOTH the local-filesystem ops (download/remove/list)
+    # and the backend/cloud discovery leaves (list-folders/list-folder/search/
+    # show) — `models.py` merges the latter in from `search.py` at import time.
+    # `models` (plural) is a hidden, deprecated alias for the discovery leaves
+    # only, built alongside them in `search.py` so resolving it stays lazy —
+    # see the `deprecated_alias_app` built there.
+    "model": LazySubcommand(
+        "scalify_cli.command.models.models",
+        help="Manage models — local files on disk plus backend/cloud discovery.",
+    ),
+    "models": LazySubcommand(
+        "scalify_cli.command.models.search",
+        attr="deprecated_alias_app",
+        hidden=True,
+    ),
+    "node": LazySubcommand("scalify_cli.command.custom_nodes", help="Manage custom nodes."),
+    "nodes": LazySubcommand(
+        "scalify_cli.command.nodes", help="Introspect ScalifyUI node classes (inputs, outputs, categories)."
+    ),
+    "templates": LazySubcommand("scalify_cli.command.templates", help="Browse the Scalify workflow-template gallery."),
+    "knowledge": LazySubcommand(
+        "scalify_cli.command.knowledge",
+        help="Inspect the curated model-knowledge bundle: status, resolve an alias, ranked picks per capability.",
+    ),
+    "workflow": LazySubcommand(
+        "scalify_cli.command.workflow", help="Slot-based editing of frontend-format ScalifyUI workflows."
+    ),
+    "manager": LazySubcommand(
+        "scalify_cli.command.custom_nodes",
+        attr="manager_app",
+        help="Enable/disable and configure ScalifyUI-Manager (lifecycle, not updates).",
+    ),
+    "pr-cache": LazySubcommand("scalify_cli.command.pr_command", help="Manage PR cache."),
+    # code_search.app is a one-command Typer callback, not a command group.
+    # Mounting it as LazySubcommand makes Click expect another command after
+    # the query in an installed CLI even though direct module tests pass.
+    "code-search": LazyCommand(
+        "scalify_cli.command.code_search", attr="code_search", help="Search code across ScalifyUI repositories."
+    ),
+    "cs": LazyCommand("scalify_cli.command.code_search", attr="code_search", hidden=True),
+    "code-search-context": LazyCommand(
+        "scalify_cli.command.code_search",
+        attr="code_search_context",
+        help="Read a bounded range from a pinned code-search result.",
+    ),
+    "tracking": LazySubcommand("scalify_cli.tracking", help="Manage analytics tracking settings."),
+    "cloud": LazySubcommand("scalify_cli.cloud.command", help="Scalify Cloud — sign in, route commands, inspect session."),
+    "auth": LazySubcommand("scalify_cli.auth.command", help="Manage API tokens for model hosts (Civitai, Hugging Face)."),
+    "jobs": LazySubcommand("scalify_cli.command.jobs", help="List, inspect, and live-watch ScalifyUI prompts."),
+    "build": LazySubcommand(
+        "scalify_cli.command.build", help="Package a local ScalifyUI environment into a serverless build."
+    ),
+    "deploy": LazySubcommand("scalify_cli.command.deploy", help="Create and manage serverless deployments."),
+    "project": LazySubcommand("scalify_cli.command.project", help="Project conventions: init and status."),
+    "assets": LazySubcommand(
+        "scalify_cli.command.project",
+        attr="assets_app",
+        help="Push project assets to the run target (local or cloud) and track them in the lock.",
+    ),
+    "agent": LazySubcommand(
+        "scalify_cli.agent.command",
+        help="The local scalify agent: what it may reach, and how to let it reach more.",
+    ),
+    "skills": LazySubcommand(
+        "scalify_cli.skills.command",
+        help="Install the scalify agent skills into Claude Code, Cursor, Aider, and any AGENTS.md-aware tool.",
+    ),
+    # Keep the singular alias for backward compat
+    "skill": LazySubcommand("scalify_cli.skills.command", hidden=True),
+    # Hidden: the detached watcher subprocess spawned by `scalify run` when async.
+    "_watch": LazySubcommand("scalify_cli.command.job_watcher", hidden=True),
+}

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scalify.khulnasoft.com/schemas/build_refs_model_dirs.json",
+  "title": "scalify build refs model-dirs --json data payload",
+  "type": "object",
+  "required": ["directories"],
+  "additionalProperties": true,
+  "properties": {"directories": {"type": "array", "items": {"type": "string"}}}
+}

@@ -1,0 +1,1046 @@
+"""Tests for the unified HTTP Client + Target abstraction.
+
+Both local and cloud paths flow through the same ``Client``; the differences
+are encoded as ``Target`` fields. These tests pin the contract.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import urllib.error
+from unittest.mock import patch
+
+import pytest
+
+from scalify_cli import scalify_client
+from scalify_cli.caller import Caller, usage_source_for
+from scalify_cli.target import Target
+
+
+def _mcp_usage_source() -> str:
+    """What ``usage_source()`` returns under ``SCALIFY_USER_AGENT=scalify-mcp``.
+
+    Built through the real mapper so these tests pin the wiring, not a
+    hand-copied string; only the environment probe is stubbed out.
+    """
+    return usage_source_for(Caller(kind="scalify-mcp", agentic=True, source_env="SCALIFY_USER_AGENT"))
+
+
+def _mock_response(payload):
+    class _Resp:
+        def __init__(self, body):
+            self.body = body if isinstance(body, bytes) else json.dumps(body).encode()
+
+        def read(self, n=None):
+            # Mirror http.client.HTTPResponse.read(amt) — the client reads with
+            # a byte cap, so a no-arg-only fake would not match the real API.
+            return self.body if n is None else self.body[:n]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    return _Resp(payload)
+
+
+def _header(req, name: str) -> str | None:
+    """Case-insensitive header lookup.
+
+    ``urllib.request.Request.headers`` is a plain dict keyed by
+    ``str.capitalize()``d names, so ``add_header("X-API-Key", ...)`` is stored
+    as ``"X-api-key"`` and both a literal ``"X-API-Key"`` lookup and
+    ``get_header`` are one casing change away from silently missing. A leak
+    guard that can quietly stop testing anything is worse than no guard.
+    """
+    return next((v for k, v in req.headers.items() if k.lower() == name.lower()), None)
+
+
+def _http_error(status: int, body: bytes = b""):
+    return urllib.error.HTTPError(
+        url="https://cloud/x",
+        code=status,
+        msg=f"HTTP {status}",
+        hdrs=None,
+        fp=io.BytesIO(body),
+    )
+
+
+CLOUD = Target(
+    kind="cloud",
+    base_url="https://cloud.example.com",
+    path_prefix="/api",
+    history_path="history_v2",
+    jobs_path="jobs",
+    auth_token="tok-abc",
+)
+
+LOCAL = Target(
+    kind="local",
+    base_url="http://127.0.0.1:8188",
+    path_prefix="",
+    history_path="history",
+    jobs_path=None,
+    auth_token=None,
+    host="127.0.0.1",
+    port=8188,
+)
+
+
+class TestTargetURLs:
+    def test_cloud_paths_get_api_prefix(self):
+        assert CLOUD.url("prompt") == "https://cloud.example.com/api/prompt"
+        assert CLOUD.url("history_v2", "abc") == "https://cloud.example.com/api/history_v2/abc"
+
+    def test_local_paths_have_no_prefix(self):
+        assert LOCAL.url("prompt") == "http://127.0.0.1:8188/prompt"
+        assert LOCAL.url("history", "abc") == "http://127.0.0.1:8188/history/abc"
+
+
+class TestSubmitPrompt:
+    def test_posts_with_bearer_to_prefixed_url(self):
+        with patch.object(
+            scalify_client._OPENER,
+            "open",
+            return_value=_mock_response({"prompt_id": "pid-1", "number": 7, "node_errors": {}}),
+        ) as urlopen:
+            client = scalify_client.Client(CLOUD)
+            result = client.submit_prompt({"1": {"class_type": "X", "inputs": {}}}, "cid")
+        assert result.prompt_id == "pid-1"
+        assert result.number == 7
+        req = urlopen.call_args.args[0]
+        assert req.full_url == "https://cloud.example.com/api/prompt"
+        assert req.headers["Authorization"] == "Bearer tok-abc"
+        body = json.loads(req.data)
+        assert body == {
+            "prompt": {"1": {"class_type": "X", "inputs": {}}},
+            "client_id": "cid",
+            "extra_data": {"auth_token_scalify_org": "tok-abc", "scalify_usage_source": "scalify-cli"},
+        }
+        # Usage-source attribution header on every request (#468).
+        assert req.headers["Scalify-usage-source"] == "scalify-cli"
+
+    def test_local_target_has_no_auth_header(self):
+        with patch.object(
+            scalify_client._OPENER,
+            "open",
+            return_value=_mock_response({"prompt_id": "pid-2", "number": 1, "node_errors": {}}),
+        ) as urlopen:
+            client = scalify_client.Client(LOCAL)
+            client.submit_prompt({"1": {"class_type": "X", "inputs": {}}}, "cid")
+        req = urlopen.call_args.args[0]
+        assert req.full_url == "http://127.0.0.1:8188/prompt"
+        assert "Authorization" not in req.headers
+        body = json.loads(req.data)
+        # Local submissions get no body-level token injection — only the
+        # usage-source attribution rides extra_data (#468).
+        assert body.keys() == {"prompt", "client_id", "extra_data"}
+        assert body["extra_data"] == {"scalify_usage_source": "scalify-cli"}
+
+    def test_cloud_caller_extra_data_is_merged_not_overwritten(self):
+        with patch.object(
+            scalify_client._OPENER,
+            "open",
+            return_value=_mock_response({"prompt_id": "pid", "number": 1, "node_errors": {}}),
+        ) as urlopen:
+            client = scalify_client.Client(CLOUD)
+            client.submit_prompt(
+                {"1": {"class_type": "X", "inputs": {}}},
+                "cid",
+                extra_data={"pnginfo": {"workflow": "..."}},
+            )
+        body = json.loads(urlopen.call_args.args[0].data)
+        # Caller-supplied keys preserved; cloud auth token added alongside.
+        assert body["extra_data"]["pnginfo"] == {"workflow": "..."}
+        assert body["extra_data"]["auth_token_scalify_org"] == "tok-abc"
+
+    def test_cloud_caller_auth_token_is_not_clobbered(self):
+        with patch.object(
+            scalify_client._OPENER,
+            "open",
+            return_value=_mock_response({"prompt_id": "pid", "number": 1, "node_errors": {}}),
+        ) as urlopen:
+            client = scalify_client.Client(CLOUD)
+            client.submit_prompt(
+                {"1": {"class_type": "X", "inputs": {}}},
+                "cid",
+                extra_data={"auth_token_scalify_org": "caller-token"},
+            )
+        body = json.loads(urlopen.call_args.args[0].data)
+        # setdefault — caller wins.
+        assert body["extra_data"]["auth_token_scalify_org"] == "caller-token"
+
+    def test_usage_source_is_derived_from_the_caller(self, monkeypatch):
+        """An agentic caller is attributed as ``scalify-cli/<kind>`` so
+        partner-node billing can tell MCP-driven runs from human ones. (The
+        assertions above pin the human case, via the conftest fixture.)"""
+        monkeypatch.setattr(scalify_client, "usage_source", _mcp_usage_source)
+        with patch.object(
+            scalify_client._OPENER,
+            "open",
+            return_value=_mock_response({"prompt_id": "pid", "number": 1, "node_errors": {}}),
+        ) as urlopen:
+            scalify_client.Client(CLOUD).submit_prompt({"1": {"class_type": "X", "inputs": {}}}, "cid")
+        body = json.loads(urlopen.call_args.args[0].data)
+        assert body["extra_data"]["scalify_usage_source"] == "scalify-cli/scalify-mcp"
+
+    def test_caller_supplied_usage_source_still_wins(self, monkeypatch):
+        """setdefault semantics are unchanged by the derivation: a caller that
+        names its own ``scalify_usage_source`` keeps it."""
+        monkeypatch.setattr(scalify_client, "usage_source", _mcp_usage_source)
+        with patch.object(
+            scalify_client._OPENER,
+            "open",
+            return_value=_mock_response({"prompt_id": "pid", "number": 1, "node_errors": {}}),
+        ) as urlopen:
+            scalify_client.Client(CLOUD).submit_prompt(
+                {"1": {"class_type": "X", "inputs": {}}},
+                "cid",
+                extra_data={"scalify_usage_source": "some-other-surface"},
+            )
+        body = json.loads(urlopen.call_args.args[0].data)
+        assert body["extra_data"]["scalify_usage_source"] == "some-other-surface"
+
+    def test_oauth_refresh_rebuilds_partner_auth_extra_data(self):
+        cloud = Target(
+            kind="cloud",
+            base_url="https://cloud.example.com",
+            path_prefix="/api",
+            history_path="history_v2",
+            jobs_path="jobs",
+            auth_token="expired-token",
+        )
+        client = scalify_client.Client(cloud)
+
+        def refresh():
+            object.__setattr__(cloud, "auth_token", "fresh-token")
+            return True
+
+        seq = [_http_error(401), _mock_response({"prompt_id": "pid", "number": 1, "node_errors": {}})]
+        with patch.object(client, "_try_refresh_token", side_effect=refresh):
+            with patch.object(scalify_client._OPENER, "open", side_effect=seq) as urlopen:
+                client.submit_prompt({"1": {"class_type": "X", "inputs": {}}}, "cid")
+
+        first_req = urlopen.call_args_list[0].args[0]
+        retry_req = urlopen.call_args_list[1].args[0]
+        assert first_req.headers["Authorization"] == "Bearer expired-token"
+        assert json.loads(first_req.data)["extra_data"]["auth_token_scalify_org"] == "expired-token"
+        assert retry_req.headers["Authorization"] == "Bearer fresh-token"
+        assert json.loads(retry_req.data)["extra_data"]["auth_token_scalify_org"] == "fresh-token"
+
+    def test_local_target_with_stray_credentials_sends_no_auth_header(self):
+        """The leak guard the shared header selection carries: credentials that
+        somehow ended up on a LOCAL Target are never sent to the plaintext
+        server. ``_assert_safe_url`` only covers cloud targets, so the
+        ``is_cloud`` gate is the whole defense for the header.
+
+        The body is a second, independent gate: ``submit_prompt`` has its own
+        ``is_cloud`` check before injecting ``auth_token_scalify_org`` into
+        ``extra_data``, so asserting only the headers would stay green while a
+        regression there leaked the stray token to the plaintext server.
+        """
+        local_with_creds = Target(
+            kind="local",
+            base_url="http://127.0.0.1:8188",
+            history_path="history",
+            auth_token="stray-token",
+            api_key="stray-key",
+            host="127.0.0.1",
+            port=8188,
+        )
+        with patch.object(
+            scalify_client._OPENER,
+            "open",
+            return_value=_mock_response({"prompt_id": "pid", "number": 1, "node_errors": {}}),
+        ) as urlopen:
+            scalify_client.Client(local_with_creds).submit_prompt({"1": {"class_type": "X", "inputs": {}}}, "cid")
+        req = urlopen.call_args.args[0]
+        assert _header(req, "Authorization") is None
+        assert _header(req, "X-API-Key") is None
+        assert json.loads(req.data)["extra_data"] == {"scalify_usage_source": "scalify-cli"}
+
+    def test_cloud_with_api_key_sends_x_api_key_header(self):
+        cloud_apikey = Target(
+            kind="cloud",
+            base_url="https://cloud.example.com",
+            path_prefix="/api",
+            history_path="history_v2",
+            jobs_path="jobs",
+            api_key="sk-test-1234",
+        )
+        with patch.object(
+            scalify_client._OPENER,
+            "open",
+            return_value=_mock_response({"prompt_id": "pid", "number": 1, "node_errors": {}}),
+        ) as urlopen:
+            client = scalify_client.Client(cloud_apikey)
+            client.submit_prompt({"1": {"class_type": "X", "inputs": {}}}, "cid")
+        req = urlopen.call_args.args[0]
+        # X-API-Key header is set; Authorization Bearer is NOT.
+        assert req.headers["X-api-key"] == "sk-test-1234"
+        assert "Authorization" not in req.headers
+        # Partner-API extra_data uses api_key_scalify_org for the key path.
+        body = json.loads(req.data)
+        assert body["extra_data"] == {"api_key_scalify_org": "sk-test-1234", "scalify_usage_source": "scalify-cli"}
+
+    def test_cloud_both_credentials_uses_one_identity_for_header_and_body(self):
+        """Both credentials set is UNREACHABLE in production — ``resolve_target``
+        resolves a single credential, so at most one of api_key / auth_token is
+        ever populated. The tie-break is pinned anyway, because the two paths
+        must not diverge if it ever becomes reachable: the header comes from
+        ``http.target_auth_headers`` and the ``extra_data`` credential from
+        ``submit_prompt``, and both are OAuth-first. A split — gateway
+        authenticated as the API key, partner-API nodes handed the OAuth
+        identity — would also be unrecoverable, since ``_try_refresh_token``
+        early-returns when ``api_key`` is set and so could never heal the 401.
+        """
+        cloud_both = Target(
+            kind="cloud",
+            base_url="https://cloud.example.com",
+            path_prefix="/api",
+            history_path="history_v2",
+            jobs_path="jobs",
+            auth_token="bearer-token",
+            api_key="api-key-1234",
+        )
+        with patch.object(
+            scalify_client._OPENER,
+            "open",
+            return_value=_mock_response({"prompt_id": "pid", "number": 1, "node_errors": {}}),
+        ) as urlopen:
+            client = scalify_client.Client(cloud_both)
+            client.submit_prompt({"1": {"class_type": "X", "inputs": {}}}, "cid")
+        req = urlopen.call_args.args[0]
+        assert _header(req, "Authorization") == "Bearer bearer-token"
+        assert _header(req, "X-API-Key") is None
+        body = json.loads(req.data)
+        assert "auth_token_scalify_org" in body["extra_data"]
+        assert "api_key_scalify_org" not in body["extra_data"]
+
+    def test_raises_http_error_on_4xx(self):
+        with patch.object(scalify_client._OPENER, "open", side_effect=_http_error(400, b"bad workflow")):
+            with pytest.raises(scalify_client.HTTPError) as exc:
+                scalify_client.Client(CLOUD).submit_prompt({}, "cid")
+        assert exc.value.status == 400
+        assert "bad workflow" in exc.value.body
+
+    def test_raises_on_missing_prompt_id_in_response(self):
+        with patch.object(scalify_client._OPENER, "open", return_value=_mock_response({"number": 1})):
+            with pytest.raises(scalify_client.HTTPError):
+                scalify_client.Client(CLOUD).submit_prompt({}, "cid")
+
+
+class TestUnauthenticated:
+    def test_cloud_without_token_raises_at_construction(self):
+        cloud_no_token = Target(
+            kind="cloud",
+            base_url="https://cloud.example.com",
+            path_prefix="/api",
+            history_path="history_v2",
+            jobs_path="jobs",
+            auth_token=None,
+        )
+        with pytest.raises(scalify_client.Unauthenticated):
+            scalify_client.Client(cloud_no_token)
+
+
+class TestGetHistory:
+    def test_cloud_uses_history_v2_path(self):
+        with patch.object(
+            scalify_client._OPENER,
+            "open",
+            return_value=_mock_response({"pid-1": {"outputs": {"3": {"images": []}}, "status": {"completed": True}}}),
+        ) as urlopen:
+            rec = scalify_client.Client(CLOUD).get_history("pid-1")
+        req = urlopen.call_args.args[0]
+        assert req.full_url == "https://cloud.example.com/api/history_v2/pid-1"
+        assert rec["status"]["completed"] is True
+
+    def test_local_uses_history_path(self):
+        with patch.object(
+            scalify_client._OPENER,
+            "open",
+            return_value=_mock_response({"pid-1": {"outputs": {}, "status": {"completed": True}}}),
+        ) as urlopen:
+            scalify_client.Client(LOCAL).get_history("pid-1")
+        req = urlopen.call_args.args[0]
+        assert req.full_url == "http://127.0.0.1:8188/history/pid-1"
+
+    def test_404_treated_as_transient_returns_none(self):
+        with patch.object(scalify_client._OPENER, "open", side_effect=_http_error(404, b"not yet")):
+            assert scalify_client.Client(CLOUD).get_history("pid") is None
+
+    def test_returns_inner_when_flat(self):
+        flat = {"outputs": {"3": {"images": []}}, "status": {"completed": False}}
+        with patch.object(scalify_client._OPENER, "open", return_value=_mock_response(flat)):
+            rec = scalify_client.Client(CLOUD).get_history("pid-1")
+        assert rec["status"]["completed"] is False
+
+    def test_returns_none_for_unrecognized_shape(self):
+        with patch.object(scalify_client._OPENER, "open", return_value=_mock_response({"unrelated": 1})):
+            assert scalify_client.Client(CLOUD).get_history("pid-1") is None
+
+
+class TestListJobs:
+    def test_cloud_hits_jobs_endpoint_with_limit(self):
+        with patch.object(
+            scalify_client._OPENER, "open", return_value=_mock_response({"jobs": [{"id": "a"}, {"id": "b"}]})
+        ) as urlopen:
+            jobs = scalify_client.Client(CLOUD).list_jobs(limit=5)
+        req = urlopen.call_args.args[0]
+        assert req.full_url == "https://cloud.example.com/api/jobs?limit=5"
+        assert [j["id"] for j in jobs] == ["a", "b"]
+
+    def test_local_raises_not_implemented(self):
+        with pytest.raises(NotImplementedError):
+            scalify_client.Client(LOCAL).list_jobs()
+
+
+class TestGetJobStatus:
+    def test_cloud_uses_jobs_detail_endpoint(self):
+        with patch.object(scalify_client._OPENER, "open", return_value=_mock_response({"status": "success"})) as urlopen:
+            scalify_client.Client(CLOUD).get_job_status("pid-1")
+        req = urlopen.call_args.args[0]
+        assert req.full_url == "https://cloud.example.com/api/jobs/pid-1"
+
+    def test_404_returns_none(self):
+        with patch.object(scalify_client._OPENER, "open", side_effect=_http_error(404)):
+            assert scalify_client.Client(CLOUD).get_job_status("pid") is None
+
+    def test_local_raises_not_implemented(self):
+        # A local target has no jobs_path — must fail loudly, not fall back to
+        # GET {base}/<id> (mirrors list_jobs).
+        with pytest.raises(NotImplementedError):
+            scalify_client.Client(LOCAL).get_job_status("pid")
+
+    @pytest.mark.parametrize("bad_id", ["", "   "])
+    def test_empty_id_rejected(self, bad_id):
+        # An empty id would collapse to the plural LIST endpoint and misclassify
+        # the job — reject before issuing any request.
+        with patch.object(scalify_client._OPENER, "open") as urlopen:
+            with pytest.raises(ValueError):
+                scalify_client.Client(CLOUD).get_job_status(bad_id)
+        urlopen.assert_not_called()
+
+    def test_id_is_percent_encoded(self):
+        # A raw id with path/query metacharacters must not escape the
+        # /api/jobs/<id> segment.
+        with patch.object(scalify_client._OPENER, "open", return_value=_mock_response({"status": "success"})) as urlopen:
+            scalify_client.Client(CLOUD).get_job_status("../admin?x=1")
+        req = urlopen.call_args.args[0]
+        assert req.full_url == "https://cloud.example.com/api/jobs/..%2Fadmin%3Fx%3D1"
+
+
+class TestWaitForCompletion:
+    def test_returns_record_when_status_completed_true(self):
+        record = {"status": {"completed": True}, "outputs": {}}
+        with patch.object(scalify_client.Client, "get_history", return_value=record):
+            assert scalify_client.Client(CLOUD).wait_for_completion("pid", poll_interval=0) == record
+
+    def test_treats_outputs_present_as_done(self):
+        record = {"outputs": {"3": {"images": [{"filename": "out.png"}]}}}
+        with patch.object(scalify_client.Client, "get_history", return_value=record):
+            assert scalify_client.Client(CLOUD).wait_for_completion("pid", poll_interval=0) == record
+
+    def test_raises_timeout(self):
+        with patch.object(scalify_client.Client, "get_history", return_value=None):
+            with pytest.raises(TimeoutError):
+                scalify_client.Client(CLOUD).wait_for_completion("pid", poll_interval=0.01, timeout=0.05)
+
+
+class TestTransientRetry:
+    """A 429 / transient 5xx during polling must back off and retry, not abort
+    the request — this is the bug that killed `scalify run --wait` mid-job."""
+
+    def test_get_retries_on_429_then_succeeds(self):
+        seq = [_http_error(429), _mock_response({"status": "success"})]
+        with patch("scalify_cli.scalify_client.time.sleep"):
+            with patch.object(scalify_client._OPENER, "open", side_effect=seq) as urlopen:
+                result = scalify_client.Client(CLOUD).get_job_status("pid")
+        assert result == {"status": "success"}
+        assert urlopen.call_count == 2
+
+    def test_persistent_429_eventually_raises(self):
+        with patch("scalify_cli.scalify_client.time.sleep"):
+            with patch.object(scalify_client._OPENER, "open", side_effect=_http_error(429)) as urlopen:
+                with pytest.raises(scalify_client.HTTPError) as exc:
+                    scalify_client.Client(CLOUD).get_job_status("pid")
+        assert exc.value.status == 429
+        assert urlopen.call_count == scalify_client._MAX_TRANSIENT_RETRIES + 1
+
+    def test_submit_is_not_auto_retried_on_429(self):
+        # A 429 alone does not prove the submit had no effect, so the client
+        # must not repeat a non-idempotent POST by itself (duplicate-job risk).
+        # The 429 surfaces once, with its Retry-After, for the caller to handle.
+        from http.client import HTTPMessage
+
+        hdrs = HTTPMessage()
+        hdrs["Retry-After"] = "9"
+        err = urllib.error.HTTPError(url="https://cloud/x", code=429, msg="429", hdrs=hdrs, fp=io.BytesIO(b""))
+        with patch("scalify_cli.scalify_client.time.sleep") as sleep:
+            with patch.object(scalify_client._OPENER, "open", side_effect=[err]) as urlopen:
+                with pytest.raises(scalify_client.HTTPError) as exc:
+                    scalify_client.Client(CLOUD).submit_prompt({"1": {}}, "cid")
+        assert exc.value.status == 429
+        assert exc.value.retry_after == 9.0
+        assert urlopen.call_count == 1
+        sleep.assert_not_called()
+
+    def test_5xx_retried_on_get(self):
+        seq = [_http_error(503), _mock_response({"status": "success"})]
+        with patch("scalify_cli.scalify_client.time.sleep"):
+            with patch.object(scalify_client._OPENER, "open", side_effect=seq) as urlopen:
+                assert scalify_client.Client(CLOUD).get_job_status("pid") == {"status": "success"}
+        assert urlopen.call_count == 2
+
+    def test_5xx_not_retried_on_post(self):
+        # A 5xx on submit could have partially applied — must NOT auto-retry (double-execute risk).
+        with patch("scalify_cli.scalify_client.time.sleep"):
+            with patch.object(scalify_client._OPENER, "open", side_effect=_http_error(503)) as urlopen:
+                with pytest.raises(scalify_client.HTTPError):
+                    scalify_client.Client(CLOUD).submit_prompt({"1": {}}, "cid")
+        assert urlopen.call_count == 1
+
+    def test_honors_retry_after_header(self):
+        from http.client import HTTPMessage
+
+        hdrs = HTTPMessage()
+        hdrs["Retry-After"] = "3"
+        err = urllib.error.HTTPError(url="https://cloud/x", code=429, msg="429", hdrs=hdrs, fp=io.BytesIO(b""))
+        seq = [err, _mock_response({"status": "success"})]
+        with patch("scalify_cli.scalify_client.time.sleep") as sleep:
+            with patch.object(scalify_client._OPENER, "open", side_effect=seq):
+                scalify_client.Client(CLOUD).get_job_status("pid")
+        assert sleep.call_args.args[0] == 3.0
+
+    def test_wait_for_completion_survives_transient_429(self):
+        done = {"status": {"completed": True}, "outputs": {}}
+        seq = [_http_error(429), _mock_response(done)]
+        with patch("scalify_cli.scalify_client.time.sleep"):
+            with patch.object(scalify_client._OPENER, "open", side_effect=seq):
+                assert scalify_client.Client(CLOUD).wait_for_completion("pid", poll_interval=0) == done
+
+
+class TestPollLevelBackoff:
+    """In-request retries cover quick blips, but once a poll's request budget
+    is spent — or on a plain 500, which the in-request layer never retries —
+    the whole `run --wait` used to abort for a job that was still fine
+    (fennec friction #2). wait_for_completion owns a poll-level budget:
+    exponential backoff (base 2s, cap 60s, jitter, Retry-After honored) and
+    only ~5 CONSECUTIVE poll failures surface the existing HTTPError path."""
+
+    DONE = {"status": {"completed": True}, "outputs": {}}
+
+    @staticmethod
+    def _history_side_effect(events):
+        """Each event is an Exception (raised) or a record (returned)."""
+        it = iter(events)
+
+        def _next(prompt_id, **kwargs):
+            value = next(it)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return _next
+
+    def test_429_twice_then_success_completes(self):
+        client = scalify_client.Client(CLOUD)
+        events = [
+            scalify_client.HTTPError(429, "Too Many Requests"),
+            scalify_client.HTTPError(429, "Too Many Requests"),
+            self.DONE,
+        ]
+        with (
+            patch("scalify_cli.scalify_client.time.sleep") as sleep,
+            patch.object(client, "get_history", side_effect=self._history_side_effect(events)) as gh,
+        ):
+            assert client.wait_for_completion("pid", poll_interval=0) == self.DONE
+        assert gh.call_count == 3
+        assert sleep.call_count >= 2  # backed off between failed polls
+
+    def test_500_twice_then_success_completes(self):
+        # Plain 500 is NOT retried by the in-request layer; the poller must
+        # absorb it instead of aborting the wait.
+        client = scalify_client.Client(CLOUD)
+        events = [
+            scalify_client.HTTPError(500, "Internal Server Error"),
+            scalify_client.HTTPError(500, "Internal Server Error"),
+            self.DONE,
+        ]
+        with (
+            patch("scalify_cli.scalify_client.time.sleep"),
+            patch.object(client, "get_history", side_effect=self._history_side_effect(events)) as gh,
+        ):
+            assert client.wait_for_completion("pid", poll_interval=0) == self.DONE
+        assert gh.call_count == 3
+
+    def test_permanent_500_fails_after_retry_budget(self):
+        client = scalify_client.Client(CLOUD)
+        with (
+            patch("scalify_cli.scalify_client.time.sleep"),
+            patch.object(client, "get_history", side_effect=scalify_client.HTTPError(500, "boom")) as gh,
+        ):
+            with pytest.raises(scalify_client.HTTPError) as exc:
+                client.wait_for_completion("pid", poll_interval=0)
+        assert exc.value.status == 500
+        assert gh.call_count == scalify_client._MAX_POLL_FAILURES
+
+    def test_backoff_is_exponential_with_cap(self):
+        client = scalify_client.Client(CLOUD)
+        with (
+            patch("scalify_cli.scalify_client.time.sleep") as sleep,
+            patch("scalify_cli.scalify_client.random.uniform", return_value=0.0),
+            patch.object(client, "get_history", side_effect=scalify_client.HTTPError(429, "rl")),
+        ):
+            with pytest.raises(scalify_client.HTTPError):
+                client.wait_for_completion("pid", poll_interval=0)
+        backoffs = [c.args[0] for c in sleep.call_args_list if c.args[0] > 0]
+        assert backoffs == [2.0, 4.0, 8.0, 16.0]  # base 2s, doubling, jitter zeroed
+        assert all(b <= 60.0 for b in backoffs)
+
+    def test_retry_after_overrides_backoff(self):
+        client = scalify_client.Client(CLOUD)
+        events = [
+            scalify_client.HTTPError(429, "rl", retry_after=7.0),
+            self.DONE,
+        ]
+        with (
+            patch("scalify_cli.scalify_client.time.sleep") as sleep,
+            patch.object(client, "get_history", side_effect=self._history_side_effect(events)),
+        ):
+            assert client.wait_for_completion("pid", poll_interval=0) == self.DONE
+        assert 7.0 in [c.args[0] for c in sleep.call_args_list]
+
+    def test_failure_counter_resets_on_successful_poll(self):
+        client = scalify_client.Client(CLOUD)
+        budget = scalify_client._MAX_POLL_FAILURES
+        events = (
+            [scalify_client.HTTPError(429, "rl")] * (budget - 1)
+            + [None]  # successful poll (job not done yet) resets the counter
+            + [scalify_client.HTTPError(429, "rl")] * (budget - 1)
+            + [self.DONE]
+        )
+        with (
+            patch("scalify_cli.scalify_client.time.sleep"),
+            patch.object(client, "get_history", side_effect=self._history_side_effect(events)) as gh,
+        ):
+            assert client.wait_for_completion("pid", poll_interval=0, timeout=600) == self.DONE
+        assert gh.call_count == len(events)
+
+    def test_non_transient_http_error_propagates_immediately(self):
+        client = scalify_client.Client(CLOUD)
+        with (
+            patch("scalify_cli.scalify_client.time.sleep") as sleep,
+            patch.object(client, "get_history", side_effect=scalify_client.HTTPError(403, "forbidden")) as gh,
+        ):
+            with pytest.raises(scalify_client.HTTPError) as exc:
+                client.wait_for_completion("pid", poll_interval=0)
+        assert exc.value.status == 403
+        assert gh.call_count == 1
+        assert sleep.call_count == 0
+
+    def test_request_attaches_retry_after_to_http_error(self):
+        from http.client import HTTPMessage
+
+        hdrs = HTTPMessage()
+        hdrs["Retry-After"] = "12"
+        err = urllib.error.HTTPError(url="https://cloud/x", code=500, msg="500", hdrs=hdrs, fp=io.BytesIO(b""))
+        with patch.object(scalify_client._OPENER, "open", side_effect=err):
+            with pytest.raises(scalify_client.HTTPError) as exc:
+                scalify_client.Client(CLOUD).submit_prompt({"1": {}}, "cid")
+        assert exc.value.retry_after == 12.0
+
+
+class TestOutputUrls:
+    def test_view_url_uses_api_prefix_for_cloud(self):
+        url = scalify_client.Client(CLOUD).view_url({"filename": "a.png", "subfolder": "", "type": "output"})
+        assert url == "https://cloud.example.com/api/view?filename=a.png&subfolder=&type=output"
+
+    def test_view_url_no_prefix_for_local(self):
+        url = scalify_client.Client(LOCAL).view_url({"filename": "a.png", "subfolder": "", "type": "output"})
+        assert url == "http://127.0.0.1:8188/view?filename=a.png&subfolder=&type=output"
+
+    def test_extract_collects_image_urls(self):
+        record = {
+            "outputs": {
+                "3": {
+                    "images": [
+                        {"filename": "a.png", "subfolder": "", "type": "output"},
+                        {"filename": "b.png", "subfolder": "sub", "type": "temp"},
+                    ]
+                }
+            }
+        }
+        urls = scalify_client.Client(CLOUD).extract_output_urls(record)
+        assert urls == [
+            "https://cloud.example.com/api/view?filename=a.png&subfolder=&type=output",
+            "https://cloud.example.com/api/view?filename=b.png&subfolder=sub&type=temp",
+        ]
+
+    def test_extract_skips_malformed(self):
+        assert scalify_client.Client(CLOUD).extract_output_urls({}) == []
+        record = {"outputs": {"3": {"images": [{"no_filename": True}, "garbage"]}}}
+        assert scalify_client.Client(CLOUD).extract_output_urls(record) == []
+
+    def test_extract_outputs_keeps_node_association(self):
+        """extract_outputs returns one dict per artifact with the producing
+        node id — the node association that flat URL lists drop."""
+        record = {
+            "outputs": {
+                "9": {
+                    "images": [
+                        {"filename": "a.png", "subfolder": "", "type": "output"},
+                        {"filename": "b.png", "subfolder": "sub", "type": "temp"},
+                    ]
+                },
+                "12": {"videos": [{"filename": "v.mp4", "subfolder": "", "type": "output"}]},
+            }
+        }
+        out = scalify_client.Client(CLOUD).extract_outputs(record)
+        assert out == [
+            {
+                "node_id": "9",
+                "url": "https://cloud.example.com/api/view?filename=a.png&subfolder=&type=output",
+                "filename": "a.png",
+                "type": "output",
+            },
+            {
+                "node_id": "9",
+                "url": "https://cloud.example.com/api/view?filename=b.png&subfolder=sub&type=temp",
+                "filename": "b.png",
+                "type": "temp",
+            },
+            {
+                "node_id": "12",
+                "url": "https://cloud.example.com/api/view?filename=v.mp4&subfolder=&type=output",
+                "filename": "v.mp4",
+                "type": "output",
+            },
+        ]
+
+    def test_extract_outputs_skips_non_dict_noise(self):
+        record = {
+            "outputs": {
+                "3": "garbage-not-a-dict",
+                "4": {"images": [{"no_filename": True}, "garbage", None]},
+                "5": {"images": "not-a-list"},
+                "6": {"images": [{"filename": "ok.png", "subfolder": "", "type": "output"}]},
+            }
+        }
+        out = scalify_client.Client(CLOUD).extract_outputs(record)
+        assert [o["node_id"] for o in out] == ["6"]
+        assert scalify_client.Client(CLOUD).extract_outputs({}) == []
+        assert scalify_client.Client(CLOUD).extract_outputs({"outputs": "nope"}) == []
+
+    def test_extract_output_urls_delegates_to_extract_outputs(self):
+        record = {
+            "outputs": {
+                "9": {"images": [{"filename": "a.png", "subfolder": "", "type": "output"}]},
+                "12": {"videos": [{"filename": "v.mp4", "subfolder": "", "type": "output"}]},
+            }
+        }
+        client = scalify_client.Client(CLOUD)
+        assert client.extract_output_urls(record) == [o["url"] for o in client.extract_outputs(record)]
+
+    def test_extract_resolves_saveglb_3d_key(self):
+        """SaveGLB emits entries under the "3d" key, not the classic media
+        keys — shape-based detection must still resolve them."""
+        record = {"outputs": {"10": {"3d": [{"filename": "abc123.glb", "subfolder": "3d", "type": "output"}]}}}
+        assert scalify_client.extract_output_entries(record) == [
+            {"node_id": "10", "filename": "abc123.glb", "subfolder": "3d", "type": "output"}
+        ]
+        urls = scalify_client.Client(CLOUD).extract_output_urls(record)
+        assert urls == ["https://cloud.example.com/api/view?filename=abc123.glb&subfolder=3d&type=output"]
+
+    def test_extract_resolves_singular_video_key(self):
+        """The cloud worker's synthesizeMediaTypeFromResult emits a singular
+        "video" key; shape-based detection covers it too."""
+        record = {"outputs": {"7": {"video": [{"filename": "clip.webm", "subfolder": "", "type": "output"}]}}}
+        assert scalify_client.extract_output_entries(record) == [
+            {"node_id": "7", "filename": "clip.webm", "subfolder": "", "type": "output"}
+        ]
+
+    def test_extract_dedups_same_artifact_under_two_keys(self):
+        """A node that surfaces the same artifact under both the singular
+        "video" and plural "videos" keys must emit one entry, not two — else
+        the /view URL (and the downloaded file) is duplicated."""
+        record = {
+            "outputs": {
+                "7": {
+                    "video": [{"filename": "clip.webm", "subfolder": "", "type": "output"}],
+                    "videos": [{"filename": "clip.webm", "subfolder": "", "type": "output"}],
+                }
+            }
+        }
+        assert scalify_client.extract_output_entries(record) == [
+            {"node_id": "7", "filename": "clip.webm", "subfolder": "", "type": "output"}
+        ]
+
+    def test_extract_skips_non_file_shaped_keys(self):
+        """Keys carrying flags/metadata rather than file entries produce
+        nothing: "animated" (boolean flags — explicitly skipped), "text"
+        (strings), "dims" (dicts without a filename)."""
+        record = {
+            "outputs": {
+                "3": {
+                    "animated": [True],
+                    "text": ["hello"],
+                    "dims": [{"width": 512}],
+                }
+            }
+        }
+        assert scalify_client.extract_output_entries(record) == []
+        assert scalify_client.Client(CLOUD).extract_output_urls(record) == []
+
+
+class TestGroupOutputs:
+    """_group_outputs: pure grouping of extract_outputs entries by node and
+    (via an item_map) by blueprint foreach item."""
+
+    OUTPUTS = [
+        {"node_id": "9", "url": "https://x/a.png", "filename": "a.png", "type": "output"},
+        {"node_id": "9", "url": "https://x/b.png", "filename": "b.png", "type": "output"},
+        {"node_id": "12", "url": "https://x/v.mp4", "filename": "v.mp4", "type": "output"},
+    ]
+
+    def test_groups_by_node(self):
+        by_node, by_item = scalify_client._group_outputs(self.OUTPUTS, None)
+        assert by_node == {"9": ["https://x/a.png", "https://x/b.png"], "12": ["https://x/v.mp4"]}
+        assert by_item == {}
+
+    def test_groups_by_item_via_item_map_nodes(self):
+        item_map = {
+            "s1": {"nodes": ["7", "9"], "save_node": "9", "prefix": "outputs/s1"},
+            "s2": {"nodes": ["10", "12"], "save_node": "12", "prefix": "outputs/s2"},
+        }
+        _by_node, by_item = scalify_client._group_outputs(self.OUTPUTS, item_map)
+        assert by_item == {
+            "s1": ["https://x/a.png", "https://x/b.png"],
+            "s2": ["https://x/v.mp4"],
+        }
+
+    def test_item_with_no_outputs_keeps_empty_list(self):
+        # A pruned branch (item produced nothing) must still be visible.
+        item_map = {
+            "s1": {"nodes": ["9"], "save_node": "9", "prefix": "p"},
+            "s2": {"nodes": ["99"], "save_node": "99", "prefix": "p"},
+        }
+        _by_node, by_item = scalify_client._group_outputs(self.OUTPUTS[:1], item_map)
+        assert by_item == {"s1": ["https://x/a.png"], "s2": []}
+
+    def test_save_node_membership_counts_even_outside_nodes_list(self):
+        item_map = {"s1": {"nodes": ["7"], "save_node": "9", "prefix": "p"}}
+        _by_node, by_item = scalify_client._group_outputs(self.OUTPUTS[:1], item_map)
+        assert by_item == {"s1": ["https://x/a.png"]}
+
+    def test_empty_inputs(self):
+        assert scalify_client._group_outputs([], None) == ({}, {})
+        assert scalify_client._group_outputs([], {}) == ({}, {})
+
+    def test_skips_malformed_entries(self):
+        outputs = [
+            "garbage",
+            {"url": "https://x/no-node.png"},
+            {"node_id": "9"},
+            {"node_id": "9", "url": "https://x/a.png"},
+        ]
+        item_map = {"s1": {"nodes": ["9"]}, "bad": "not-a-dict"}
+        by_node, by_item = scalify_client._group_outputs(outputs, item_map)
+        assert by_node == {"9": ["https://x/a.png"]}
+        assert by_item == {"s1": ["https://x/a.png"], "bad": []}
+
+
+class TestWaitForCompletionProgressProbe:
+    def test_wait_for_completion_resets_idle_on_progress(self, monkeypatch):
+        import scalify_cli.scalify_client as cc
+
+        client = cc.Client(CLOUD)
+
+        poll_interval = 0.04  # each poll sleeps ~40ms
+        timeout = 0.06  # without reset, the idle timer trips after 60ms
+
+        calls = {"n": 0}
+        done = {"status": {"completed": True}, "outputs": {}}
+
+        def history(pid):
+            calls["n"] += 1
+            return done if calls["n"] >= 5 else {"status": {"status_str": "running"}}
+
+        counter = {"v": 0}
+
+        def probe():
+            counter["v"] += 1
+            return ("running", counter["v"])  # advances every poll → resets last_change
+
+        monkeypatch.setattr(client, "get_history", history)
+        # ~5 polls × 40ms ≈ 200ms total elapsed, far past the 60ms timeout, but the
+        # idle timer resets each poll because the probe value advances → must NOT raise.
+        rec = client.wait_for_completion("pid", poll_interval=poll_interval, timeout=timeout, progress_probe=probe)
+        assert rec is done
+
+    def test_wait_for_completion_times_out_on_silence(self, monkeypatch):
+        import scalify_cli.scalify_client as cc
+
+        client = cc.Client(CLOUD)
+        monkeypatch.setattr(client, "get_history", lambda pid: {"status": {"status_str": "running"}})
+        with pytest.raises(TimeoutError):
+            client.wait_for_completion("pid", poll_interval=0, timeout=0.05, progress_probe=lambda: ("running", 1))
+
+
+class TestRedirectRefusal:
+    """The opener must refuse to follow redirects so the Bearer token can't
+    be replayed at a different host."""
+
+    def test_302_to_attacker_raises_http_error(self):
+        # Build a 302 response that the redirect handler would normally follow.
+        from http.client import HTTPMessage
+
+        headers = HTTPMessage()
+        headers["Location"] = "http://attacker.example/steal"
+        err = urllib.error.HTTPError(
+            url="https://cloud.example.com/api/prompt",
+            code=302,
+            msg="Found",
+            hdrs=headers,
+            fp=io.BytesIO(b""),
+        )
+        with patch.object(scalify_client._OPENER, "open", side_effect=err):
+            with pytest.raises(scalify_client.HTTPError) as exc:
+                scalify_client.Client(CLOUD).submit_prompt({}, "cid")
+        assert exc.value.status == 302
+
+
+class TestHttpUrlRejectedForCloud:
+    def test_cloud_with_http_non_loopback_refused(self):
+        bad = Target(
+            kind="cloud",
+            base_url="http://attacker.example",  # http, non-loopback, with token
+            path_prefix="/api",
+            history_path="history_v2",
+            jobs_path="jobs",
+            auth_token="tok",
+        )
+        client = scalify_client.Client(bad)
+        with pytest.raises(ValueError, match="non-https"):
+            client.submit_prompt({}, "cid")
+
+    def test_cloud_with_http_loopback_allowed(self):
+        local_cloud = Target(
+            kind="cloud",
+            base_url="http://127.0.0.1:8190",  # loopback exception
+            path_prefix="/api",
+            history_path="history_v2",
+            jobs_path="jobs",
+            auth_token="tok",
+        )
+        with patch.object(
+            scalify_client._OPENER,
+            "open",
+            return_value=_mock_response({"prompt_id": "x", "number": 1, "node_errors": {}}),
+        ):
+            scalify_client.Client(local_cloud).submit_prompt({}, "cid")  # no raise
+
+
+class TestTokenRedaction:
+    def test_http_error_str_does_not_leak_bearer(self):
+        body = b'{"error": "missing scope, header was Bearer abc123def456"}'
+        err = urllib.error.HTTPError("https://x", 401, "Unauthorized", None, io.BytesIO(body))
+        with patch.object(scalify_client._OPENER, "open", side_effect=err):
+            with pytest.raises(scalify_client.HTTPError) as exc:
+                scalify_client.Client(CLOUD).submit_prompt({}, "cid")
+        assert "abc123def456" not in str(exc.value)
+        assert "abc123def456" not in exc.value.body
+
+    def test_target_repr_omits_token(self):
+        # Bearer should never show in logger.debug("%r", target).
+        assert "tok-abc" not in repr(CLOUD)
+
+
+# ---------------------------------------------------------------------------
+# Bounded response reads
+# ---------------------------------------------------------------------------
+
+
+class _CapRecordingResp:
+    """A urlopen response that records the byte cap it was read with.
+
+    ``read(None)`` fails outright — an unbounded read is the bug being guarded
+    against, and a lenient fake would let it back in.
+    """
+
+    def __init__(self, body: bytes, status: int = 200):
+        self._body = body
+        self.status = status
+        self.requested: list[int] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self, n=None):
+        if n is None:
+            raise AssertionError("unbounded read() — the body must be read with a cap")
+        self.requested.append(n)
+        return self._body[:n]
+
+
+class TestBoundedResponseReads:
+    def test_response_is_read_with_a_cap_not_unbounded(self):
+        import scalify_cli.http as http_mod
+
+        resp = _CapRecordingResp(json.dumps({"prompt_id": "pid", "number": 1, "node_errors": {}}).encode())
+        target = Target(kind="local", base_url="http://127.0.0.1:8188", path_prefix="")
+        with patch.object(scalify_client._OPENER, "open", return_value=resp):
+            scalify_client.Client(target).submit_prompt({"1": {}}, "cid")
+        # One byte past the cap, so a body that exactly fills it is still complete.
+        assert resp.requested == [http_mod.MAX_RESPONSE_BYTES + 1]
+
+    def test_oversize_response_raises_http_error_not_a_truncated_parse(self, monkeypatch):
+        # A truncated body would surface as a misleading JSON decode error (or,
+        # worse, parse into something plausible). Surface it as the same
+        # HTTPError family every caller already handles instead.
+        import scalify_cli.http as http_mod
+
+        resp = _CapRecordingResp(b"x" * 4096)
+        monkeypatch.setattr(
+            scalify_client,
+            "read_capped",
+            lambda r, url, max_bytes=8: http_mod.read_capped(r, url, max_bytes=max_bytes),
+        )
+        target = Target(kind="local", base_url="http://127.0.0.1:8188", path_prefix="")
+        with patch.object(scalify_client._OPENER, "open", return_value=resp):
+            with pytest.raises(scalify_client.HTTPError) as exc_info:
+                scalify_client.Client(target).submit_prompt({"1": {}}, "cid")
+        assert "too large" in str(exc_info.value)
+
+    def test_error_body_is_read_with_a_cap_too(self):
+        # The 4xx/5xx body comes from the same server as the success body, so
+        # it needs the same ceiling — the fake refuses an unbounded read().
+        err = _http_error(400, b"bad workflow")
+        with patch.object(scalify_client._OPENER, "open", side_effect=err):
+            with pytest.raises(scalify_client.HTTPError) as exc_info:
+                scalify_client.Client(LOCAL).submit_prompt({"1": {}}, "cid")
+        # Still capped-but-generous, so a real error body reaches the caller.
+        assert exc_info.value.body == "bad workflow"
+
+    def test_oversize_error_body_degrades_to_an_empty_body_not_a_crash(self, monkeypatch):
+        # Over the cap the read raises; the status and reason must still make it
+        # out, with the body simply dropped rather than the request blowing up.
+        import scalify_cli.http as http_mod
+
+        monkeypatch.setattr(
+            scalify_client,
+            "read_capped",
+            lambda r, url, max_bytes=4: http_mod.read_capped(r, url, max_bytes=max_bytes),
+        )
+        err = _http_error(500, b"x" * 4096)
+        with patch.object(scalify_client._OPENER, "open", side_effect=err):
+            with pytest.raises(scalify_client.HTTPError) as exc_info:
+                scalify_client.Client(LOCAL).submit_prompt({"1": {}}, "cid")
+        assert exc_info.value.status == 500
+        assert exc_info.value.body == ""

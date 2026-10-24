@@ -1,0 +1,34 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://scalify.khulnasoft.com/schemas/assets_library.json",
+ "title": "scalify assets library --json data payload",
+ "description": "Union schema for `assets library ls` and `assets library ensure`.",
+ "type": "object",
+ "additionalProperties": true,
+ "properties": {
+  "count": { "type": "integer" },
+  "assets": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {
+     "id": { "type": ["string", "null"] },
+     "name": { "type": ["string", "null"] },
+     "hash": { "type": ["string", "null"] },
+     "mime_type": { "type": ["string", "null"] },
+     "size": { "type": ["integer", "null"] },
+     "tags": { "type": ["array", "null"] },
+     "preview_url": { "type": ["string", "null"] },
+     "job_id": { "type": ["string", "null"] },
+     "created_at": { "type": ["string", "null"] }
+    }
+   }
+  },
+  "has_more": { "type": "boolean" },
+  "total": { "type": "integer", "minimum": 0 },
+  "id": { "type": ["string", "null"] },
+  "hash": { "type": ["string", "null"] },
+  "created_new": { "type": ["boolean", "null"] }
+ }
+}

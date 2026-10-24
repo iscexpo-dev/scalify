@@ -1,0 +1,44 @@
+name: "Windows Specific Commands"
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - scalify_cli/**
+      # The smoke test below pip-installs scalify-cli, so dependency changes must
+      # run it too — an unpinned transitive dep (mixpanel 5.x -> pydantic-core)
+      # is exactly what broke `scalify install` on Windows.
+      - pyproject.toml
+      - .github/workflows/test-windows.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: "utf8"
+      # uv hardlinks by default, which cannot replace a .pyd that is still
+      # loaded by another process on the runner (os error 5). Copy instead.
+      UV_LINK_MODE: copy
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: 3.12
+
+      - name: Install Dependencies
+        run: |
+          python -m venv venv
+          .\venv\Scripts\Activate.ps1
+          Get-Command python
+          python -m pip install --upgrade pip
+          pip install pytest
+          pip install -e .
+          scalify --skip-prompt --workspace ./ScalifyUI install --fast-deps --nvidia --cuda-version 12.6 --skip-manager
+          scalify --here launch -- --cpu --quick-test-for-ci

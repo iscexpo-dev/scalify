@@ -1,0 +1,551 @@
+"""Renderer: decides output mode and emits JSON envelopes or pretty output.
+
+UX contract:
+- Pretty mode produces output byte-identical to the pre-Phase-1 CLI.
+- JSON mode produces a single envelope on stdout (intermediate messages → stderr,
+  and so do ``progress_event`` lines, as JSON).
+- NDJSON mode produces one JSON event per line on stdout; the final envelope is
+  the last line.
+- Errors carry a stable ``code`` and a ``hint``. The hint is rendered as a
+  yellow line under the error in pretty mode and as ``error.hint`` in JSON.
+"""
+
+from __future__ import annotations
+
+import codecs
+import json
+import os
+import sys
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, TextIO
+
+from rich.console import Console
+
+from scalify_cli.caller import Caller, detect_caller, stream_is_tty
+from scalify_cli.output.sanitize import sanitize_markup
+
+# Machine-output contract versions, surfaced in every envelope/event line and
+# in `scalify discover` (output_contract). Bump rule: additive optional fields =
+# no bump; rename/remove/retype a field or changed exit semantics = bump.
+ENVELOPE_SCHEMA = "envelope/1"
+EVENT_SCHEMA = "event/1"
+
+
+class OutputMode(str, Enum):
+    PRETTY = "pretty"
+    JSON = "json"
+    NDJSON = "ndjson"
+
+
+def _truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass
+class Renderer:
+    mode: OutputMode = OutputMode.PRETTY
+    caller: Caller = field(default_factory=detect_caller)
+    command: str = ""
+    version: str = ""
+    where: str | None = None
+    # Stream overrides. When None we look up sys.stdout / sys.stderr at the
+    # *call site* so test fixtures (capsys, CliRunner) that monkey-patch
+    # streams still capture our output. Tests can set these explicitly to
+    # pin redirection in scope.
+    _pretty_stream_override: TextIO | None = field(default=None, repr=False)
+    _machine_stream_override: TextIO | None = field(default=None, repr=False)
+    # Throttle map for high-frequency events: {token: last_emit_ts}.
+    _throttle: dict[str, float] = field(default_factory=dict, repr=False)
+    _envelope_emitted: bool = field(default=False, repr=False)
+    _exit_code: int = field(default=0, repr=False)
+
+    @property
+    def pretty_stream(self) -> TextIO:
+        if self._pretty_stream_override is not None:
+            return self._pretty_stream_override
+        # In pretty mode we use stdout. In JSON modes we redirect to stderr so
+        # stdout is reserved for the envelope/events.
+        return sys.stdout if self.mode is OutputMode.PRETTY else sys.stderr
+
+    @pretty_stream.setter
+    def pretty_stream(self, value: TextIO) -> None:
+        self._pretty_stream_override = value
+
+    @property
+    def machine_stream(self) -> TextIO:
+        if self._machine_stream_override is not None:
+            return self._machine_stream_override
+        return sys.stdout
+
+    @machine_stream.setter
+    def machine_stream(self, value: TextIO) -> None:
+        self._machine_stream_override = value
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        json_flag: bool | None = None,
+        json_stream_flag: bool | None = None,
+        no_json_flag: bool = False,
+        env: Mapping[str, str] | None = None,
+        is_stdout_tty: bool | None = None,
+        caller: Caller | None = None,
+        command: str = "",
+        version: str = "",
+    ) -> Renderer:
+        """Decide the output mode.
+
+        Precedence (highest first):
+            1. --json-stream flag                       → NDJSON
+            2. --json flag                              → JSON
+            3. --no-json flag                           → PRETTY
+            4. SCALIFY_OUTPUT env (json/ndjson/pretty)    → that mode
+            5. agentic caller detected                  → JSON
+            6. stdout is not a TTY                      → JSON
+            7. default                                  → PRETTY
+        """
+        env_map = env if env is not None else os.environ
+        caller = caller if caller is not None else detect_caller(env_map)
+        if is_stdout_tty is None:
+            # Guarded probe, not a bare `sys.stdout.isatty()`: this runs from
+            # the main Typer callback before any command dispatch, so under a
+            # detached / `pythonw` stdout a raising probe would kill every
+            # invocation — `scalify --help` included. See `caller.stream_is_tty`.
+            is_stdout_tty = stream_is_tty(getattr(sys, "stdout", None))
+
+        mode: OutputMode
+        if json_stream_flag:
+            mode = OutputMode.NDJSON
+        elif json_flag:
+            mode = OutputMode.JSON
+        elif no_json_flag:
+            mode = OutputMode.PRETTY
+        else:
+            env_choice = (env_map.get("SCALIFY_OUTPUT") or "").strip().lower()
+            if env_choice in {"json", "ndjson", "pretty"}:
+                mode = OutputMode(env_choice)
+            elif caller.agentic:
+                mode = OutputMode.JSON
+            elif not is_stdout_tty:
+                mode = OutputMode.JSON
+            else:
+                mode = OutputMode.PRETTY
+
+        # Streams are resolved lazily from sys.stdout/sys.stderr at each call
+        # site (see pretty_stream / machine_stream properties), so test
+        # fixtures that monkey-patch streams keep working.
+        return cls(
+            mode=mode,
+            caller=caller,
+            command=command,
+            version=version,
+        )
+
+    # ----- pretty (Rich) helpers -----
+
+    def pretty_console(self) -> Console:
+        # Recreated each call so it respects whatever sys.stdout/stderr looks
+        # like *now*. Console is cheap.
+        return Console(file=self.pretty_stream, force_terminal=None, soft_wrap=False)
+
+    def stderr_console(self) -> Console:
+        return Console(file=sys.stderr)
+
+    def is_pretty(self) -> bool:
+        return self.mode is OutputMode.PRETTY
+
+    def is_json(self) -> bool:
+        return self.mode in {OutputMode.JSON, OutputMode.NDJSON}
+
+    def is_stream(self) -> bool:
+        return self.mode is OutputMode.NDJSON
+
+    def force_stream(self) -> None:
+        """Upgrade this renderer to NDJSON streaming mode.
+
+        Used by command-local streaming flags (e.g. ``scalify run --json``)
+        after the global callback has already resolved the mode: the
+        command knows it produces an event stream, so a plain ``--json``
+        on it means "stream NDJSON events + final envelope" rather than
+        the single-envelope JSON mode.
+        """
+        self.mode = OutputMode.NDJSON
+
+    def force_json(self) -> None:
+        """Upgrade a pretty renderer to single-envelope JSON mode.
+
+        Counterpart to ``force_stream`` for commands whose ``--json`` is
+        parsed out of an argv tail the global callback never sees — e.g.
+        ``scalify generate list --json``, where ``generate`` takes
+        ``allow_extra_args`` and hand-parses its own meta flags. Already-JSON
+        modes are left alone so this can never *downgrade* an NDJSON stream.
+        """
+        if self.mode is OutputMode.PRETTY:
+            self.mode = OutputMode.JSON
+
+    # ----- printing -----
+
+    def print(self, *args: Any, **kwargs: Any) -> None:
+        """Print human-readable text. In JSON modes this goes to stderr.
+
+        Use this as a drop-in for ``rich.print``: the Rich markup, panels,
+        tables, and exact whitespace are preserved in pretty mode.
+        """
+        # Rich's print accepts file= kwarg. We always direct human output to
+        # `pretty_stream` (stdout in pretty mode, stderr in JSON mode).
+        from rich import print as _rprint
+
+        kwargs.setdefault("file", self.pretty_stream)
+        _rprint(*args, **kwargs)
+
+    def console(self) -> Console:
+        """Return the Console used for Rich tables / panels in pretty mode.
+
+        In JSON modes, returns a Console attached to stderr so any
+        ``console.print(table)`` calls don't pollute stdout.
+        """
+        return self.pretty_console() if self.is_pretty() else self.stderr_console()
+
+    # ----- semantic helpers -----
+
+    # These four take a plain string and hand it to the terminal, so they are a
+    # pretty-mode boundary in the same sense ``error_panel`` is: anything the
+    # message carries — including a remote server's text — is neutralized before
+    # it can be acted on as an escape sequence. The message lands inside a Rich
+    # *markup* string, so ``sanitize_markup`` also escapes the markup: Rich would
+    # otherwise turn ``[link=http://evil]x[/link]`` back into a live OSC 8
+    # sequence, and an unbalanced ``[/]`` would raise ``MarkupError`` and crash
+    # the CLI mid-print. Escaping here rather than asking every call site to
+    # remember ``rich.markup.escape`` is the whole point of having a boundary;
+    # the cost is that these four helpers no longer accept caller markup, which
+    # is fine — they style the line themselves and no call site passed any.
+    # ``print`` is deliberately not sanitized: it is the generic passthrough and
+    # takes arbitrary Rich renderables, not just strings.
+    # ``sanitize_value`` semantics (not ``sanitize``) so a caller that ignores
+    # the ``str`` annotation still gets the ``str()`` coercion f-strings did.
+
+    def info(self, message: str, *, hint: str | None = None) -> None:
+        self.print(sanitize_markup(message))
+        if hint:
+            self.print(f"[yellow]Hint:[/yellow] {sanitize_markup(hint)}")
+
+    def warn(self, message: str, *, hint: str | None = None) -> None:
+        self.print(f"[yellow]{sanitize_markup(message)}[/yellow]")
+        if hint:
+            self.print(f"[yellow]Hint:[/yellow] {sanitize_markup(hint)}")
+
+    def success(self, message: str) -> None:
+        self.print(f"[bold green]{sanitize_markup(message)}[/bold green]")
+
+    # ----- structured output -----
+
+    def emit(
+        self,
+        data: Any = None,
+        *,
+        command: str | None = None,
+        where: str | None = None,
+        changed: bool | None = None,
+        ok: bool = True,
+        error: Mapping[str, Any] | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Emit the final envelope. In pretty mode this is a no-op (data was
+        already shown by ``print``/``success``/etc).
+
+        ``ok`` defaults to True for the common success path. Commands that
+        carry a structured result *and* a negative verdict (e.g. ``validate``
+        on an invalid workflow, which still emits its error/warning payload as
+        data) pass ``ok=False`` so the envelope's ``ok`` agrees with the
+        process exit code — and, with it, an ``error`` block naming the verdict.
+        ``ok=False`` without one is refused: every consumer branches on
+        ``error.code``, so ``{"ok": false, "error": null}`` is unreadable.
+
+        ``extra`` merges additional top-level fields into the envelope
+        (additive-optional under envelope/1, e.g. ``--select``'s
+        ``selected_bytes``/``total_bytes``). Core envelope keys are never
+        overridden; when ``extra`` is absent the envelope is byte-identical to
+        an emit without it.
+        """
+        if not ok and not error:
+            raise AssertionError("a not-ok envelope must carry an error block naming the failure")
+        if self.is_pretty():
+            return
+        if self._envelope_emitted:
+            # Defensive: the harness should only emit once. Don't double-write.
+            return
+        envelope = self._envelope(
+            ok=ok,
+            command=command or self.command,
+            data=data,
+            where=where or self.where,
+            changed=changed,
+            error=error,
+        )
+        if extra:
+            for key, value in extra.items():
+                envelope.setdefault(key, value)
+        self._write_json_line(envelope)
+        self._envelope_emitted = True
+
+    def error(
+        self,
+        code: str,
+        message: str,
+        *,
+        hint: str | None = None,
+        details: Mapping[str, Any] | None = None,
+        exit_code: int = 1,
+        command: str | None = None,
+        where: str | None = None,
+    ) -> None:
+        """Emit a structured error. In pretty mode, prints red message + yellow
+        hint. In JSON mode, emits an envelope with ``ok=false`` and the error
+        block; in NDJSON mode also emits the envelope as the final line.
+
+        An error message is a navigation signal toward correctness. When the
+        call site doesn't supply a usable ``hint`` — ``None`` OR an empty/blank
+        string (call sites often pass ``e.hint or ""``) — fall back to the
+        code's REGISTERED hint so every error tells the agent what to do next.
+        No dead ends.
+        """
+        self._exit_code = exit_code
+        if not (hint and hint.strip()):
+            from scalify_cli import error_codes
+
+            registered = error_codes.get(code)
+            if registered is not None and registered.hint:
+                hint = registered.hint
+        if self.is_pretty():
+            # Lazy import to keep panel deps optional.
+            from scalify_cli.output.panels import error_panel
+
+            self.console().print(error_panel(code=code, message=message, hint=hint, details=details))
+            return
+        if self._envelope_emitted:
+            return
+        envelope = self._envelope(
+            ok=False,
+            command=command or self.command,
+            data=None,
+            where=where or self.where,
+            changed=None,
+            error={
+                "code": code,
+                "message": message,
+                "hint": hint,
+                "details": dict(details) if details else None,
+            },
+        )
+        self._write_json_line(envelope)
+        self._envelope_emitted = True
+
+    def event(self, type: str, **fields: Any) -> None:
+        """Emit one NDJSON event line. Only meaningful in NDJSON mode."""
+        if not self.is_stream():
+            return
+        payload = {"schema": EVENT_SCHEMA, "type": type, **fields}
+        self._write_json_line(payload)
+
+    def throttled_event(self, token: str, type: str, *, max_hz: float = 10.0, **fields: Any) -> bool:
+        """Emit an NDJSON event only if at least ``1/max_hz`` seconds have
+        passed since the last event with the same ``token``. Returns True if
+        the event was emitted.
+        """
+        if not self.is_stream():
+            return False
+        now = time.monotonic()
+        last = self._throttle.get(token, 0.0)
+        if now - last < (1.0 / max_hz):
+            return False
+        self._throttle[token] = now
+        self.event(type, **fields)
+        return True
+
+    def progress_event(self, type: str, **fields: Any) -> None:
+        """Emit one event line about work still in flight, in either JSON mode.
+
+        ``event`` is silent outside NDJSON mode, which is right for a stream a
+        consumer asked for and wrong for progress: a caller that resolved to
+        single-envelope JSON mode only because its stdout is a pipe (every agent)
+        would sit through a multi-GB upload with nothing to read. So in NDJSON
+        mode this is ``event``; in JSON mode the same ``event/1`` line goes to
+        stderr, which keeps stdout the single envelope the contract promises.
+        Pretty mode renders its own progress and emits nothing here.
+        """
+        if self.is_pretty():
+            return
+        payload = {"schema": EVENT_SCHEMA, "type": type, **fields}
+        self._write_json_line(payload, stream=None if self.is_stream() else sys.stderr)
+
+    # ----- internals -----
+
+    def _envelope(
+        self,
+        *,
+        ok: bool,
+        command: str,
+        data: Any,
+        where: str | None,
+        changed: bool | None,
+        error: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        env: dict[str, Any] = {
+            # Contract discriminator + version first: NDJSON consumers pick
+            # out the final line by `type` and negotiate shape on `schema`.
+            "schema": ENVELOPE_SCHEMA,
+            "type": "envelope",
+            "ok": ok,
+            "command": command,
+            "version": self.version,
+            "where": where,
+            "data": data,
+            "error": dict(error) if error else None,
+        }
+        if changed is not None:
+            env["changed"] = changed
+        return env
+
+    def _write_json_line(self, payload: Mapping[str, Any], *, stream: TextIO | None = None) -> None:
+        if stream is None:
+            stream = self.machine_stream
+        # Readers of this stream decode it as UTF-8. A legacy code page that
+        # CAN encode a character is the dangerous case — no UnicodeEncodeError
+        # fires (the clause below never runs) and the line goes out as bytes
+        # that are not valid UTF-8: cp1252 spells an em-dash 0x97, and the
+        # scalify-agent stored "no output nodes � the server will reject it"
+        # for every validate failure on Windows. Escaping whenever the stream
+        # is not UTF-8 keeps those envelopes readable on a UTF-8 terminal and
+        # decodable everywhere else.
+        is_utf8 = _is_utf8_stream(stream)
+        line = json.dumps(payload, default=_json_default, ensure_ascii=not is_utf8)
+        try:
+            # Escaping to ASCII is not enough on a stream that re-encodes it: a
+            # UTF-16 wrapper turns even pure ASCII into two-byte sequences, and
+            # a reader decoding this stream as UTF-8 cannot parse it at all.
+            # Write through the binary buffer instead, after flushing whatever
+            # the text wrapper still holds so the two stay in order.
+            buffer = getattr(stream, "buffer", None)
+            if not is_utf8 and buffer is not None:
+                stream.flush()
+                buffer.write((line + "\n").encode("utf-8"))
+                buffer.flush()
+                return
+            try:
+                stream.write(line + "\n")
+            except UnicodeEncodeError:
+                # A redirected stdout on Windows is cp1252 (or another legacy
+                # code page), and a payload with a character outside it — the
+                # "→" in a skill description, a model name — raised here. As a
+                # ValueError it fell into the clause below and the envelope
+                # silently vanished: the scalify-agent's skill import saw zero
+                # packs on Windows. JSON can spell every character in ASCII,
+                # so the same envelope is written escaped instead.
+                stream.write(json.dumps(payload, default=_json_default, ensure_ascii=True) + "\n")
+            stream.flush()
+        except (AttributeError, ValueError):
+            # Resolving to JSON mode against an unusable stdout must not merely
+            # DEFER the crash to the first emit — by then the command has
+            # already run and its side effects have landed, so dying here is
+            # strictly worse than dying at startup. `machine_stream` falls back
+            # to `sys.stdout`, which under pythonw / a detached parent is
+            # `None` (AttributeError on `.write`) or an already-closed file
+            # (ValueError). Neither can ever receive output, so the write is a
+            # no-op and the process still exits with the right code.
+            #
+            # `OSError` is deliberately NOT caught, even though it looks like it
+            # belongs. A `BrokenPipeError` here means the stream was real and the
+            # reader hung up, which is load-bearing: `scalify cloud login` relies
+            # on it propagating out of the `login_url` emit so the command fails
+            # fast instead of blocking the full 300s on a browser callback nobody
+            # will read (see test_json_login_fails_fast_when_login_url_write_breaks).
+            # Swallowing it would turn that into a silent hang.
+            #
+            # `TypeError` is likewise not caught: it would mean the payload is
+            # malformed, which is our bug and must stay visible.
+            return
+
+    @property
+    def exit_code(self) -> int:
+        return self._exit_code
+
+
+def _is_utf8_stream(stream: TextIO | None) -> bool:
+    """Whether text written to ``stream`` comes out as UTF-8 bytes.
+
+    ``TextIO.encoding`` is the declared type, but this is still read with
+    ``getattr``: ``machine_stream`` is assignable, and the things callers
+    assign (a ``StringIO``, a test double) have no encoding at all. Such a
+    stream re-encodes nothing, so it counts as UTF-8 — escaping would only make
+    its text harder to read, and no bytes reach a decoder anyway.
+
+    The name is resolved through ``codecs.lookup`` rather than compared, so
+    every alias the platform may report lands correctly — ``utf8``, ``UTF-8``,
+    ``utf_8`` and Windows' ``cp65001`` all normalise to ``utf-8``. A name no
+    codec claims falls to "not UTF-8", which only ever escapes more.
+    """
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        return True
+    try:
+        return codecs.lookup(encoding).name == "utf-8"
+    except (LookupError, TypeError):
+        return False
+
+
+def _json_default(obj: Any) -> Any:
+    """Coerce one unserializable value to a JSON-native one.
+
+    json feeds anything this returns straight back in when it still cannot
+    encode it, so a hook that returns another opaque object re-enters once per
+    hop and one that keeps producing new objects never terminates at all. The
+    tail coercion is what holds that off: every return is either a scalar json
+    encodes directly or a container it walks itself. A container's members are
+    values of their own, so each costs at most one further hook call, and a
+    container that contains itself trips json's own circular-reference check.
+    """
+    seen: set[int] = set()
+    while isinstance(obj, Enum) and id(obj) not in seen:
+        seen.add(id(obj))
+        obj = obj.value
+    if hasattr(obj, "isoformat"):
+        try:
+            obj = obj.isoformat()
+        except Exception:  # noqa: BLE001
+            pass
+    if isinstance(obj, str | int | float | None | list | dict | tuple):
+        return obj
+    return str(obj)
+
+
+# ----- process-wide singleton ----------------------------------------------
+
+_RENDERER: Renderer | None = None
+
+
+def set_renderer(renderer: Renderer) -> None:
+    """Install the process-wide renderer. Called once from cmdline.entry()."""
+    global _RENDERER
+    _RENDERER = renderer
+
+
+def get_renderer() -> Renderer:
+    """Return the installed renderer, creating a default pretty one if none.
+
+    The default is pretty so existing tests and ad-hoc imports don't blow up.
+    """
+    global _RENDERER
+    if _RENDERER is None:
+        _RENDERER = Renderer()
+    return _RENDERER
+
+
+def reset_renderer_for_testing() -> None:
+    global _RENDERER
+    _RENDERER = None

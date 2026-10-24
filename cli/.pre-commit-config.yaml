@@ -1,0 +1,46 @@
+repos:
+  - repo: local
+    hooks:
+      - id: adr-validation
+        name: validate architecture decision records
+        entry: python scripts/check_adrs.py
+        language: python
+        pass_filenames: false
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+    -   id: check-yaml
+        exclude: ^tests/.*$
+    -   id: check-toml
+        exclude: ^tests/.*$
+    -   id: end-of-file-fixer
+        exclude: >-
+          (^.*\.(json|txt)$)|(^tests/.*\.toml$)|(.github/.*TEMPLATE)
+    -   id: trailing-whitespace
+        exclude: >-
+          (^.*\.(json|txt)$)
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.15
+    hooks:
+      # Run the linter.
+      - id: ruff
+        args: [ --fix ]
+      # Run the formatter.
+      - id: ruff-format
+
+  - repo: https://github.com/tox-dev/pyproject-fmt
+    rev: v2.6.0
+    hooks:
+      - id: pyproject-fmt
+        exclude: ^tests/.*$
+
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.8.5
+    hooks:
+      - id: uv-lock
+      - id: uv-export
+        args: [ "--output-file=pylock.toml" ]
+      - id: uv-sync
+        args: [ "--all-extras" ]

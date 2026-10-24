@@ -1,0 +1,280 @@
+"""Guardrail: every ``scalify …`` we print must be a command that exists.
+
+The audit found eight help/hint strings pointing users at ``scalify auth login``,
+which has never been a command — the real one is ``scalify cloud login``. Nothing
+caught it because help text is just string literals. This test walks the shipped
+source, the README and the bundled agent skills, and resolves every mention
+against the live Typer tree.
+
+If this fails, the mention is wrong (or the command was renamed) — fix the
+string, don't loosen the lint. See :mod:`scalify_cli.command_mentions` for why the
+resolver is deliberately conservative.
+"""
+
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+import pytest
+
+from scalify_cli.cmdline import app
+from scalify_cli.command_mentions import Mention, check_mention, check_text, extract_mentions, global_options
+from scalify_cli.help_json import build_help_json
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PACKAGE_ROOT = REPO_ROOT / "scalify_cli"
+
+# ``discovery.py`` holds no prose — it is a ``"scalify <emit name>" -> schema`` map,
+# and envelope names are not all subcommands (the root ``--version`` flag emits
+# ``command="version"``). Its keys get the stronger structural check below
+# instead of the prose scan.
+PROSE_SCAN_EXCLUDED = {PACKAGE_ROOT / "discovery.py"}
+
+# The two exemption sets below are the *only* escapes from
+# ``test_emit_literals_are_real_command_paths``. Each entry cites the code that
+# proves it cannot be a Typer path, so a future reader can tell an exemption from a
+# tolerated typo. Shrink them when an entry becomes a real command; never grow one
+# to silence a rename — that is the drift this guardrail exists to catch.
+
+# Emitted by a root *flag*: ``scalify --version`` → ``cmdline.py:311``.
+_ROOT_FLAG_ENVELOPES = {"scalify version"}
+
+# Real invocations the Typer tree structurally cannot show:
+#   welcome         — the root callback's envelope for a bare ``scalify`` (cmdline.py:325-344).
+#   generate <verb> — ``generate`` is a plain command, not a group, so its first
+#                     positional can be a model alias (generate/app.py:224-230); these
+#                     verbs dispatch inside the body (already ``COMMAND_SCHEMAS`` keys
+#                     at discovery.py:134-135). ``emit-workflow`` is its flag envelope.
+_NON_TYPER_ENVELOPES = {
+    "scalify welcome",
+    "scalify generate list",
+    "scalify generate schema",
+    "scalify generate emit-workflow",
+}
+
+
+@pytest.fixture(scope="module")
+def tree() -> dict:
+    return build_help_json(app)["commands"]
+
+
+@pytest.fixture(scope="module")
+def globals_() -> dict:
+    return global_options(build_help_json(app))
+
+
+def _scanned_files() -> list[Path]:
+    """Python sources plus the user-facing prose that ships with the package."""
+    files = [p for p in PACKAGE_ROOT.rglob("*.py") if "__pycache__" not in p.parts and p not in PROSE_SCAN_EXCLUDED]
+    files += sorted(PACKAGE_ROOT.rglob("*.md"))
+    readme = REPO_ROOT / "README.md"
+    if readme.exists():
+        files.append(readme)
+    return files
+
+
+def _all_command_paths() -> set[str]:
+    """Every command path in the tree, groups included (``iter_command_paths`` gives leaves only)."""
+    paths: set[str] = set()
+
+    def walk(subs: dict, prefix: str) -> None:
+        for name, child in subs.items():
+            path = f"{prefix} {name}"
+            paths.add(path)
+            walk(child.get("subcommands") or {}, path)
+
+    walk(build_help_json(app)["commands"], "scalify")
+    return paths
+
+
+def _emitted_command_literals() -> set[str]:
+    """Every ``renderer.emit(…, command="x")`` literal in the package, as ``"scalify x"``."""
+    emitted: set[str] = set()
+    for path in PACKAGE_ROOT.rglob("*.py"):
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            module = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(module):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "emit"):
+                continue
+            for kw in node.keywords:
+                if kw.arg == "command" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                    emitted.add(f"scalify {kw.value.value}")
+    return emitted
+
+
+def test_scan_covers_the_expected_surface():
+    """A silently-empty scan would make this whole guardrail a no-op."""
+    files = _scanned_files()
+    assert len(files) > 50
+    assert any(p.name == "cmdline.py" for p in files)
+    assert any(p.name == "SKILL.md" for p in files)
+
+
+def test_scan_reaches_the_readmes_fenced_examples():
+    """The README's copy-pasteable examples are bare lines in ```bash fences.
+
+    They carry no backticks of their own, so they are invisible to the
+    backtick/quoted patterns — if fenced extraction regresses, the guardrail
+    stops covering the most-copied surface in the repo while still passing.
+    """
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    found = {m.text for m in extract_mentions(readme, path="README.md")}
+    assert "scalify cloud login" in found
+    assert "scalify generate list" in found
+
+
+def test_no_mentions_of_nonexistent_commands(tree, globals_):
+    violations = []
+    for path in _scanned_files():
+        text = path.read_text(encoding="utf-8", errors="replace")
+        violations += check_text(text, path=str(path.relative_to(REPO_ROOT)), tree=tree, globals_=globals_)
+    assert not violations, "help/hint strings reference commands that do not exist:\n" + "\n".join(
+        str(v) for v in violations
+    )
+
+
+# --- the machine-readable catalogs keyed by command path ---
+
+
+def test_help_examples_keys_are_real_commands():
+    """A stale ``HELP_EXAMPLES`` key is silently dropped — the command loses its examples."""
+    from scalify_cli.help_json import HELP_EXAMPLES
+
+    stale = sorted(k for k in HELP_EXAMPLES if k not in _all_command_paths())
+    assert not stale, f"HELP_EXAMPLES keys that are not commands (their examples never render): {stale}"
+
+
+def test_command_schema_keys_are_commands_or_emitted_envelopes():
+    """``COMMAND_SCHEMAS`` ships verbatim in ``scalify discover``.
+
+    Its keys are ``"scalify <envelope command name>"``. Most are real command
+    paths; a few name an envelope emitted by a root flag (``--version``). A key
+    that is neither advertises a schema for something no agent can ever invoke.
+    """
+    from scalify_cli.discovery import COMMAND_SCHEMAS, STREAM_EVENT_SCHEMAS
+
+    emitted = _emitted_command_literals()
+
+    known = _all_command_paths() | emitted
+    for name, catalog in (("COMMAND_SCHEMAS", COMMAND_SCHEMAS), ("STREAM_EVENT_SCHEMAS", STREAM_EVENT_SCHEMAS)):
+        stale = sorted(k for k in catalog if k not in known)
+        assert not stale, f"{name} keys that are neither a command nor an emitted envelope: {stale}"
+
+
+def test_emit_literals_are_real_command_paths():
+    """The other direction: an emit literal must resolve into the live Typer tree.
+
+    The union above lets an emit literal validate itself — typo
+    ``emit(command="build init")`` into ``"build iiinit"`` and it simply joins
+    ``known``, so ``COMMAND_SCHEMAS`` still "matches" and nothing goes red while
+    the shipped envelope now names a command no agent can invoke. This asserts the
+    subset direction, which is the half that catches a rename.
+    """
+    bad = _emitted_command_literals() - _ROOT_FLAG_ENVELOPES - _NON_TYPER_ENVELOPES - _all_command_paths()
+    assert not bad, f"emit literals that are not real command paths: {sorted(bad)}"
+
+
+# --- resolver unit tests: the lint is only as good as its false-positive rate ---
+
+
+def _check(text: str, tree: dict, globals_: dict | None = None):
+    return check_mention(Mention(text=text, path="<test>", line=1), tree, globals_=globals_)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "scalify cloud login",
+        "scalify install --nvidia",
+        "scalify run --prompt 'a red fox in snow'",
+        "scalify model download --url https://example.com/x.safetensors",
+        "scalify --json env",  # global option skipped, then a real command
+        "scalify --where cloud jobs ls",  # value-taking global; 'cloud' is its value, not a subcommand
+        "scalify --where=cloud jobs ls",  # inline value form
+        "scalify node show installed",  # positional argument to a leaf command
+        "scalify manager disable-gui",
+        "scalify",
+        "scalify auth",  # a bare group mention is fine
+        "scalify --not-a-real-flag auth login",  # unknown option: stop clean rather than guess
+    ],
+)
+def test_valid_mentions_pass(text, tree, globals_):
+    assert _check(text, tree, globals_) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "unknown"),
+    [
+        ("scalify auth login", "login"),  # the original regression itself
+        ("scalify cloud singin", "singin"),
+        ("scalify nope", "nope"),
+        ("scalify model downlaod --url x", "downlaod"),
+        # A leading global option must not end the scan before the subcommand.
+        ("scalify --json auth login", "login"),
+        ("scalify --where cloud cloud singin", "singin"),
+    ],
+)
+def test_invalid_mentions_are_flagged(text, unknown, tree, globals_):
+    violation = _check(text, tree, globals_)
+    assert violation is not None
+    assert violation.unknown_token == unknown
+
+
+def test_global_options_are_derived_from_the_live_root_callback(globals_):
+    """Hardcoding the set would silently rot as root options change."""
+    assert globals_["--json"] is False  # a flag: consumes no value
+    assert globals_["--where"] is True  # takes a value
+    assert "--help-json" in globals_
+
+
+def test_without_globals_the_resolver_still_stops_at_the_first_option(tree):
+    """Default (no ``globals_``) keeps the old conservative behaviour."""
+    assert _check("scalify --json auth login", tree) is None
+
+
+def test_extract_finds_backticked_and_run_prefixed_mentions():
+    text = "first line\nrun: scalify cloud login\nand `scalify jobs ls` too\n"
+    found = {m.text for m in extract_mentions(text, path="<test>")}
+    assert "scalify cloud login" in found
+    assert "scalify jobs ls" in found
+
+
+def test_extract_finds_bare_quoted_invocations(tree):
+    """The run-cli tour labels invocations as plain string literals, not backticks."""
+    text = 'Invocation(argv=[*scalify, "auth", "whoami"], label="scalify auth whoami")\n'
+    found = extract_mentions(text, path="<test>")
+    assert [m.text for m in found] == ["scalify auth whoami"]
+    assert check_mention(found[0], tree).unknown_token == "whoami"
+
+
+def test_extract_ignores_non_command_scalify_words():
+    text = "`scalify-cli` installs things and writes `scalify.yaml`."
+    assert extract_mentions(text, path="<test>") == []
+
+
+def test_extract_reads_markdown_fenced_code_blocks():
+    """The README's primary examples are bare shell lines inside ```bash fences."""
+    text = "Sign in:\n\n```bash\nscalify cloud login                   # opens your browser\n$ scalify jobs ls --where cloud\n```\n"
+    found = {m.text for m in extract_mentions(text, path="<test>")}
+    assert "scalify cloud login" in found
+    assert "scalify jobs ls --where cloud" in found
+
+
+def test_fenced_mentions_report_their_own_line():
+    text = "intro\n\n```bash\nscalify auth login\n```\n"
+    (mention,) = extract_mentions(text, path="<test>")
+    assert mention.line == 4
+    assert text.splitlines()[mention.line - 1] == "scalify auth login"
+
+
+def test_run_prefixed_mention_at_line_start_reports_its_own_line():
+    """``_RUN_PREFIX``'s boundary class eats the preceding newline; the line must not shift."""
+    text = "first line\nsecond line\nrun: scalify cloud login\n"
+    (mention,) = extract_mentions(text, path="<test>")
+    assert mention.line == 3
+    assert text.splitlines()[mention.line - 1] == "run: scalify cloud login"

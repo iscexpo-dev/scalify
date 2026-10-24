@@ -1,0 +1,294 @@
+import json
+import logging
+import os
+
+from scalify_cli.http import DEFAULT_HTTP_TIMEOUT
+
+# Reduced global imports from scalify_cli.registry
+from scalify_cli.registry.types import (
+    License,
+    Node,
+    NodeVersion,
+    PublishNodeVersionResponse,
+    PyProjectConfig,
+)
+
+MAX_ERROR_BODY_CHARS = 2000
+
+
+def sanitize_error_body(text: str, *, secrets: tuple[str | None, ...] = ()) -> str:
+    """Make an untrusted registry response body safe to log and render.
+
+    The registry is upstream of us: its response body can echo back what we
+    sent (including the publish PAT), embed newlines that forge extra log
+    lines, or be arbitrarily large. Redact known secrets, flatten CR/LF to
+    escapes, and bound the length before the body reaches a log record or a
+    ``renderer.error`` envelope.
+    """
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***REDACTED***")
+
+    text = text.replace("\r", "\\r").replace("\n", "\\n")
+
+    if len(text) > MAX_ERROR_BODY_CHARS:
+        text = f"{text[:MAX_ERROR_BODY_CHARS]}... [truncated, {len(text)} chars total]"
+
+    return text
+
+
+class RegistryAPIError(Exception):
+    """Raised when a Registry API call fails.
+
+    Carries the HTTP ``status`` and response ``body`` when the failure came
+    from a non-2xx response, so the command boundary can surface a
+    machine-readable ``renderer.error(code=..., details={status, body})``
+    instead of a bare traceback. Client-side validation failures (missing
+    publisher id / project name) carry no status/body.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None, body: str | None = None):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.body = body
+
+
+class NodeFetchError(Exception):
+    """``get_node`` got a non-200 from the registry.
+
+    Carries ``status_code`` so callers can tell a permanent 404 ("no such node")
+    apart from a transient 5xx/proxy failure — the two need different remediation
+    and only one is worth retrying. Subclasses ``Exception`` and keeps the
+    original message, so pre-existing ``except Exception`` callers are unaffected.
+    """
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class RegistryAPI:
+    def __init__(self):
+        self.base_url = self.determine_base_url()
+
+    def determine_base_url(self):
+        env = os.getenv("ENVIRONMENT")
+        if env == "dev":
+            return "http://localhost:8080"
+        elif env == "staging":
+            return "https://stagingapi.scalify.khulnasoft.com"
+        else:
+            return "https://api.scalify.khulnasoft.com"
+
+    def publish_node_version(
+        self, node_config: PyProjectConfig, token, changelog: str | None = None
+    ) -> PublishNodeVersionResponse:
+        """
+        Publishes a new version of a node.
+
+        Args:
+          node_config (PyProjectConfig): The node configuration.
+          token (str): The token to authenticate with the API server.
+          changelog (str | None): Optional changelog text stored on the published
+            version and shown in the registry's Updates section.
+
+        Returns:
+        PublishNodeVersionResponse: The response object from the API server.
+        """
+        # Local import to prevent circular dependency
+        if not node_config.tool_scalify.publisher_id:
+            raise RegistryAPIError("Publisher ID is required in pyproject.toml to publish a node version")
+
+        if not node_config.project.name:
+            raise RegistryAPIError("Project name is required in pyproject.toml to publish a node version")
+        license_json = serialize_license(node_config.project.license)
+        request_body = {
+            "personal_access_token": token,
+            "node": {
+                "id": node_config.project.name,
+                "description": node_config.project.description,
+                "icon": node_config.tool_scalify.icon,
+                "name": node_config.tool_scalify.display_name,
+                "license": license_json,
+                "repository": node_config.project.urls.repository,
+                "banner_url": node_config.tool_scalify.banner_url,
+                "supported_os": node_config.project.supported_os,
+                "supported_accelerators": node_config.project.supported_accelerators,
+                "supported_scalifyui_version": node_config.project.supported_scalifyui_version,
+                "supported_scalifyui_frontend_version": node_config.project.supported_scalifyui_frontend_version,
+            },
+            "node_version": {
+                "version": node_config.project.version,
+                "dependencies": node_config.project.dependencies,
+                "supported_os": node_config.project.supported_os,
+                "supported_accelerators": node_config.project.supported_accelerators,
+                "supported_scalifyui_version": node_config.project.supported_scalifyui_version,
+                "supported_scalifyui_frontend_version": node_config.project.supported_scalifyui_frontend_version,
+            },
+        }
+        if changelog:
+            request_body["node_version"]["changelog"] = changelog
+        url = f"{self.base_url}/publishers/{node_config.tool_scalify.publisher_id}/nodes/{node_config.project.name}/versions"
+        headers = {"Content-Type": "application/json"}
+        body = request_body
+
+        # Imported lazily: requests costs ~30ms to import and this module is
+        # on the import path of every CLI invocation.
+        import requests
+
+        response = requests.post(url, headers=headers, data=json.dumps(body), timeout=DEFAULT_HTTP_TIMEOUT)
+
+        if response.status_code == 201:
+            data = response.json()
+            return PublishNodeVersionResponse(
+                node_version=map_node_version(data["node_version"]),
+                signedUrl=data["signedUrl"],
+            )
+        else:
+            # The publish request body carries the PAT, so a registry error that
+            # echoes the payload back would otherwise leak it into logs.
+            safe_body = sanitize_error_body(response.text, secrets=(token,))
+            raise RegistryAPIError(
+                f"Failed to publish node version: {response.status_code} {safe_body}",
+                status=response.status_code,
+                body=safe_body,
+            )
+
+    def list_all_nodes(self):
+        """
+        Retrieves a list of all nodes and maps them to Node dataclass instances.
+
+        Returns:
+          list: A list of Node instances.
+        """
+        import requests  # deferred; see publish_node_version
+
+        url = f"{self.base_url}/nodes"
+        response = requests.get(url, timeout=DEFAULT_HTTP_TIMEOUT)
+        if response.status_code == 200:
+            raw_nodes = response.json()["nodes"]
+            return [map_node_to_node_class(node) for node in raw_nodes]
+        else:
+            safe_body = sanitize_error_body(response.text)
+            raise RegistryAPIError(
+                f"Failed to retrieve nodes: {response.status_code} - {safe_body}",
+                status=response.status_code,
+                body=safe_body,
+            )
+
+    def install_node(self, node_id, version=None):
+        """
+        Retrieves the node version for installation.
+
+        Args:
+          node_id (str): The unique identifier of the node.
+          version (str, optional): Specific version of the node to retrieve. If omitted, the latest version is returned.
+
+        Returns:
+          NodeVersion: Node version data or error message.
+        """
+        import requests  # deferred; see publish_node_version
+
+        if version is None:
+            url = f"{self.base_url}/nodes/{node_id}/install"
+        else:
+            url = f"{self.base_url}/nodes/{node_id}/install?version={version}"
+
+        # A stalled/blackholed registry must not hang callers indefinitely.
+        # A Timeout surfaces as a RequestException for callers to catch.
+        response = requests.get(url, timeout=DEFAULT_HTTP_TIMEOUT)
+        if response.status_code == 200:
+            # Convert the API response to a NodeVersion object
+            logging.debug(f"RegistryAPI install_node response: {response.json()}")
+            return map_node_version(response.json())
+        else:
+            safe_body = sanitize_error_body(response.text)
+            raise RegistryAPIError(
+                f"Failed to install node: {response.status_code} - {safe_body}",
+                status=response.status_code,
+                body=safe_body,
+            )
+
+    def get_node(self, node_id):
+        """
+        Retrieves a node's public metadata, read-only.
+
+        Unlike ``install_node`` (whose backend records an installation and fires
+        an analytics event on every call), this endpoint has no side effects, so
+        it's safe for pure version checks like ``scalify outdated``.
+
+        Args:
+          node_id (str): The unique identifier of the node.
+
+        Returns:
+          Node: Node data, including ``latest_version`` when the registry has one.
+        """
+        import requests  # deferred; see publish_node_version
+
+        url = f"{self.base_url}/nodes/{node_id}"
+        # Same rationale as install_node: a stalled registry must not hang callers.
+        response = requests.get(url, timeout=DEFAULT_HTTP_TIMEOUT)
+        if response.status_code == 200:
+            logging.debug(f"RegistryAPI get_node response: {response.json()}")
+            return map_node_to_node_class(response.json())
+        else:
+            raise NodeFetchError(
+                f"Failed to retrieve node: {response.status_code} - {response.text}",
+                status_code=response.status_code,
+            )
+
+
+def map_node_version(api_node_version):
+    """
+    Maps node version data from API response to NodeVersion dataclass.
+
+    Args:
+        api_data (dict): The 'node_version' part of the API response.
+
+    Returns:
+        NodeVersion: An instance of NodeVersion dataclass populated with data from the API.
+    """
+    return NodeVersion(
+        changelog=api_node_version.get("changelog", ""),  # Provide a default value if 'changelog' is missing
+        dependencies=api_node_version.get(
+            "dependencies", []
+        ),  # Provide a default empty list if 'dependencies' is missing
+        deprecated=api_node_version.get("deprecated", False),  # Assume False if 'deprecated' is not specified
+        id=api_node_version["id"],  # 'id' should be mandatory; raise KeyError if missing
+        version=api_node_version["version"],  # 'version' should be mandatory; raise KeyError if missing
+        download_url=api_node_version.get("downloadUrl", ""),  # Provide a default value if 'downloadUrl' is missing
+    )
+
+
+def map_node_to_node_class(api_node_data):
+    """
+    Maps node data from API response to Node dataclass.
+
+    Args:
+        api_node_data (dict): The node data from the API.
+
+    Returns:
+        Node: An instance of Node dataclass populated with API data.
+    """
+    return Node(
+        id=api_node_data["id"],
+        name=api_node_data["name"],
+        description=api_node_data["description"],
+        author=api_node_data.get("author"),
+        license=api_node_data.get("license"),
+        icon=api_node_data.get("icon"),
+        repository=api_node_data.get("repository"),
+        tags=api_node_data.get("tags", []),
+        latest_version=(
+            map_node_version(api_node_data["latest_version"]) if "latest_version" in api_node_data else None
+        ),
+    )
+
+
+def serialize_license(license: License) -> str:
+    if license.file:
+        return json.dumps({"file": license.file})
+    if license.text:
+        return json.dumps({"text": license.text})
+    return "{}"

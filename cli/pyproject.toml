@@ -1,0 +1,122 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+
+requires = [ "setuptools>=61" ]
+
+[project]
+name = "scalify-cli"
+version = "0.0.0"                                            # Will be filled in by the CI/CD pipeline. Check .github/workflows/publish_package.yml.
+description = "A CLI tool for installing and using ScalifyUI."
+readme = "README.md"
+keywords = [ "scalifyui", "stable diffusion" ]
+
+license = { text = "GPL-3.0-only" }
+maintainers = [
+  { name = "Md Sulaiman", email = "infosulaimanbd@gmail.com" }
+]
+
+requires-python = ">=3.10"
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+  # The CA bundle every https call verifies against (scalify_cli.http.trust_store).
+  # Declared rather than inherited from `requests`: a distribution can ship a
+  # Python whose OpenSSL has no compiled-in trust path at all. Floored at the
+  # release that dropped the compromised e-Tugra root.
+  "certifi>=2024.7.4",
+  "charset-normalizer>=3",
+  "cookiecutter",
+  "gitpython>=3.1.50",
+  "httpx",
+  # mixpanel 5.x pulls in pydantic/pydantic-core; the compiled pydantic_core DLL
+  # gets loaded by `scalify install` and then cannot be replaced when ScalifyUI's
+  # requirements resolve a different version on Windows (os error 5). 4.x has no
+  # pydantic dependency.
+  "mixpanel<5",
+  "packaging",
+  "pathspec",
+  "posthog>=6,<8",
+  # 6.0.0 renamed Process.connections() to Process.net_connections(), which
+  # `scalify stop --port` needs (the system-wide psutil.net_connections() is
+  # root-only on macOS, so per-process is the only usable form).
+  "psutil>=6",
+  "pyyaml",
+  "questionary",
+  "requests",
+  "rich",
+  "ruff",
+  "semver~=3.0.2",
+  "tomlkit>=0.13,<0.16",
+  "typer>=0.12.5",
+  "typing-extensions>=4.7",
+  "uv>=0.11.15",
+  "websocket-client",
+  # Bundled static ffmpeg so `scalify preview` renders video/audio previews on
+  # machines without a system ffmpeg (the CLI-as-agent path). ffprobe metadata
+  # still needs system ffprobe; preview degrades to extension-based classification.
+  "imageio-ffmpeg",
+  "blake3>=1.0.9",
+]
+
+optional-dependencies.dev = [ "jsonschema", "pre-commit", "pytest", "pytest-cov", "ruff==0.15.15", "typer>=0.24" ]
+optional-dependencies.preview = [ "term-image>=0.7,<0.8" ]
+urls.Repository = "https://github.com/Khulnasoft/scalify-cli.git"
+scripts.scalify = "scalify_cli.__main__:main"
+scripts.scalify-cli = "scalify_cli.__main__:main"
+scripts.scalifycli = "scalify_cli.__main__:main"
+
+[tool.setuptools.packages.find]
+where = [ "." ]
+include = [ "scalify_cli*" ]
+
+[tool.setuptools.package-data]
+# Bundled skills: subdirs of scalify_cli.skills named after each skill (kept in
+# sync with BUNDLED_SKILLS). Hyphenated dirs aren't importable packages, so
+# they're plain data dirs matched by glob from the parent package.
+"scalify_cli.skills" = [ "*/SKILL.md" ]
+"scalify_cli.schemas" = [ "*.json", "*.md" ]
+
+"scalify_cli.cql.data" = [ "*.yaml", "*.json" ]
+"scalify_cli.command.generate" = [ "spec/openapi.yml" ]
+
+[tool.ruff]
+target-version = "py310"
+
+line-length = 120
+lint.select = [
+  "C901",   # mccabe - complexity ratchet, see [tool.ruff.lint.mccabe] below
+  "E",      # pycodestyle - Error
+  "ERA001", # eradicate - commented-out code
+  "F",      # default
+  "I",      # isort-like behavior (import statement sorting)
+  "Q",      # flake8-quotes
+  "RET504", # Unnecessary assignment to {name} before return statement
+  "UP",     # pyupgrade
+  "W",      # pycodestyle - Warning
+]
+lint.extend-ignore = [
+  "E501", # Line too long
+]
+
+[tool.ruff.lint.mccabe]
+# Ratchet, not a target. 48 is the complexity of the single worst function in
+# the tree today (`execute` in scalify_cli/command/run/__init__.py), so this
+# enabling adds no new failures. Lower it whenever the worst offender drops;
+# never raise it. At the eventual default of 10 there are 92 hits, so getting
+# there is a long refactor, not a lint flip.
+max-complexity = 48
+
+[tool.ruff.lint.per-file-ignores]
+# TODO: drop once fix/tarfile-extraction-filter (#734) lands - it rewrites the
+# extraction helper that holds this file's single commented-out-code hit, and
+# touching the file here would conflict with that branch.
+"scalify_cli/utils.py" = ["ERA001"]

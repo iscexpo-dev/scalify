@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scalify.khulnasoft.com/schemas/which.json",
+  "title": "scalify which --json data payload",
+  "type": "object",
+  "required": ["workspace_path"],
+  "additionalProperties": true,
+  "properties": {
+    "workspace_path": {"type": ["string", "null"]},
+    "workspace_type": {"type": ["string", "null"]}
+  }
+}

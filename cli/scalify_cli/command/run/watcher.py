@@ -1,0 +1,183 @@
+"""Background-watcher subprocess + transient pretty-mode status tail.
+
+``_spawn_watcher`` detaches a Python subprocess that polls the server and
+updates the job's state file. ``_tail_state_file`` is the foreground
+companion — a short live-status display in pretty mode that exits cleanly
+once the watcher takes over.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+from scalify_cli.output import get_renderer
+from scalify_cli.output import rprint as pprint
+from scalify_cli.output.sanitize import sanitize_markup
+
+
+def _no_watch_requested() -> bool:
+    """``SCALIFY_NO_WATCH=1`` (or any other truthy value) suppresses the
+    detached watcher subprocess entirely.
+
+    This is the env kill switch for agentic callers: the cloud agent has its
+    own native job-wait (Redis pub/sub + a reconcile GET) and has no use for
+    a second, credential-holding, ``start_new_session=True`` process that
+    outlives the parent and polls the jobs API for up to 6h. Checked as an
+    env var (rather than threaded through every call site) so a host can set
+    it once in the subprocess's environment without touching argv; ``scalify
+    run --no-watch`` sets the same variable for interactive use.
+    """
+    value = os.environ.get("SCALIFY_NO_WATCH")
+    if value is None:
+        return False
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _tail_state_file(prompt_id: str, *, seconds: float = 8.0) -> None:
+    """Pretty-mode only: poll the state file for up to ``seconds`` showing
+    live status transitions, then return. The background watcher keeps
+    writing after we return — we just give the human a few seconds of
+    "alive" feedback before the foreground exits.
+
+    Always safe to call; no-ops if the renderer isn't pretty, the state file
+    can't be read at all, or the user Ctrl-Cs out.
+
+    That "can't be read at all" case is load-bearing, not defensive padding.
+    This runs from ``_announce_async_queued``, i.e. inside ``execute``'s
+    ``except (WebSocketException, ConnectionError, OSError)`` block's try and
+    *after* the server accepted the prompt. An ``OSError`` escaping here —
+    ``state_dir()``'s mkdir under a config root that resolved outside the
+    sandbox, a read-only directory — would therefore be reported to the caller
+    as ``ws_disconnected`` with a "re-run the command" hint, for a job that is
+    already queued. See the same guarantee on ``_write_state`` in
+    ``scalify_cli/command/run/__init__.py``.
+    """
+    import time as _t
+
+    from rich.live import Live
+    from rich.text import Text
+
+    renderer = get_renderer()
+    if not renderer.is_pretty():
+        return
+
+    from scalify_cli import jobs_state
+    from scalify_cli.output.glyphs import status_glyph
+
+    # Truncate first, then escape: slicing can split a markup sequence, and
+    # `prompt_id` is server-chosen. Unsafe ids used to stop at the submit-time
+    # `jobs_state.write`; now that `_write_state` swallows that rejection they
+    # reach this render, where raw markup raises MarkupError (or injects into
+    # the terminal) on a job the server already accepted.
+    short_id = sanitize_markup(prompt_id[:8])
+
+    def render(status: str, elapsed: float) -> Text:
+        return Text.from_markup(f"  {status_glyph(status)}  [dim]· {elapsed:.1f}s · {short_id}…[/dim]")
+
+    def read_state():
+        """``(state, readable)``. ``readable`` is False only when the record
+        could not be consulted at all, which is unrecoverable for the whole
+        tail — distinct from ``state is None``, the ordinary "nothing written
+        yet" the poll loop is built to wait through.
+
+        ``ValueError`` is caught alongside ``OSError`` to match
+        ``_write_state``: ``state_path()`` raises it for a server-supplied
+        prompt_id that fails ``_SAFE_PROMPT_ID``, and since ``_write_state``
+        now swallows that at submit, this read is where it would otherwise
+        surface — as a traceback, uncovered by either caller's handler."""
+        try:
+            return jobs_state.read(prompt_id), True
+        except (OSError, ValueError):
+            return None, False
+
+    deadline = _t.time() + seconds
+    last_status = "queued"
+    start = _t.time()
+    try:
+        with Live(render(last_status, 0.0), console=renderer.console(), refresh_per_second=4, transient=True) as live:
+            while _t.time() < deadline:
+                state, readable = read_state()
+                if not readable:
+                    return
+                if state is not None:
+                    last_status = state.status
+                    live.update(render(last_status, _t.time() - start))
+                    if state.is_terminal:
+                        break
+                _t.sleep(0.25)
+    except KeyboardInterrupt:
+        pass
+
+    final_state, _readable = read_state()
+    if final_state is None:
+        return
+    elapsed = _t.time() - start
+    glyph = status_glyph(final_state.status)
+    if final_state.is_terminal:
+        pprint(f"  {glyph} [dim]· finished in {elapsed:.1f}s[/dim]")
+        for u in (final_state.outputs or [])[:3]:
+            pprint(f"  [dim]→[/dim] [cyan]{sanitize_markup(u)}[/cyan]")
+    else:
+        pprint(f"  {glyph} [dim]· still in flight — track:[/dim] [cyan]scalify jobs ls --watch[/cyan]")
+
+
+def _spawn_watcher(
+    prompt_id: str,
+    *,
+    where: str,
+    host: str | None = None,
+    port: int | None = None,
+    notify: bool = False,
+) -> bool:
+    """Detach a watcher subprocess that polls + updates the state file.
+
+    Fully decoupled from the parent: stdio redirected to /dev/null, and a
+    detached process group so a controlling terminal closing doesn't kill it.
+    POSIX gets its own session; Windows gets
+    DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP for the equivalent, because
+    ``start_new_session`` is POSIX-only and CPython ignores it there. We don't
+    track the PID — the watcher writes its own PID into the state file so
+    callers can find it there if needed.
+
+    Returns ``True`` on success, ``False`` if the subprocess could not be
+    spawned — or if suppressed entirely via ``SCALIFY_NO_WATCH=1``
+    (see ``_no_watch_requested``).
+    """
+    if _no_watch_requested():
+        return False
+    argv = [sys.executable, "-m", "scalify_cli", "_watch", "_watch-job", prompt_id, "--where", where]
+    if host:
+        argv += ["--host", host]
+    if port:
+        argv += ["--port", str(port)]
+    argv += ["--notify"] if notify else ["--no-notify"]
+
+    kwargs: dict = {}
+    if sys.platform == "win32":
+        # Not module-level attributes on POSIX, hence the getattr lookups.
+        detached = getattr(subprocess, "DETACHED_PROCESS", 0)
+        new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        kwargs["creationflags"] = detached | new_group
+    else:
+        kwargs["start_new_session"] = True
+
+    try:
+        subprocess.Popen(
+            argv,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+            **kwargs,
+        )
+        return True
+    except (OSError, ValueError):
+        # Watcher spawn failed — the job still ran; the user just won't get
+        # a state-file update without manual polling. Don't bail the submit:
+        # we're past the point of no return, the workflow is already queued.
+        # ValueError covers Popen's argument-level rejections (an embedded NUL
+        # in host/prompt_id, creationflags on a non-Windows platform), which
+        # aren't OSError.
+        return False

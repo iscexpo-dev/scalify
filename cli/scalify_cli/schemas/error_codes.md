@@ -1,0 +1,32 @@
+# scalify-cli error codes
+
+The accepted compatibility decision for envelopes and registered error codes is
+recorded in
+[`ADR-AUTOMATION-0003`](../../docs/adr/AUTOMATION-0003-one-versioned-machine-output-dialect.md).
+
+Stable machine identifiers for `error.code` in the JSON envelope. The
+canonical list lives in `scalify_cli/error_codes.py` — this file is for humans.
+**Append-only** — never repurpose an existing code.
+
+For programmatic access, agents call:
+
+```bash
+scalify --json discover | jq '.data.error_codes[]'
+```
+
+## Conventions
+
+- `code` is the contract; agents branch on it.
+- `message` is human-readable; phrased so it can be shown to users verbatim.
+- `hint` is one actionable next step. Always set a hint when there is one.
+- `details` carries structured context (`status`, `path`, `host`,
+  `close_matches`, `valid_inputs`, etc.) so agents can self-correct.
+
+## Tests
+
+Two tests pin the contract:
+
+- Every `renderer.error(code="…")` site is registered.
+- Every registered code is raised somewhere (no dead codes).
+
+A code goes into `error_codes.py` *before* it lands in any call site.

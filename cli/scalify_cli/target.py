@@ -1,0 +1,139 @@
+"""Routing target for ScalifyUI HTTP traffic.
+
+A ``Target`` is the small bundle of facts that distinguishes "talk to a local
+ScalifyUI on 127.0.0.1:8188" from "talk to Scalify Cloud on
+fe-pr-12159.testenvs.scalify.khulnasoft.com": a base URL, an optional path prefix
+(``/api``), and an optional Bearer token. Everything else flows through the
+unified :class:`scalify_cli.scalify_client.Client`.
+
+A few thin differences remain (the cloud history endpoint is ``history_v2``,
+queue inspection works differently, no WebSocket on cloud) — those are
+captured as fields on the Target so the client can branch on them rather than
+duplicating call sites.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+# Back-compat re-export: the provider name now lives with the credential
+# resolver. Hidden / testing-only path; the canonical sign-in is OAuth.
+from scalify_cli.credentials import CLOUD_API_KEY_PROVIDER as CLOUD_API_KEY_PROVIDER
+
+
+@dataclass(frozen=True)
+class Target:
+    """Where to send ScalifyUI HTTP requests."""
+
+    kind: str  # "local" | "cloud"
+    base_url: str  # e.g. "http://127.0.0.1:8188" or "https://fe-pr-12159.testenvs.scalify.khulnasoft.com"
+    path_prefix: str = ""  # "" for local, "/api" for cloud
+    history_path: str = "history"  # "history" for local, "history_v2" for cloud
+    jobs_path: str | None = None  # "jobs" for cloud, None for local (uses queue+history)
+    # auth_token (OAuth Bearer) and api_key (X-API-Key) are both repr-suppressed
+    # so logger.debug + pytest failure dumps can't leak credentials.
+    auth_token: str | None = field(default=None, repr=False)
+    api_key: str | None = field(default=None, repr=False)
+    host: str | None = None  # only for local — preserved for back-compat
+    port: int | None = None  # only for local
+
+    @property
+    def is_cloud(self) -> bool:
+        return self.kind == "cloud"
+
+    def url(self, *parts: str) -> str:
+        """Build a fully-qualified URL, applying the path prefix."""
+        joined = "/".join(p.strip("/") for p in parts if p)
+        if self.path_prefix:
+            return f"{self.base_url}{self.path_prefix}/{joined}"
+        return f"{self.base_url}/{joined}"
+
+
+def resolve_target(
+    *,
+    where: str | None,
+    host: str | None = None,
+    port: int | None = None,
+    config: Any = None,
+    allow_clear: bool = True,
+) -> Target:
+    """Pick a Target based on ``--where`` plus host/port (for local).
+
+    Precedence honoring the global routing mode: explicit ``where`` arg >
+    ``SCALIFY_WHERE`` env var > persisted ``where_default`` config key >
+    auto-detect (``cloud`` if credentials exist, else ``local``).
+    The ``config`` arg is honored if passed; otherwise
+    we instantiate a ``ConfigManager`` to read the persisted key.
+
+    ``allow_clear=False`` is forwarded to :func:`resolve_cloud_credential` so a
+    best-effort background caller cannot wipe the stored session on a failed
+    token refresh.
+    """
+    from scalify_cli import where as where_module
+
+    config_value: str | None = None
+    if config is not None:
+        config_value = config.get(where_module.CONFIG_KEY_WHERE_DEFAULT)
+    else:
+        try:
+            from scalify_cli.config_manager import ConfigManager
+
+            config_value = ConfigManager().get(where_module.CONFIG_KEY_WHERE_DEFAULT)
+        except Exception:  # noqa: BLE001 — never break target resolution on a bad config
+            pass
+
+    decision = where_module.resolve(flag=where, config_value=config_value)
+
+    if decision.target is where_module.WhereTarget.CLOUD:
+        from scalify_cli.cloud import get_base_url
+        from scalify_cli.credentials import resolve_cloud_credential
+
+        # Precedence: a credential handed in by env (SCALIFY_CLOUD_AUTH_TOKEN,
+        # then SCALIFY_CLOUD_API_KEY) > OAuth session > stored key. With an env
+        # credential set the session is not read or refreshed at all.
+        # ``base_url=`` arms the replay-guard: a session minted for a different
+        # base_url (or expired) is ignored so credentials are never replayed to
+        # a host the user didn't authenticate against; the API-key fallback or
+        # a downstream "unauthenticated" error takes over. ``refresh=True`` is
+        # the *proactive* leg: a near-expiry access token is refreshed before
+        # it's attached, so the user keeps working across the ~1h token
+        # lifetime without ever hitting a 401. The refresh is a cheap no-op
+        # when the token isn't near expiry (no network), and the client/loader
+        # still force-refresh *reactively* on a server 401 as a backstop.
+        base_url = get_base_url()
+        cred = resolve_cloud_credential(purpose="cloud", base_url=base_url, refresh=True, allow_clear=allow_clear)
+        token = cred.value if cred is not None and cred.kind == "oauth" else None
+        api_key = cred.value if cred is not None and cred.kind == "api_key" else None
+
+        return Target(
+            kind="cloud",
+            base_url=base_url,
+            path_prefix="/api",
+            history_path="history_v2",
+            jobs_path="jobs",
+            auth_token=token,
+            api_key=api_key,
+        )
+
+    # Local — resolve host/port by precedence: explicit flag > SCALIFY_LOCAL_URL
+    # env > 127.0.0.1:8188. host/port may be None here; callers that also honor
+    # a persisted background server (run/jobs, and validate/nodes)
+    # resolve that upstream via host_port.resolve_host_port before reaching us.
+    from scalify_cli.env_checker import _bracket_host
+    from scalify_cli.local_address import resolve_local_host_port
+
+    resolved_host, resolved_port = resolve_local_host_port(host, port)
+    # Bracket IPv6 literals so the URL is well-formed (RFC 3986 §3.2.2).
+    # Delegates to the shared ``_bracket_host`` choke point.
+    url_host = _bracket_host(resolved_host)
+    return Target(
+        kind="local",
+        base_url=f"http://{url_host}:{resolved_port}",
+        path_prefix="",
+        history_path="history",
+        jobs_path=None,
+        auth_token=None,
+        host=resolved_host,
+        port=resolved_port,
+    )

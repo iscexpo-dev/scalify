@@ -1,0 +1,162 @@
+import os
+from unittest.mock import patch
+
+from scalify_cli.command.custom_nodes import command
+
+
+class TestGetInstalledPackages:
+    def test_uses_resolved_python(self):
+        command.pip_map = None
+
+        with (
+            patch(
+                "scalify_cli.command.custom_nodes.command.resolve_workspace_python",
+                return_value="/resolved/python",
+            ),
+            patch.object(command.workspace_manager, "workspace_path", "/fake/workspace"),
+            patch(
+                "scalify_cli.command.custom_nodes.command.subprocess.check_output",
+                return_value="Package  Version\n------  -------\npip  24.0\n",
+            ) as mock_check_output,
+        ):
+            command.get_installed_packages()
+
+        cmd = mock_check_output.call_args[0][0]
+        assert cmd[0] == "/resolved/python"
+        assert cmd == ["/resolved/python", "-m", "pip", "list"]
+
+        command.pip_map = None
+
+
+class TestExecuteInstallScript:
+    def test_pip_uses_resolved_python(self, tmp_path):
+        (tmp_path / "requirements.txt").write_text("somepackage\n")
+
+        with (
+            patch(
+                "scalify_cli.command.custom_nodes.command.resolve_workspace_python",
+                return_value="/resolved/python",
+            ),
+            patch.object(command.workspace_manager, "workspace_path", str(tmp_path)),
+            patch("scalify_cli.command.custom_nodes.command.subprocess.check_call") as mock_check_call,
+        ):
+            command.execute_install_script(str(tmp_path))
+
+        mock_check_call.assert_called()
+        cmd = mock_check_call.call_args[0][0]
+        assert cmd[0] == "/resolved/python"
+        assert "-m" in cmd and "pip" in cmd
+
+    def test_install_py_uses_resolved_python(self, tmp_path):
+        (tmp_path / "install.py").write_text("print('install')\n")
+
+        with (
+            patch(
+                "scalify_cli.command.custom_nodes.command.resolve_workspace_python",
+                return_value="/resolved/python",
+            ),
+            patch.object(command.workspace_manager, "workspace_path", str(tmp_path)),
+            patch("scalify_cli.command.custom_nodes.command.subprocess.check_call") as mock_check_call,
+        ):
+            command.execute_install_script(str(tmp_path))
+
+        mock_check_call.assert_called()
+        cmd = mock_check_call.call_args[0][0]
+        assert cmd == ["/resolved/python", "install.py"]
+
+    def test_inline_comment_not_passed_to_pip(self, tmp_path):
+        # Issue #431 regression: inline comments in requirements.txt must not
+        # survive into the argv handed to pip. Pre-fix, the raw line was passed
+        # verbatim (e.g. "matplotlib>=3.3.0  # note") and pip rejected it.
+        bad_spec = "matplotlib>=3.3.0  # For visualization"
+        (tmp_path / "requirements.txt").write_text(f"{bad_spec}\n")
+
+        with (
+            patch(
+                "scalify_cli.command.custom_nodes.command.resolve_workspace_python",
+                return_value="/resolved/python",
+            ),
+            patch.object(command.workspace_manager, "workspace_path", str(tmp_path)),
+            patch("scalify_cli.command.custom_nodes.command.subprocess.check_call") as mock_check_call,
+        ):
+            command.execute_install_script(str(tmp_path))
+
+        for call in mock_check_call.call_args_list:
+            argv = call[0][0]
+            assert bad_spec not in argv, f"raw comment-laden spec leaked into pip argv: {argv!r}"
+
+    def test_uses_pip_install_r(self, tmp_path):
+        # Option C: delegate requirements-file parsing to pip via `-r <path>`.
+        # This lets pip handle inline comments, line continuations, VCS URL
+        # fragments, env markers, -e, -r, --index-url, etc.
+        requirements_path = tmp_path / "requirements.txt"
+        requirements_path.write_text("numpy>=1.0\n")
+
+        with (
+            patch(
+                "scalify_cli.command.custom_nodes.command.resolve_workspace_python",
+                return_value="/resolved/python",
+            ),
+            patch.object(command.workspace_manager, "workspace_path", str(tmp_path)),
+            patch("scalify_cli.command.custom_nodes.command.subprocess.check_call") as mock_check_call,
+        ):
+            command.execute_install_script(str(tmp_path))
+
+        mock_check_call.assert_called_once()
+        argv = mock_check_call.call_args[0][0]
+        assert argv == ["/resolved/python", "-m", "pip", "install", "-r", str(requirements_path)]
+
+    def test_requirements_path_is_absolute_when_repo_path_is_relative(self, tmp_path, monkeypatch):
+        # try_install_script runs pip with cwd=repo_path. If requirements_path
+        # were relative, pip would resolve `-r <rel>/requirements.txt` against
+        # that cwd, producing a doubled path like <rel>/<rel>/requirements.txt.
+        # Guard: the `-r` target must be absolute regardless of the input.
+        (tmp_path / "requirements.txt").write_text("numpy>=1.0\n")
+        monkeypatch.chdir(tmp_path.parent)
+        relative_repo = tmp_path.name  # e.g. "test_requirements_path..." relative to cwd
+
+        with (
+            patch(
+                "scalify_cli.command.custom_nodes.command.resolve_workspace_python",
+                return_value="/resolved/python",
+            ),
+            patch.object(command.workspace_manager, "workspace_path", str(tmp_path)),
+            patch("scalify_cli.command.custom_nodes.command.subprocess.check_call") as mock_check_call,
+        ):
+            command.execute_install_script(relative_repo)
+
+        argv = mock_check_call.call_args[0][0]
+        target = argv[-1]
+        assert os.path.isabs(target), f"-r target is not absolute: {target!r}"
+        assert target == str(tmp_path / "requirements.txt")
+
+
+class TestUpdateNodeIdCache:
+    def test_uses_resolved_python(self, tmp_path):
+        cm_cli_path = tmp_path / "custom_nodes" / "ScalifyUI-Manager" / "cm-cli.py"
+        cm_cli_path.parent.mkdir(parents=True)
+        cm_cli_path.touch()
+
+        config_path = tmp_path / "config"
+        config_path.mkdir()
+
+        with (
+            patch(
+                "scalify_cli.command.custom_nodes.command.resolve_workspace_python",
+                return_value="/resolved/python",
+            ),
+            # update_node_id_cache() hard-fails on `not find_cm_cli()`. That guard is
+            # incidental to what this test asserts (that the resolved workspace Python
+            # is the interpreter invoked), and the on-disk cm-cli.py above never
+            # satisfies it — find_cm_cli() probes for the importable `cm_cli` module,
+            # not a clone's script. Stub the guard so the test stands on its own.
+            patch("scalify_cli.command.custom_nodes.command.find_cm_cli", return_value=True),
+            patch.object(command.workspace_manager, "workspace_path", str(tmp_path)),
+            patch("scalify_cli.command.custom_nodes.command.ConfigManager") as MockConfig,
+            patch("scalify_cli.command.custom_nodes.command.subprocess.run") as mock_run,
+        ):
+            MockConfig.return_value.get_config_path.return_value = str(config_path)
+            command.update_node_id_cache()
+
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == "/resolved/python"

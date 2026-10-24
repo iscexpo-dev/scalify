@@ -1,0 +1,1038 @@
+# `scalify run --json`: Machine-Readable Output (NDJSON)
+
+The accepted architecture for machine-readable output is recorded in
+[ADR-AUTOMATION-0003](adr/AUTOMATION-0003-one-versioned-machine-output-dialect.md).
+
+> **Dialect change (breaking).** The legacy `{"event": …, "schema_version": 1,
+> "error": {"kind": …}}` dialect was removed; `scalify run --json` now emits the
+> CLI-wide renderer stream. Every event line carries `schema: "event/1"` and a
+> `type` discriminator, and the stream is terminated by a single envelope line
+> (`schema: "envelope/1"`, `type: "envelope"`) carrying `ok`/`data`/`error`.
+> Consumers discriminate the final line by `type: "envelope"`. Error
+> categorisation moved from `error.kind` to the registered `error.code` values
+> (`scalify --json discover` lists them all). The full legacy→current mapping is
+> at the [bottom of this document](#legacy-dialect-mapping).
+
+This document specifies the output contract of `scalify run --json`. The intent
+is to give agents and automation a stable, parseable view of a workflow
+execution — independent of the human-readable Rich-formatted output that
+`scalify run` emits by default.
+
+`scalify run --json` is exactly `scalify --json-stream run`: the command-local
+flag switches the process-wide renderer into NDJSON streaming mode. The same
+event names are used by `scalify jobs watch` in stream mode, so the run stream
+and the watch stream speak one dialect.
+
+## `jobs watch` attaches as the submitting session
+
+A local ScalifyUI server does **not** broadcast execution events: it addresses
+`executing` / `executed` / `progress_state` / `execution_cached` /
+`execution_success` to the websocket session that submitted the prompt. So
+`scalify jobs watch <prompt_id>` resolves that prompt's `client_id` — from the job
+state file `scalify run` wrote, else `/queue`, else `/history` — and reconnects
+under it; the terminal envelope reports which id it used (`data.client_id`) and
+whether it was the real submitter (`data.attached`). Use `--client-id` to force a
+specific one — except on a run submitted by `scalify run --client-id`, where the
+id belongs to a live client being fed on purpose. Resolution withholds it
+deliberately (`attached: false`) and the watch polls status instead; passing
+`--client-id` on such a run is refused with `client_id_rejected`
+(`reason: "borrowed"`) before any socket opens. That marker is read from the job
+state file *and* from the `extra_data` the server echoes back, and an override is
+honoured only once one of them has actually vouched for the run. If there is no
+local state file and the prompt's own server record cannot be read — the fetch
+failed, the body came back the wrong shape, or neither `/queue` nor `/history`
+mentions the prompt — then nothing has ruled the marker out, so the run is not
+assumed unmarked: the watch polls (`attached: false`) and an explicit
+`--client-id` is refused with `reason: "indeterminate"`. A retry clears that once
+the server answers again; a `prompt_id` that is a typo or already pruned stays
+unreadable, and no id works for it.
+
+The check is on the id as well as on the prompt: naming a borrowed client's id
+as `--client-id` while watching some *other*, perfectly ordinary prompt is
+refused the same way, because attaching evicts that client either way. Those
+ids are read from `/queue`, and if that read does not come back whole the
+override is refused as `indeterminate` rather than waved through — an empty
+list of borrowed ids counts as "nobody is borrowing" only when the queue was
+actually walked. What it cannot see is a run that has already *left* the queue:
+an id that run was feeding is honoured again. Watch by `prompt_id` and let
+resolution do its job; `--client-id` is a last resort. One more gap: a prompt that is
+*already terminal* short-circuits before any of this runs, so a non-empty
+`--client-id` is ignored rather than refused there — harmless, because that path
+opens no socket at all. Separately, and by design, this protects only runs
+*scalify-cli* submitted with `--client-id`: a browser tab that submits its own
+prompt stamps no marker, so watching that prompt re-attaches as the tab, exactly
+as the last paragraph of this section describes for any re-attach. Both
+`data.client_id` and `data.attached` are present on every *local* `jobs watch`
+terminal envelope (cloud watch emits neither): a
+watch of an already-finished prompt short-circuits without opening a socket, and
+reports `client_id: null` / `attached: false`. Reconnecting under an existing id
+is ScalifyUI's own session-resume path, so a submitter that is *still* holding that
+socket (an open browser tab, a blocking `scalify run`) stops receiving events until
+it reconnects.
+
+`data.completed_nodes` on the terminal envelope does not depend on the stream: it
+is the union of what the watch observed and what `/history` records for the
+prompt, so it is populated even for a watch that attached after the job ended.
+
+`data.poll_reason` says why a watch polled instead of opening a socket, and is
+`null` when it attached (and on a prompt that was already terminal, which opens
+no socket either). `"borrowed"` means the run was submitted for another client
+that is receiving its events — drop `--client-id` and keep polling.
+`"indeterminate"` means nothing could vouch for the run — retry once the server
+answers. `data.attached` alone cannot separate those two, and they want opposite
+responses, which is why the reason is published rather than only printed.
+
+**`data.execution_error` on a failed watch.** Any `jobs watch` that ends in
+`status: "error"` — not just a borrowed or poll-only one — carries the node's
+structured failure under `data.execution_error`, never under
+`data.details.error`. Both of the command's exits do this: the live/poll path
+and the short-circuit for a prompt that had already failed before the watch
+started. `data.details` keeps the rest of the record on the paths that have one.
+The key is what the shared error classifier reads to produce
+`error.code` / `error.message` / `error.hint` — the same path `scalify run` uses —
+so a failure left anywhere else reaches the envelope unclassified, and also
+unredacted: `current_inputs` is scrubbed and `traceback` capped to its last two
+frames only for the value under this key. Earlier builds of this branch put it
+at `data.details.error` (live path) and `data.error` (terminal path); neither is
+published any more.
+
+## Overview
+
+When `--json` is passed, `scalify run` switches into a strict
+machine-readable mode:
+
+- **stdout** carries exclusively **NDJSON** (newline-delimited JSON): one
+  JSON object per line, each terminated by `\n`. No ANSI, no progress bar,
+  no headings. Each line is written and flushed to stdout as soon as the
+  underlying event is produced; agents may rely on read-as-emitted timing —
+  there is no batching (the `progress` event is throttled to ~10 Hz per node).
+- The stream is UTF-8. Non-ASCII characters in string fields are emitted
+  as-is (`json.dumps(..., ensure_ascii=False)`).
+- **stderr** carries human-readable side messages plus anything the CLI
+  cannot route through the JSON contract: framework-level Python errors,
+  uncaught exceptions, library warnings. Agents should not parse stderr;
+  they may discard it or capture it for diagnostics.
+- **Exit code** is `0` when the final envelope has `ok: true`, `130` when
+  the run was cancelled (`error.code: "cancelled"` — Ctrl-C or a
+  server-side interrupt), and `1` for every other failure. Fine-grained
+  error categorisation is carried in `error.code`, not in the exit code.
+
+In `--json` mode, `--verbose` has no effect: agents receive the full event
+stream regardless.
+
+**Workflow input format.** `--workflow` accepts both the ScalifyUI **API
+format** (the canonical `{node_id: {class_type, inputs, ...}}` graph
+produced by "Save (API Format)") and the **exported UI format** (the
+`{nodes: [...], links: [...]}` shape produced by "Save"). UI workflows
+are converted to API format client-side via `/object_info` before
+queuing; conversion is signalled by a [`converted`](#converted) event
+emitted before [`queued`](#queued). API-format input does not produce a
+`converted` event.
+
+All duration fields in this contract are floats representing seconds.
+Numeric count fields (e.g., `progress.completed` / `total`) are JSON
+`number` and may be int or float depending on the underlying node.
+
+## Stream shape
+
+Every line on stdout is a JSON object with two universal fields:
+
+| Field    | Type | Description                                                       |
+| -------- | ---- | ----------------------------------------------------------------- |
+| `schema` | str  | Contract version: `"event/1"` on events, `"envelope/1"` on the final line |
+| `type`   | str  | Discriminator. Agents must dispatch on this field.                |
+
+The stream always ends with exactly one line of `type: "envelope"`:
+
+```json
+{"schema": "envelope/1", "type": "envelope", "ok": true, "command": "run", "version": "1.6.1", "where": "local", "data": {...}, "error": null}
+```
+
+| Field     | Type         | Description                                                     |
+| --------- | ------------ | --------------------------------------------------------------- |
+| `ok`      | bool         | `true` on success, `false` on failure                           |
+| `command` | str          | The subcommand (`"run"`)                                        |
+| `version` | str          | scalify-cli version                                               |
+| `where`   | str \| null  | Target this invocation was routed to: `"local"` or `"cloud"`. Set as soon as routing resolves, so client-side failures that never reach that backend still carry it (e.g. `workflow_not_found`). `null` for commands that don't route, and for errors raised *before* routing resolves (e.g. `where_invalid`). |
+| `data`    | dict \| null | Result payload on success (see [Success envelope](#success-envelope)) |
+| `error`   | dict \| null | Error object on failure (see [Error object](#error-object))     |
+
+### Stream archetypes
+
+| Outcome                   | Stream                                                                       |
+| ------------------------- | ---------------------------------------------------------------------------- |
+| Success (`--wait`)        | `[converted]? + prompt_preview + queued + [node events]* + envelope(ok)`     |
+| `--no-wait` queued (default) | `[converted]? + prompt_preview + queued + envelope(ok, data.status="queued")` |
+| `--print-prompt`          | `[converted]? + prompt_preview + envelope(ok, data.status="preview")`        |
+| Failure mid-execution     | `[converted]? + prompt_preview + queued + [node events]* + envelope(error)`  |
+| Failure at validation, consent, or submission | `[converted]? + prompt_preview + envelope(error)`         |
+| Failure before the graph is parsed | `[converted]? + envelope(error)`                                    |
+
+Where `[node events]*` is zero or more interleaved `execution_cached`,
+`executing`, `progress`, `executed`, and `output` events. `[X]?` means X
+may or may not appear. An error envelope can replace any non-terminal
+line, ending the stream early.
+
+The last two rows split on **whether the CLI has a parsed graph in hand
+yet**, because `prompt_preview` is emitted as soon as it does — before any
+check that could still refuse the run:
+
+- **Before the graph is parsed** — the workflow file is missing, unreadable,
+  or not JSON; a UI→API conversion failed (`conversion_error`,
+  `conversion_crash`, `cql_no_graph`); the graph is empty
+  (`workflow_empty`) or not in API format (`workflow_not_api_format`); no
+  local server is running (`server_not_running`). These emit a bare error
+  envelope. `converted` can precede it in exactly one case: conversion
+  succeeded but its output still failed API-format classification.
+- **After it is parsed** — the CQL pre-flight (`workflow_unknown_nodes` and
+  friends), the `spend_consent_required` consent gate, cloud authentication
+  (`cloud_unauthorized`), and the submit call itself all run *after*
+  `prompt_preview`. A run refused by any of them therefore emits
+  `prompt_preview` first and *then* the error envelope — the previewed graph
+  is what the CLI *would* have submitted, not a promise that it did.
+
+This ordering is identical on both targets. Note that `prompt_preview`
+carries the full workflow graph, so `--json-stream` output should be treated
+as sensitive if custom nodes embed local paths or credential-like widget
+values in it. Events are emitted in `--json-stream` mode only — neither
+pretty nor plain `--json` mode ever writes a `prompt_preview` line.
+
+These archetypes hold for **both** `--where local` and `--where cloud`, with
+one exception: `scalify run --where cloud` produces no `[node events]*` — use
+`scalify jobs watch --where cloud` for in-flight cloud progress (see
+[Per-target differences](#per-target-differences)). Everything else — the
+`converted` / `prompt_preview` / `queued` prefix, the single terminal
+envelope, and the exit-code mapping — is identical on both targets.
+
+## Per-target differences
+
+`scalify run` has two execution targets — `--where local` (the default: an HTTP
+submit plus a WebSocket session against a ScalifyUI server you run) and
+`--where cloud` (an HTTPS submit plus polling against Scalify Cloud). They emit
+the **same event dialect** and the same envelope framing, but the targets are
+not the same machine and a few things genuinely cannot match. The complete
+list of differences:
+
+| Aspect | `--where local` | `--where cloud` |
+| ------ | --------------- | --------------- |
+| Per-node events (`executing`, `execution_cached`, `progress`, `executed`, `output`, `execution_error`) | Emitted, streamed live from the server WebSocket | Not emitted by `scalify run`. The cloud API is polled for a terminal record, so a `--wait` run goes straight from `queued` to the final envelope. For in-flight cloud progress, watch the job instead: `scalify --json-stream jobs watch <prompt_id> --where cloud` emits a coarse `state` event per status transition plus an `output` event per artifact |
+| `queued.validation_warnings` | May be non-empty: the server can accept a prompt (HTTP 200) while reporting per-node issues | Always `[]` — the cloud rejects any submit carrying `node_errors` outright, as a `prompt_rejected` error envelope |
+| `queued.base_url` | Absent | Present — the cloud endpoint the prompt was submitted to |
+| Envelope `where` | `"local"` | `"cloud"` |
+| Envelope target fields | `data.host` (str), `data.port` (int) | `data.base_url` (str) |
+| Envelope `data.cached_node_ids` / `data.executed_node_ids` | Present on `--wait` | Absent — they are derived from the per-node event stream, which the cloud has none of |
+| Envelope `data.warnings` | Absent | Present on `--wait` success: an array of non-fatal warning objects (currently only `partial_execution`, see below). `[]` when there are none |
+| `prompt_rejected` `details` | `status` (400) and `node_errors` | `node_errors` only — the cloud reports rejected nodes on an otherwise-2xx submit, so there is no 4xx status to report. The `node_errors` value has the same [array-of-records shape](#node_errors-shape) on both targets |
+| Error codes | The local set below | The workflow/pre-flight codes and the node-failure codes (`execution_error`, `transient_auth`, `prompt_rejected`, `cancelled`, `spend_consent_required`) plus the cloud-only codes below. The local-server- and WebSocket-specific codes cannot occur: `server_not_running`, `object_info_unavailable`, `connection_error`, `ws_timeout`, `ws_disconnected`, `invalid_response`, `client_error`, `server_error`, `partner_node_requires_credential` (the cloud injects the caller's credential itself) |
+
+Everything not in that table is the same on both targets, including
+`converted`, `prompt_preview`, the `queued` field set, `data.status`,
+`data.prompt_id` / `client_id` / `outputs` / `outputs_by_node` /
+`outputs_by_item` / `state_file` / `watcher_spawned` / `elapsed_seconds`, and
+the `--print-prompt` and `--no-wait` stream shapes.
+
+### Cloud-only error codes
+
+| `code`               | Triggered when                                                     | `details`                       | Exit |
+| -------------------- | ------------------------------------------------------------------ | -------------------------------- | ---- |
+| `cloud_unauthorized` | No usable cloud session, or the session was rejected — run `scalify cloud login` | —                     | 1 |
+| `cloud_http_error`   | The cloud API returned a non-2xx response on submit or while polling | `status` (int), `body` (str) on submit; `status`, `prompt_id` while polling | 1 |
+| `cloud_rate_limited` | The cloud API throttled the request (HTTP 429) on submit or while polling. Throttling is not a verdict on the workflow, but it does not by itself prove the submit had no effect, and the CLI never repeats a submit on its own. On submit, wait, then check `scalify jobs ls --where cloud` for the job before re-running; while polling, the job was already submitted, so follow it with `scalify jobs watch <prompt_id> --where cloud` instead of re-running (the job record is left non-terminal). Cloud only: a local server's 429 is `client_error` | same as `cloud_http_error`, plus `retry_after` (seconds) when the server sent `Retry-After` | 1 |
+| `cloud_payment_required` | The cloud refused the request because the account's plan does not allow it (HTTP 402, or a legacy HTTP 429 whose body type is a plan refusal: free generations used up, subscription required, a partner node or model that needs a paid plan). Not throttling and not a workflow problem; nothing was queued, so do not retry or edit the workflow. A full queue stays `cloud_rate_limited` | `status` (402 or 429), `body` (str), `reason` (the server's refusal type, when it sent one) | 1 |
+| `cloud_timeout`      | The cloud job produced no progress for `--timeout` seconds          | `prompt_id` (str)               | 1 |
+| `cql_no_graph`       | A UI-format workflow needs the cloud `object_info` snapshot to be lowered to API format, and it could not be loaded — run `scalify nodes refresh --where cloud` | — | 1 |
+
+All of these are registered in `scalify_cli/error_codes.py` and listed by
+`scalify --json discover`, exactly like the local codes.
+
+### `partial_execution` warning
+
+The cloud prunes workflow branches that fail server-side validation and still
+reports the job as completed. On a `--wait` success the CLI diffs the output
+nodes it submitted against the ones that returned outputs and, when some are
+missing, appends a warning object to `data.warnings` rather than passing the
+run off as a clean success:
+
+```json
+{"code": "partial_execution", "message": "submitted 2 output node(s) but the cloud returned outputs for only 1; 1 branch(es) were pruned server-side (likely failed validation) and produced nothing", "submitted_output_nodes": 2, "returned_output_nodes": 1}
+```
+
+The envelope is still `ok: true` (exit `0`) — the job did run. Agents that
+need all-or-nothing semantics should check `data.warnings` is empty.
+
+## Event reference
+
+| `type`             | When                                                 |
+| ------------------ | ---------------------------------------------------- |
+| `converted`        | UI-format workflow was client-side converted         |
+| `prompt_preview`   | The API-format workflow graph about to be submitted  |
+| `queued`           | Server accepted the prompt (HTTP 200 on `/prompt`)   |
+| `execution_cached` | Node hit the execution cache and was skipped         |
+| `executing`        | Node started execution                               |
+| `progress`         | In-flight progress update for the running node       |
+| `executed`         | Node finished and reported its outputs               |
+| `output`           | One file-like output became available (`url`)        |
+| `execution_error`  | Server reported a node exception (error envelope follows) |
+| `login_url`        | `scalify cloud login`: OAuth authorize URL, before the browser-callback wait |
+
+Agents must ignore events whose `type` they do not recognise — new event
+kinds may be added in a backward-compatible manner. Agents must ignore
+unknown fields on known events for the same reason.
+
+A handful of fields carry values from a server-defined open set rather
+than a fixed enumeration: `class_type`, `category`, `type` (output folder),
+and `exception_type`. Agents must accept and pass through unknown values
+without keying behaviour on specific strings.
+
+Every per-node event also carries a `title` field — the human-readable
+label to show in a per-node UI: **`_meta.title` if present, else
+`class_type`, else the node id**.
+
+### `converted`
+
+Emitted once if the input workflow was in UI format and was converted to
+API format client-side.
+
+```json
+{"schema": "event/1", "type": "converted", "node_count": 2}
+```
+
+### `prompt_preview`
+
+Emitted once the workflow has been successfully loaded, parsed, and (if
+UI-format) converted — i.e., in every stream except the **Failure
+pre-flight** archetype. Carries the API-format workflow graph the CLI is
+about to POST to `/prompt` — the same dict that would land in the
+request's `prompt` field. It does **not** include `client_id` or
+`extra_data` (so any `--api-key` value never appears here).
+
+Under `--print-prompt` this is the only event: the CLI emits it plus the
+final envelope and exits 0 without queuing.
+
+```json
+{"schema": "event/1", "type": "prompt_preview", "prompt": {"1": {"class_type": "EmptyLatentImage", "inputs": {"width": 512, "height": 512, "batch_size": 1}}}}
+```
+
+### `queued`
+
+Emitted after the submit request returns success — `POST /prompt` returning
+200 locally, the equivalent cloud submit under `--where cloud` — **and** after
+the job's state file has been persisted.
+
+```json
+{
+  "schema": "event/1",
+  "type": "queued",
+  "prompt_id": "9b1c…",
+  "client_id": "fe2a…",
+  "validation_warnings": [],
+  "nodes": [
+    {"node_id": "1", "class_type": "GeminiNanoBanana2", "title": "Nano Banana 2"},
+    {"node_id": "2", "class_type": "SaveImage", "title": "Save Image"}
+  ]
+}
+```
+
+| Field                 | Type          | Description                                            |
+| --------------------- | ------------- | ------------------------------------------------------ |
+| `prompt_id`           | str           | Server-assigned prompt UUID                            |
+| `client_id`           | str           | Client-generated UUID (sent with `/prompt`)            |
+| `validation_warnings` | array of dict | Per-node validation issues ScalifyUI reported alongside a successful queue (some output chains validated, others didn't). Same record shape as `prompt_rejected`'s `details.node_errors` (see [shape](#node_errors-shape)). Empty (`[]`) in the common case. |
+| `nodes`               | array of dict | Manifest of every node in the submitted (post-conversion) workflow: `node_id` (str), `class_type` (str), `title` (str). Lets piped consumers render a per-node UI without the workflow file. |
+| `base_url`            | str           | **Cloud only.** The cloud endpoint the prompt was submitted to. Absent on `--where local`. |
+
+`queued` is emitted **after** the submit call returns successfully **and after
+the job's state file has been persisted** — on the async (`--no-wait`) paths,
+after the background watcher spawn attempt too. On both targets it therefore
+means more than "the server has the prompt": the durable record exists, so a
+consumer may run `scalify jobs status <prompt_id>` — or expect the job in
+`scalify jobs ls` — the moment it reads this line. A run whose submit fails emits
+its error envelope with no `queued` line at all.
+
+### `executing`
+
+Emitted when a node starts execution. Two consecutive `executing` events
+with different `node` values are normal (intermediate compute nodes whose
+outputs aren't published to the client never fire `executed`); agents that
+track a "current node" should treat a new `executing` as implicitly
+closing the previous one.
+
+```json
+{"schema": "event/1", "type": "executing", "node": "2", "title": "Save Image", "class_type": "SaveImage", "prompt_id": "9b1c…"}
+```
+
+### `execution_cached`
+
+One event per node whose outputs were retrieved from the execution cache
+(from ScalifyUI's `execution_cached` websocket message). Same fields as
+`executing`. A cached output-bearing node (e.g., a cached `SaveImage`)
+may emit both `execution_cached` AND `executed`.
+
+### `progress`
+
+Per-step progress for samplers, video encoders, and any node that calls
+`ProgressBar.update_absolute(...)`. Throttled to ~10 events/second per
+node. Same field names as the `scalify jobs watch` stream.
+
+```json
+{"schema": "event/1", "type": "progress", "node": "1", "completed": 14, "total": 30, "prompt_id": "9b1c…"}
+```
+
+Some custom nodes may emit `completed > total` near the end of execution;
+agents rendering a progress bar should clamp.
+
+### `executed`
+
+Emitted when the server reports node completion via its `executed`
+websocket message. **Not guaranteed for every executed node** —
+intermediate compute nodes that don't surface output to the client may
+finish without it.
+
+```json
+{
+  "schema": "event/1",
+  "type": "executed",
+  "node": "2",
+  "title": "Save Image",
+  "class_type": "SaveImage",
+  "outputs": [
+    {
+      "category": "images",
+      "node_id": "2",
+      "class_type": "SaveImage",
+      "title": "Save Image",
+      "filename": "banana_test_00001_.png",
+      "subfolder": "",
+      "type": "output",
+      "url": "http://127.0.0.1:8188/view?filename=banana_test_00001_.png&subfolder=&type=output"
+    }
+  ],
+  "prompt_id": "9b1c…"
+}
+```
+
+`outputs` is populated by iterating each key in ScalifyUI's
+`executed.output` dict and emitting any item that matches the
+file-record shape (a dict containing a `filename` key). Items that are
+not file-record-shaped (strings, booleans, mixed lists from nodes that
+publish non-file data like text predictions or animation flags) are
+silently skipped. See [Output object](#output-object).
+
+### `output`
+
+One event per newly seen file-like output, emitted right after the
+`executed` event that produced it. `url` is the contractual way to fetch
+the bytes (it points at ScalifyUI's `/view` endpoint); on a local loopback
+run with a resolvable workspace it may instead be an absolute local file
+path — treat any non-`http(s)` value as a filesystem path.
+
+```json
+{"schema": "event/1", "type": "output", "url": "http://127.0.0.1:8188/view?filename=banana_test_00001_.png&subfolder=&type=output", "prompt_id": "9b1c…"}
+```
+
+### `execution_error`
+
+Diagnostic event carrying the raw server payload when a node raises
+during execution. The terminal error envelope (`error.code:
+"execution_error"`) follows immediately; agents can dispatch on the
+envelope alone.
+
+```json
+{"schema": "event/1", "type": "execution_error", "prompt_id": "9b1c…", "details": {"node_id": "1", "exception_message": "API key invalid", "...": "..."}}
+```
+
+### `login_url`
+
+Emitted by `scalify cloud login` under `--json`/`--json-stream` — this event is
+part of the sign-in stream, not the `run` stream. It carries the OAuth
+authorize URL as soon as it is built, and is flushed **before** the command
+blocks (up to `timeout_s` seconds) waiting for the loopback browser callback,
+so a parent process driving login headlessly can open (or forward) `url` in
+time. If the callback never arrives, the terminal envelope is an
+`oauth_timeout` error; on success it is the login envelope (`data.action:
+"login"`, `data.session` with tokens redacted).
+
+```json
+{"schema": "event/1", "type": "login_url", "url": "https://api.scalify.khulnasoft.com/oauth/authorize?...", "timeout_s": 300}
+```
+
+### `upload_plan`, `upload_progress`, `upload_complete`
+
+Emitted by `scalify build push` while it uploads model files and packaged custom
+nodes. They are part of the push, not the `run` stream, and validate against
+`build_push_event.json`.
+
+Where they go depends on the mode. Under `--json-stream` they are on stdout,
+ahead of the envelope, like every other event. Under plain `--json` (which is
+what a caller with a piped stdout resolves to, so every agent) they are on
+**stderr**, because stdout in that mode is exactly one envelope. Read stderr line
+by line and keep the lines that parse as JSON with `schema: "event/1"`.
+
+A push opens with one `upload_plan`, sent before the first byte and sent even
+when there is nothing to upload. Each file that transfers gets an
+`upload_progress` as it starts and about every two seconds after, then one
+`upload_complete`. A file the builder already held gets only an
+`upload_complete` with `deduplicated: true`. A file whose upload fails gets no
+`upload_complete`; the error envelope is the next line.
+
+```json
+{"schema": "event/1", "type": "upload_plan", "files": 3, "bytes_total": 56908316672, "already_held": 2}
+{"schema": "event/1", "type": "upload_progress", "file": "model.safetensors", "kind": "model", "index": 1, "of": 3, "bytes_done": 1288490188, "bytes_total": 23761671782, "bytes_per_second": 47500000, "eta_seconds": 473, "overall_bytes_done": 1288490188, "overall_bytes_total": 56908316672, "overall_eta_seconds": 1171}
+{"schema": "event/1", "type": "upload_complete", "file": "model.safetensors", "kind": "model", "index": 1, "of": 3, "bytes_total": 23761671782, "seconds": 498.2, "bytes_per_second": 47695045, "deduplicated": false, "overall_bytes_done": 23761671782, "overall_bytes_total": 56908316672}
+```
+
+`bytes_per_second` on a progress event is measured over the last ten seconds
+and is sampled on a timer, not on bytes moving, so a stalled connection keeps
+reporting and its rate falls to `0` with `eta_seconds: null`. That is how to
+tell a slow upload from a dead one. `bytes_done` counts bytes handed to the
+connection, which runs slightly ahead of bytes the server has acknowledged.
+
+At a terminal the same numbers render as one redrawn progress line; with output
+piped under `--no-json` they are plain lines every five seconds, with no
+carriage returns.
+### `deploy_progress`
+
+Emitted by `scalify deploy up --watch`, `scalify deploy promote --watch`,
+`scalify deploy rollback --watch` and `scalify deploy status --watch` while the deployment's status is `provisioning`
+or `starting`. It is part of those
+commands, not the `run` stream, and validates against
+`deploy_progress_event.json`.
+
+Where it goes depends on the mode, the same way upload progress does. Under
+`--json-stream` it is on stdout, ahead of the envelope. Under plain `--json`
+(what a caller with a piped stdout resolves to, so every agent) it is on
+**stderr**, because stdout in that mode is exactly one envelope.
+
+```json
+{"schema": "event/1", "type": "deploy_progress", "deployment_id": "dep-7edc1262", "status": "provisioning", "stale": false, "progress": {"step": "staging_models", "modelsDone": 0, "modelsTotal": 2, "bytesDone": 3536540667, "bytesTotal": 7272719498, "currentModel": "models/checkpoints/sd_xl_base_1.0.safetensors", "bytesPerSecond": 44205525, "etaSeconds": 85, "attempt": 1, "startedAt": "2026-09-20T01:59:55Z", "updatedAt": "2026-09-20T02:01:15Z"}}
+{"schema": "event/1", "type": "deploy_progress", "deployment_id": "dep-7edc1262", "status": "starting", "stale": false, "progress": {"step": "waiting_for_worker", "attempt": 1, "startedAt": "2026-09-20T02:02:46Z", "updatedAt": "2026-09-20T02:02:46Z"}}
+```
+
+The event's own fields are snake_case like every other event. `progress` is the
+deploy service's object, passed through unchanged, so its fields are the API's
+camelCase, the same as `computeConfig` and `endpointUrl` in the envelopes. The
+service computes `bytesPerSecond` and `etaSeconds`; the CLI computes nothing, so
+the portal and the CLI show the same numbers.
+
+One event per new sample: the CLI polls every two seconds and the service writes
+about every three, and a sample is keyed on its `updatedAt` (on its whole content
+where a sample carries no `updatedAt`). If a sample then goes
+a minute without being rewritten, one more event carries it with `stale: true`.
+The service's writes are best-effort, so a stale sample is not evidence that the
+deploy stopped; `status` remains the verdict. A service that sends no `progress`
+object produces no events, and the command behaves as it did before.
+
+`scalify deploy status --json` (with or without `--watch`) and `scalify deploy up
+--json` carry the same object as `data.progress` while the deployment is coming
+up, and omit the key otherwise.
+
+At a terminal the numbers render as one redrawn progress line; with output piped
+under `--no-json` they are plain lines, one per new sample, with no carriage
+returns. Ctrl-C during `--watch` exits 130 after printing that the deployment
+keeps coming up and the command that re-attaches, and in the JSON modes still
+writes the envelope for the last state it read.
+
+A watch rides out a deploy API that stops answering, as it does for a few
+seconds while a new version rolls out: a 5xx or a failed connection on its read
+is retried, backing off (2, 4, 8, then 15 seconds), for about a minute from the
+first failure, and the watch says once that it is retrying. A 4xx still ends the
+watch at once. If the API is still not answering when the window closes, the
+watch ends with the error code `deploy_watch_lost` and exit code **75**, never 1:
+only the watch ended, and the deployment may still be coming up. Its `hint`
+carries the command that re-attaches and `details.deployment_id` the deployment.
+
+## Success envelope
+
+On `--wait` success, `data` carries:
+
+| Field               | Type            | Description                                            |
+| ------------------- | --------------- | ------------------------------------------------------ |
+| `workflow`          | str             | Absolute path of the submitted workflow file           |
+| `status`            | str             | `"completed"` (`"queued"` without `--wait`; `"preview"` under `--print-prompt`) |
+| `prompt_id`         | str             | Server-assigned prompt UUID                            |
+| `client_id`         | str             | Client-generated UUID                                  |
+| `outputs`           | array of str    | URL (or local path) per file-like output, deduplicated |
+| `outputs_by_node`   | dict            | The same outputs grouped by the node id that produced them |
+| `outputs_by_item`   | dict            | The same outputs grouped by `compose` foreach item; `{}` when the workflow carried no item map |
+| `cached_node_ids`   | array of str    | **Local only.** Node IDs the server reported as cached  |
+| `executed_node_ids` | array of str    | **Local only.** Node IDs the executor *ran* — the union of every node that appeared in an `executing` or `executed` event, including intermediate compute nodes |
+| `warnings`          | array of dict   | **Cloud only.** Non-fatal warnings about the completed run — see [`partial_execution`](#partial_execution-warning). `[]` when there are none |
+| `elapsed_seconds`   | float \| null   | Wall-clock duration (null when not waiting)            |
+| `host` / `port`     | str / int       | **Local only.** Target server                          |
+| `base_url`          | str             | **Cloud only.** Target cloud endpoint                  |
+| `state_file`        | str \| null     | Path of the job state file (poll with `scalify jobs status`); null when no record could be written — see [below](#known-limit-a-state-file-failure-is-never-a-run-failure) |
+
+`cached_node_ids` and `executed_node_ids` may overlap: a cached
+output-bearing node emits both `execution_cached` and `executed`. Agents
+wanting "ran fresh, not from cache" should compute
+`set(executed_node_ids) - set(cached_node_ids)`. Both are derived from the
+per-node event stream and so are local-only — see
+[Per-target differences](#per-target-differences).
+
+Without `--wait` (the default), the stream ends at the `queued` envelope
+(`data.status: "queued"`, `data.watcher_spawned: bool`) and a detached
+watcher keeps the state file updated; follow up with
+`scalify jobs watch <prompt_id>` or `scalify jobs status <prompt_id>`. This is
+the same on both targets, `watcher_spawned` included (add `--where cloud` to
+the follow-up commands for a cloud job). The async envelope carries no
+`outputs_by_node` / `outputs_by_item` / `warnings` — nothing has run yet.
+
+### Known limit: a state-file failure is never a run failure
+
+Writing the job's state file is best-effort on an **async submit** (the default,
+no `--wait`, local or cloud) and on **local `--wait`**. If the state directory
+can't be written — a config root that resolved somewhere unreachable, a
+read-only or sandboxed home, a full disk — the run still reports `ok: true`,
+because by then the server has already accepted the prompt. What the envelope
+says depends on the path, and `data.state_file` is `null` on both:
+
+- **async submit** — `data.status: "queued"`, exactly as it would be with the
+  record written.
+- **local `--wait`** — the run goes on to completion in the foreground and
+  finishes `data.status: "completed"` with its outputs, so a failed state write
+  costs you only the on-disk record, not the result.
+
+**`state_file: null` is not a failed run**, and in particular it is not a
+transport error: there is nothing to retry, and re-submitting queues a second
+job for a prompt that is already running. Follow an async job by `prompt_id`
+(`scalify jobs status <prompt_id>`) and treat a missing record as "unknown", not
+"did not run".
+
+With no record there is also nothing for a background watcher to update, so the
+spawn is skipped and `data.watcher_spawned` is `false` — poll
+`scalify jobs status` yourself, as that field already instructs.
+
+Run with `LOG_LEVEL=DEBUG` to see the swallowed cause.
+
+**Cloud `--wait` is not yet covered.** That path still writes its state record
+directly, including inside its own error handlers, so an unwritable state
+directory there can surface as a traceback after the job was accepted rather
+than as a clean envelope. Treat the guarantee above as scoped to the paths
+named in the first paragraph.
+
+### Known limit: `--wait` has no background watcher
+
+`--wait` writes the job's state file at submit and finalizes it in the
+foreground — it does **not** spawn the detached watcher the async path does
+(`data.watcher_spawned` is an async-path field only). Every ordinary outcome is
+still recorded: a node failure, a cancel, and a lost connection to a dying
+server all run through the foreground handlers, which write `error.code`
+(the classified execution verdict or `execution_error`; `cancelled`;
+`server_died`) before exiting.
+
+A `--wait` process that is **killed from outside** — a caller-imposed timeout
+(`SIGKILL`/`SIGTERM` on the process group), a terminal going away, the OS
+reaping the CLI alongside the server — runs no handler, so the state file is
+left at its submit-time `running`. To cover that, `--wait` (local and cloud)
+stamps its own `watcher_pid` (+ start time) on the submit-time record: the next
+`jobs ls` finds a non-terminal record whose recorded pid is dead, and its
+stale-watcher reap finalizes the job as `error` with `error_code:
+"watcher_crashed"` — the same treatment a crashed background watcher gets — and
+`jobs ls --orphaned` lists it. The stamp is dropped again on the exits where
+the job may genuinely still be alive on the server, so the reap can't claim a
+crash the CLI hasn't established: when local `--wait` gives up on its *own*
+`--timeout` (`ws_timeout`), and when cloud `--wait` dies on a network error
+that escapes its handlers (a DNS failure or connection reset while polling, as
+opposed to the handled `cloud_timeout` / `cloud_unauthorized` /
+`cloud_http_error` exits, which record a terminal verdict of their own), or
+when cloud `--wait` gives up on a throttled status poll (`cloud_rate_limited`,
+recorded as the record's `error` until the next successful status poll). In
+both cases the record is left non-terminal with no pid, the reap never touches
+it, and `scalify jobs status <prompt_id>` can still consult the server for the
+real outcome.
+
+The reap itself never overwrites a verdict that landed first: it re-reads each
+record under that record's lock before rewriting it, so a `--wait` run
+finishing normally in the same instant keeps its `completed` status and its
+outputs.
+
+What the reap cannot tell you is *why* the process died, or what happened to the
+job afterwards — `watcher_crashed` records the watcher's death, not the job's
+outcome. **For runs that may outlive the caller's patience, submit without
+`--wait`** — the async path spawns a watcher that survives the parent (its own
+session/process group), and it is the watcher that writes `server_died` when the
+server disappears mid-job. `scalify jobs ls` then reports both the status and the
+`error_code`.
+
+A watcher is deliberately *not* spawned on `--wait`: it would put a second,
+independent writer on the state file the foreground already finalizes, add a
+second server connection per foreground run, and leave a background process
+behind after a synchronous command returns — a real regression on the common
+path in exchange for a case the async path already covers.
+
+## `scalify validate --json` envelope
+
+`scalify validate --workflow <file> --json` checks a workflow without submitting
+it and emits a single envelope (no event stream). On a valid workflow `ok` is
+`true` and `data` carries:
+
+| Field                  | Type          | Description                                                                                     |
+| ---------------------- | ------------- | ----------------------------------------------------------------------------------------------- |
+| `workflow`             | str           | Absolute path of the validated workflow file                                                    |
+| `valid`                | bool          | Whether the graph passed validation (also the envelope `ok`)                                     |
+| `error_count`          | number        | Number of entries in `errors`                                                                    |
+| `warning_count`        | number        | Number of entries in `warnings`                                                                  |
+| `errors`               | array of dict | Per-node validation errors (empty when `valid`)                                                  |
+| `warnings`             | array of dict | Non-fatal validation warnings                                                                    |
+| `partner_nodes`        | array of str  | Sorted class_types in the workflow that are partner-API (paid) nodes. **Always present**; `[]` when none |
+| `spends_credits`       | bool          | `true` iff `partner_nodes` is non-empty — a convenience flag for "will this workflow spend Scalify credits?" |
+| `converted_from_ui`    | bool          | Present and `true` only when the input was a UI export that was lowered to API format before validating |
+| `converted_node_count` | number        | Present only alongside `converted_from_ui`: node count of the converted graph                    |
+
+`partner_nodes` / `spends_credits` are **informational only** — they never
+change validate's exit code (validate stays advisory; the credit-spend gate
+lives in `scalify run`). Detection is the same authoritative `api_node: true`
+flag (with a `partner/...` category fallback) that `scalify run` uses, run over
+the loaded `object_info`; in offline `--input` mode where the `object_info`
+lacks `api_node` flags the list is simply empty (fail-open). When
+`spends_credits` is `true`, pretty (non-`--json`) mode also prints a yellow
+`⚠ uses partner-API (paid) nodes …` line after the verdict.
+
+On a canvas whose ids `get_template` remapped (`insert:<op>:root:node:94`), an
+issue on such a node also carries `template_node_id` (`"94"`), the id the
+template showed; `workflow slots --node`, `set-widget` and the other edit
+commands accept it. It is absent when a literal node `94` exists or two
+inserts carry that id.
+
+A literal of the wrong JSON type is an error (`shape_mismatch`) unless the
+server converts it the way ScalifyUI does (a lossless subset of its conversions) —
+an integer string on an INT input, a numeric string on a FLOAT input, a number
+on a STRING input. That one is a `coercible_type` warning: `value` is the stored
+literal, `coerced_value` the typed value the server runs with, and `hint` the
+`set-widget` command for non-link inputs when no catalog error or fatal finding
+refuses the converted value. Range checks judge `coerced_value`.
+
+Invalid workflows emit `ok: false` with the same `data` fields (`valid: false`,
+a populated `errors` array, `partner_nodes`/`spends_credits` still present) and
+exit code `1`. Structural failures (missing file, non-object JSON, an
+unconvertible UI export) emit an [error object](#error-object) instead.
+
+## Error object
+
+Every failure envelope carries:
+
+| Field     | Type         | Description                                                                |
+| --------- | ------------ | -------------------------------------------------------------------------- |
+| `code`    | str          | Registered discriminator — see [Error codes](#error-codes); the full registry is in `scalify --json discover` under `data.error_codes` |
+| `message` | str          | Human-readable summary. For display only — dispatch on `code`              |
+| `hint`    | str \| null  | Suggested next action                                                      |
+| `details` | dict \| null | Per-code structured extras (documented below)                              |
+
+## Error codes
+
+Codes raised by `scalify run` against a local server, with their `details`
+payloads. All of them are registered in `scalify_cli/error_codes.py` (the
+registry test enforces this) and surfaced by `scalify discover`. For
+`--where cloud`, see [Cloud-only error codes](#cloud-only-error-codes) — it
+lists what the cloud adds and which of the codes below cannot occur there.
+
+| `code`                    | Triggered when                                                                  | `details`                                          | Exit |
+| ------------------------- | ------------------------------------------------------------------------------- | -------------------------------------------------- | ---- |
+| `workflow_not_found`      | `--workflow` path does not exist                                                | —                                                  | 1 |
+| `workflow_invalid_json`   | Workflow file is not valid JSON                                                 | —                                                  | 1 |
+| `workflow_read_error`     | Workflow file exists but isn't readable as text (`OSError`, `UnicodeDecodeError`) | —                                                | 1 |
+| `workflow_not_api_format` | File parses but is neither UI nor API format                                    | —                                                  | 1 |
+| `workflow_empty`          | Workflow has no executable nodes (UI conversion produced `{}`, or API workflow is `{}`) | —                                          | 1 |
+| `conversion_error`        | UI→API converter raised `WorkflowConversionError`                               | —                                                  | 1 |
+| `conversion_crash`        | UI→API converter raised an unexpected exception                                 | `exception_type` (str)                             | 1 |
+| `server_not_running`      | Pre-flight probe found no ScalifyUI on host:port                                  | `host` (str), `port` (int)                         | 1 |
+| `object_info_unavailable` | `/object_info` returned an HTTP error, or HTTP 200 with an unparseable body     | `status` (int), `body` (str)                       | 1 |
+| `connection_error`        | Server unreachable mid-flow: `URLError`, `TimeoutError`, or other `OSError` (including on `/object_info`) | —                       | 1 |
+| `workflow_unknown_nodes`  | Pre-submit validation found unknown class_types / shape mismatches              | `errors` (array), `warnings` (array)               | 1 |
+| `partner_node_requires_credential` | Workflow uses a partner-API node and no `api_key_scalify_org` credential is available | `partner_nodes` (array of str, capped at 20 entries × 64 chars each), `partner_node_count` (int, the exact total — read this, not `len(partner_nodes)`), `host`, `port` | 1 |
+| `spend_consent_required`  | Workflow embeds partner-API (paid) nodes and `--allow-spend` was not passed (machine mode) or interactive consent was declined; re-run with `--allow-spend`. Free (non-partner) workflows are unaffected. | `partner_nodes` (array of str, capped at 20 entries × 64 chars each), `partner_node_count` (int, the exact total — read this, not `len(partner_nodes)`); local path also carries `host`, `port`, the cloud path carries `where: "cloud"` | 1 |
+| `client_id_rejected`      | `--client-id` was combined with something it cannot serve. On `scalify run`: the flag was blank (`empty`), the effective target is cloud (`cloud` — the flag addresses a local ScalifyUI socket, and cloud fans execution events out per user/workspace anyway), or `--wait` was passed (`wait` — the run's events go to the named client, so this invocation would watch a silent socket). Also raised by `scalify jobs watch` when the prompt is marked as having borrowed a live client's id (`borrowed`): that run is poll-only and no `--client-id` override is honoured. `scalify jobs watch` raises it with `indeterminate` when no job state file was readable and the prompt's own server record could not be read either (the `/queue` + `/history` fetch failed, returned the wrong shape, or simply never mentioned the prompt): nothing has ruled the marker out, so the override is refused rather than risking the eviction — retry once the server answers. `scalify jobs watch` also raises `empty` for a blank `--client-id`, as `scalify run` does. Refused before anything is submitted and before any socket is opened | `reason` (str, `"empty"`, `"cloud"`, `"wait"`, `"borrowed"` or `"indeterminate"`) | 1 |
+| `prompt_rejected`         | Server returned HTTP 400 with `node_errors`                                     | `status` (400), `node_errors` (array — [shape](#node_errors-shape)) | 1 |
+| `client_error`            | Server returned another HTTP 4xx response (including 429; `cloud_rate_limited` is Cloud only) | `status` (int, 4xx), `body` (str)                  | 1 |
+| `server_error`            | Server returned an HTTP 5xx response                                            | `status` (int, 5xx), `body` (str)                  | 1 |
+| `invalid_response`        | Server returned HTTP 2xx but body was unparseable or lacked `prompt_id`         | `status` (int, 2xx)                                | 1 |
+| `ws_timeout`              | WebSocket `recv` idle past `--timeout`                                          | `timeout` (int, seconds)                           | 1 |
+| `ws_disconnected`         | WebSocket connection dropped mid-execution                                      | —                                                  | 1 |
+| `cancelled`               | Run was interrupted — client `SIGINT` (Ctrl-C) or the server's `execution_interrupted` (e.g. `/interrupt`) | —                       | 130 |
+| `execution_error`         | A node raised during execution (server emitted `execution_error`)               | `node_id` (str), `class_type` (str), `title` (str), `exception_type` (str), `traceback` (str) | 1 |
+| `transient_auth`          | The `execution_error` cause was an API node's server-side session token expiring mid-execution — transient, so resubmitting the same workflow succeeds. Local credentials are fine; `scalify cloud login` does not help | Same fields as `execution_error` | 1 |
+
+### CLI-wide codes
+
+Two codes can end any command's `--json` stream, not only `scalify run`:
+
+| `code`           | Triggered when                                                                 | `details`                                                                                  | Exit |
+| ---------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ | ---- |
+| `usage_error`    | argv did not parse (unknown option or command, missing value); nothing ran     | `command` (str), `exit_code` (int); `option` and `did_you_mean` for a near-miss option     | 2 |
+| `internal_error` | The command crashed on an exception it did not handle (a scalify-cli bug)        | `exception` (str, the exception type), `command` (str), `traceback` (array of up to 3 `file:line:func` strings, innermost last) | 1 |
+
+`internal_error`'s `message` is `"<Type>: <text>"`, capped at 500 characters.
+URL query strings, bearer tokens, `key=value` token pairs and `user:pass@`
+userinfo are replaced with `***`. The full traceback still goes to stderr.
+Whether anything was written depends on where the command crashed, so re-read
+state before retrying.
+
+### Workflow-edit refusal fields
+
+`workflow set-widget` / `set-slot` / `ls-nodes` add these fields for agents:
+
+| Where | Field | Meaning |
+| ----- | ----- | ------- |
+| `unknown_enum_value` finding (the `set-widget` error's `details`, `validate` findings) | `best_match` (str, optional) | The ONE option sharing the rejected value's leading token (`'16:9 (Landscape)'` → `'16:9 (Widescreen)'`). It is also first in `did_you_mean`. It is never auto-applied, and is absent for filenames and ambiguous tokens |
+| `unknown_dynamic_sub_input` warning (`set-slot`) | `revealed_by` (array of str, optional) | The options of the dynamic combo that reveal the requested sub-widget (`model.prompt_expansion_mode` → `["MiniMax H3 Max", "MiniMax H3 Max Turbo"]`). Set the selector to one of them first |
+| `workflow ls-nodes` rows | `ui_only` (true, optional) | A frontend-only node (Reroute, Note, MarkdownNote, PrimitiveNode, GetNode, SetNode). It is readable on the canvas but cannot be added with `add-node` or shown with `nodes show` |
+| `workflow ls-nodes` rows | `subgraph` (true, optional) | A subgraph instance: its `type` is the definition uuid, not a node class |
+
+### `exception_type` field
+
+Provided for diagnostic and observability purposes (e.g., metrics
+bucketing). **Open set** — the format is whatever ScalifyUI sends,
+typically the bare class name for builtins (`RuntimeError`,
+`ValueError`) and a dotted module path for non-builtins. May be `""`
+when the server omits it. Don't key retry or routing logic on it; use
+`error.code` for coarse dispatch.
+
+### `traceback` field
+
+A single multi-line string carrying the formatted stack frames as
+reported by ScalifyUI (joined from the server's `traceback.format_tb()`
+output). It does NOT include the `"Traceback (most recent call last):"`
+header or the final `"ExceptionType: message"` summary line. May be
+empty (`""`).
+
+### `node_errors` shape
+
+Used for `prompt_rejected`'s `details.node_errors` and for
+`queued.validation_warnings`. The value is an array of self-contained
+records, one per affected node. Each record carries `node_id` (str —
+same identifier as in the per-node events) plus the per-node fields
+ScalifyUI emits:
+
+```json
+"node_errors": [
+  {
+    "node_id": "1",
+    "errors": [
+      {
+        "type": "value_not_in_list",
+        "message": "Value not in list",
+        "details": "resolution: '5K' not in ['1K','2K','4K']",
+        "extra_info": {"input_name": "resolution", "received_value": "5K"}
+      }
+    ],
+    "dependent_outputs": ["2"],
+    "class_type": "GeminiNanoBanana2"
+  }
+]
+```
+
+The inner per-node fields are defined by ScalifyUI's `validate_prompt()`
+and may evolve with ScalifyUI versions — agents should ignore unknown
+fields. The CLI guarantees only that the outer value is an array of
+dicts, each carrying a `node_id` (str).
+
+If a server reports a bare value instead of the per-node dict above (e.g.
+`{"1": "missing input"}`), the CLI does not drop the record — it wraps the
+value as `{"node_id": "1", "errors": ["missing input"]}` so the count in the
+message always matches the array and the diagnostic survives. `errors` items
+are objects in the normal case; treat a non-object item as an opaque message.
+`node_id` is always taken from the payload's own map key, so a server-supplied
+`node_id` field inside a record cannot override it.
+
+## Output object
+
+Entries of `executed.outputs`:
+
+| Field        | Type | Description                                                                       |
+| ------------ | ---- | ---------------------------------------------------------------------------------- |
+| `category`   | str  | Output category as keyed by ScalifyUI's `executed.output` dict. **Open set** (`images`, `audio`, `3d`, `latents`, …) |
+| `node_id`    | str  | Node that produced the output                                                      |
+| `class_type` | str  | Node class name                                                                    |
+| `title`      | str  | Display label                                                                      |
+| `filename`   | str  | Raw filename as reported by the server                                             |
+| `subfolder`  | str  | Subfolder within the output root. Defaults to `""`                                 |
+| `type`       | str  | ScalifyUI output folder discriminator. **Open set** (`output`, `temp`, `input`). Defaults to `"output"` |
+| `url`        | str  | `http(s)://<host>:<port>/view?...` URL — fetch this to get the bytes               |
+
+## Process-level termination
+
+The CLI may be terminated by the operating system or a parent process
+(SIGKILL, SIGTERM, OOM-kill, segmentation fault). In these cases the
+envelope may never be emitted and the stream may be truncated. Agents
+should treat the run as failed when **both**:
+- the process exit code is non-zero, and
+- the last line on stdout is not a `type: "envelope"` line, or stdout is
+  empty.
+
+Stderr may contain a Python traceback in these cases.
+
+An exception inside the CLI itself is not one of these. It ends the stream
+with an [`internal_error`](#cli-wide-codes) envelope.
+
+## Examples
+
+### Successful run (UI-format input, `--wait`)
+
+```json
+{"schema":"event/1","type":"converted","node_count":2}
+{"schema":"event/1","type":"prompt_preview","prompt":{"1":{"class_type":"GeminiNanoBanana2","inputs":{"prompt":"a banana"},"_meta":{"title":"Nano Banana 2"}},"2":{"class_type":"SaveImage","inputs":{"filename_prefix":"banana_test","images":["1",0]},"_meta":{"title":"Save Image"}}}}
+{"schema":"event/1","type":"queued","prompt_id":"9b1c…","client_id":"fe2a…","validation_warnings":[],"nodes":[{"node_id":"1","class_type":"GeminiNanoBanana2","title":"Nano Banana 2"},{"node_id":"2","class_type":"SaveImage","title":"Save Image"}]}
+{"schema":"event/1","type":"executing","node":"1","title":"Nano Banana 2","class_type":"GeminiNanoBanana2","prompt_id":"9b1c…"}
+{"schema":"event/1","type":"progress","node":"1","completed":4,"total":4,"prompt_id":"9b1c…"}
+{"schema":"event/1","type":"executing","node":"2","title":"Save Image","class_type":"SaveImage","prompt_id":"9b1c…"}
+{"schema":"event/1","type":"executed","node":"2","title":"Save Image","class_type":"SaveImage","outputs":[{"category":"images","node_id":"2","class_type":"SaveImage","title":"Save Image","filename":"banana_test_00001_.png","subfolder":"","type":"output","url":"http://127.0.0.1:8188/view?filename=banana_test_00001_.png&subfolder=&type=output"}],"prompt_id":"9b1c…"}
+{"schema":"event/1","type":"output","url":"http://127.0.0.1:8188/view?filename=banana_test_00001_.png&subfolder=&type=output","prompt_id":"9b1c…"}
+{"schema":"envelope/1","type":"envelope","ok":true,"command":"run","version":"1.6.1","where":"local","data":{"workflow":"/path/wf.json","status":"completed","prompt_id":"9b1c…","client_id":"fe2a…","outputs":["http://127.0.0.1:8188/view?filename=banana_test_00001_.png&subfolder=&type=output"],"cached_node_ids":[],"executed_node_ids":["1","2"],"elapsed_seconds":8.342,"host":"127.0.0.1","port":8188,"state_file":"…"},"error":null}
+```
+
+Exit code: `0`.
+
+### Successful cloud run (`--where cloud --wait`)
+
+Same prefix as the local stream; no per-node events, because the cloud path
+polls for a terminal record instead of streaming a WebSocket session.
+
+```json
+{"schema":"event/1","type":"prompt_preview","prompt":{"1":{"class_type":"GeminiNanoBanana2","inputs":{"prompt":"a banana"}},"2":{"class_type":"SaveImage","inputs":{"filename_prefix":"banana_test","images":["1",0]}}}}
+{"schema":"event/1","type":"queued","prompt_id":"9b1c…","client_id":"fe2a…","validation_warnings":[],"nodes":[{"node_id":"1","class_type":"GeminiNanoBanana2","title":"GeminiNanoBanana2"},{"node_id":"2","class_type":"SaveImage","title":"SaveImage"}],"base_url":"https://api.scalify.khulnasoft.com"}
+{"schema":"envelope/1","type":"envelope","ok":true,"command":"run","version":"1.6.1","where":"cloud","data":{"workflow":"/path/wf.json","status":"completed","prompt_id":"9b1c…","client_id":"fe2a…","outputs":["https://…/banana_test_00001_.png"],"outputs_by_node":{"2":["https://…/banana_test_00001_.png"]},"outputs_by_item":{},"warnings":[],"elapsed_seconds":21.7,"base_url":"https://api.scalify.khulnasoft.com","state_file":"…"},"error":null}
+```
+
+Exit code: `0`.
+
+### Failure: workflow file missing
+
+```json
+{"schema":"envelope/1","type":"envelope","ok":false,"command":"run","version":"1.6.1","where":"local","data":null,"error":{"code":"workflow_not_found","message":"Specified workflow file not found: /tmp/missing.json","hint":"check the path; pass the API-format JSON exported from ScalifyUI","details":null}}
+```
+
+Exit code: `1`.
+
+### Failure: server returned validation errors
+
+```json
+{"schema":"event/1","type":"prompt_preview","prompt":{"…":"…"}}
+{"schema":"envelope/1","type":"envelope","ok":false,"command":"run","version":"1.6.1","where":"local","data":null,"error":{"code":"prompt_rejected","message":"Workflow has 1 validation error(s)","hint":"inspect `details.node_errors` and fix the workflow","details":{"status":400,"node_errors":[{"node_id":"1","errors":[{"type":"value_not_in_list","message":"Value not in list","details":"resolution: '5K' not in ['1K','2K','4K']"}],"dependent_outputs":["2"],"class_type":"GeminiNanoBanana2"}]}}}
+```
+
+Exit code: `1`.
+
+### Failure: node raised during execution
+
+```json
+{"schema":"event/1","type":"prompt_preview","prompt":{"…":"…"}}
+{"schema":"event/1","type":"queued","prompt_id":"9b1c…","client_id":"fe2a…","validation_warnings":[],"nodes":[{"…":"…"}]}
+{"schema":"event/1","type":"executing","node":"1","title":"Nano Banana 2","class_type":"GeminiNanoBanana2","prompt_id":"9b1c…"}
+{"schema":"event/1","type":"execution_error","prompt_id":"9b1c…","details":{"node_id":"1","exception_message":"API key invalid","…":"…"}}
+{"schema":"envelope/1","type":"envelope","ok":false,"command":"run","version":"1.6.1","where":"local","data":null,"error":{"code":"execution_error","message":"API key invalid","hint":"inspect the per-node fields in details; re-run with `--wait --verbose`","details":{"node_id":"1","class_type":"GeminiNanoBanana2","title":"Nano Banana 2","exception_type":"RuntimeError","traceback":"  File \"/path/to/node.py\", line 42, in execute\n    raise RuntimeError(\"API key invalid\")\n"}}}
+```
+
+Exit code: `1`.
+
+### Cancellation (Ctrl-C or server interrupt)
+
+```json
+{"schema":"envelope/1","type":"envelope","ok":false,"command":"run","version":"1.6.1","where":"local","data":null,"error":{"code":"cancelled","message":"Cancelled by user","hint":null,"details":null}}
+```
+
+Exit code: `130`.
+
+## Validating `data` against the shipped schemas
+
+The per-command schemas live in `scalify_cli/schemas/`. Most are self-contained,
+but the five discovery schemas — `templates.json`, `nodes.json`, `models.json`,
+`generate_list.json`, `generate_schema.json` — reference a shared one:
+
+```json
+"knowledge": { "$ref": "knowledge_block.json" }
+```
+
+Each schema carries an `$id` under `https://scalify.khulnasoft.com/schemas/`. That namespace
+is an identifier, not a location; nothing is served there. A validator built on
+one schema file alone therefore cannot resolve the reference, and validating a
+`templates ls` payload that carries a `knowledge` block fails with
+`Unresolvable: knowledge_block.json` rather than a validation error.
+
+Build a registry from the whole directory first:
+
+```python
+import json
+from pathlib import Path
+
+import jsonschema
+from referencing import Registry, Resource
+
+SCHEMAS = Path("scalify_cli/schemas")  # or wherever you vendored them
+registry = Registry().with_resources(
+    (s["$id"], Resource.from_contents(s))
+    for s in (json.loads(p.read_text()) for p in SCHEMAS.glob("*.json"))
+    if "$id" in s
+)
+
+schema = json.loads((SCHEMAS / "templates.json").read_text())
+jsonschema.Draft202012Validator(schema, registry=registry).validate(envelope["data"])
+```
+
+Any validator works the same way: load every `*.json` in the directory into
+whatever the library calls its store, keyed by `$id`. Ship the directory as a
+unit — a single schema file copied out on its own is not self-sufficient.
+
+## Stability
+
+### What is stable
+
+- The two-schema framing: `event/1` lines + a final `envelope/1` /
+  `type: "envelope"` line. Bump rule: additive optional fields = no bump;
+  rename/remove/retype a field or changed exit semantics = bump.
+- The set of event `type`s listed above and the field names within them.
+- The set of `error.code` values listed above, their registration in the
+  error-code registry, and the per-code `details` documented for each.
+- The exit code mapping: `0` on `ok: true`, `130` on `cancelled`, `1` on
+  every other failure.
+- The stdout/stderr separation: stdout carries only NDJSON.
+
+### What may change in a non-breaking way
+
+- New event types being added (ignore unknown `type` values).
+- New `error.code` values being added (default-handle unknown codes).
+- New optional fields being added to existing events or to `data`
+  (ignore unknown fields).
+
+## Legacy dialect mapping
+
+For consumers migrating from the pre-`event/1` `scalify run --json` dialect
+(removed; was `{"event": …, "schema_version": 1}` with `error.kind`):
+
+| Legacy event     | Current                                                      |
+| ---------------- | ------------------------------------------------------------ |
+| `converted`      | `type: "converted"`                                          |
+| `prompt_preview` | `type: "prompt_preview"`                                     |
+| `queued`         | `type: "queued"`                                             |
+| `node_executing` | `type: "executing"` (`node_id` → `node`)                     |
+| `node_cached`    | `type: "execution_cached"` (`node_id` → `node`)              |
+| `node_progress`  | `type: "progress"` (`value`/`max` → `completed`/`total`; `class_type`/`title` dropped — read them from the `executing` event) |
+| `node_executed`  | `type: "executed"` (+ one `output` event per file)           |
+| `completed`      | envelope `ok: true` (`outputs` → `data.outputs` as URLs; `cached_node_ids` / `executed_node_ids` preserved in `data`) |
+| `failed`         | envelope `ok: false` with `error.code`                       |
+
+| Legacy `error.kind`        | Current `error.code`        | Exit |
+| -------------------------- | --------------------------- | ---- |
+| `workflow_not_found`       | `workflow_not_found`        | 1 |
+| `workflow_invalid_json`    | `workflow_invalid_json`     | 1 |
+| `workflow_read_error`      | `workflow_read_error`       | 1 |
+| `workflow_format_invalid`  | `workflow_not_api_format`   | 1 |
+| `workflow_empty`           | `workflow_empty`            | 1 |
+| `conversion_error`         | `conversion_error`          | 1 |
+| `conversion_crash`         | `conversion_crash`          | 1 |
+| `connection_error` (probe) | `server_not_running`        | 1 |
+| `connection_error` (network) | `connection_error`        | 1 |
+| `object_info_unavailable`  | `object_info_unavailable`   | 1 |
+| `validation_error`         | `prompt_rejected`           | 1 |
+| `client_error`             | `client_error`              | 1 |
+| `server_error`             | `server_error`              | 1 |
+| `invalid_response`         | `invalid_response`          | 1 |
+| `timeout`                  | `ws_timeout`                | 1 |
+| `connection_lost`          | `ws_disconnected`           | 1 |
+| `execution_interrupted`    | `cancelled`                 | 130 (was 1) |
+| `execution_error`          | `execution_error`           | 1 |
+
+Other framing changes: `schema_version: 1` → `schema: "event/1"`;
+per-kind error extras moved under `error.details`; stdout is now UTF-8
+(was ASCII-escaped); `--print-prompt` and `--no-wait` streams now end
+with an explicit `ok: true` envelope instead of ending at
+`prompt_preview` / `queued`.

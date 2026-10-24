@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scalify.khulnasoft.com/schemas/run_event.json",
+  "title": "scalify run --json-stream NDJSON event",
+  "description": "One JSON object per line. The final line is an envelope (run.json schema in .data).",
+  "type": "object",
+  "required": ["type"],
+  "additionalProperties": true,
+  "properties": {
+    "schema": {
+      "const": "event/1",
+      "description": "Event contract version. Additive optional fields do not bump it; renamed/removed/retyped fields do."
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "converted",
+        "prompt_preview",
+        "queued",
+        "executing",
+        "execution_cached",
+        "progress",
+        "executed",
+        "execution_error",
+        "output",
+        "state",
+        "login_url",
+        "cancelled"
+      ],
+      "description": "`scalify run` emits converted?/prompt_preview/queued on both targets; its per-node types (executing, execution_cached, progress, executed, output, execution_error) are --where local only, because the cloud run path polls for a terminal record instead of streaming a session. `state` is emitted by `scalify jobs watch --where cloud` for each coarse status transition. This enum is ADVISORY and open-ended: it lists the types this scalify-cli version emits, and adding a type is an additive change that does NOT bump `event/1`. Agents must ignore types they do not recognise rather than treat them as a validation failure — fetch the current schema with `scalify --json discover` instead of pinning this list."
+    },
+    "node": {"type": ["string", "null"]},
+    "title": {"type": ["string", "null"]},
+    "class_type": {"type": ["string", "null"]},
+    "completed": {"type": ["integer", "null"]},
+    "total": {"type": ["integer", "null"]},
+    "prompt_id": {"type": ["string", "null"]},
+    "client_id": {"type": ["string", "null"]},
+    "node_count": {"type": ["integer", "null"], "description": "converted: node count of the client-side converted graph."},
+    "prompt": {"type": ["object", "null"], "description": "prompt_preview: the API-format graph about to be submitted."},
+    "validation_warnings": {
+      "type": ["array", "null"],
+      "items": {"type": "object"},
+      "description": "queued: per-node issues the server reported alongside a successful queue. Always empty on --where cloud, which rejects such a submit outright."
+    },
+    "nodes": {
+      "type": ["array", "null"],
+      "description": "queued: manifest of every node in the submitted graph, as objects (node_id, class_type, title). Also carried by `scalify jobs watch`'s execution_cached event, there as a plain array of node-id strings. The per-type `allOf` below pins which of the two shapes is legal for each event, so a `queued` that regressed to bare id strings still fails validation."
+    },
+    "base_url": {"type": ["string", "null"], "description": "queued, --where cloud only: the cloud endpoint the prompt was submitted to."},
+    "url": {"type": ["string", "null"]}
+  },
+  "allOf": [
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "queued"}}},
+      "then": {
+        "properties": {
+          "nodes": {"type": ["array", "null"], "items": {"type": "object"}}
+        }
+      }
+    },
+    {
+      "if": {"required": ["type"], "properties": {"type": {"const": "execution_cached"}}},
+      "then": {
+        "properties": {
+          "nodes": {"type": ["array", "null"], "items": {"type": "string"}}
+        }
+      }
+    }
+  ]
+}

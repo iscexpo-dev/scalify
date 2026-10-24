@@ -1,0 +1,1240 @@
+"""Tests for the multi-skill installer (no MCP needed)."""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from scalify_cli import knowledge
+from scalify_cli.caller import Caller
+from scalify_cli.output.renderer import OutputMode, Renderer, reset_renderer_for_testing, set_renderer
+from scalify_cli.skills import (
+    RETIRED_SKILLS,
+    bundled_skill_names,
+    default_skill_names,
+    frontmatter_description,
+    install,
+    plan_install,
+    prune_retired,
+    readable_skill_names,
+    reference_skill_names,
+    skill_content,
+    uninstall,
+)
+from scalify_cli.skills.command import app
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _force_json_renderer():
+    """Pin the renderer to JSON so tests can read envelopes off stdout."""
+    r = Renderer.resolve(
+        is_stdout_tty=False,
+        env={},
+        caller=Caller(kind="user", agentic=False, source_env=None),
+        json_flag=True,
+    )
+    r.mode = OutputMode.JSON
+    set_renderer(r)
+    return r
+
+
+# ---------------------------------------------------------------------------
+# Bundled skill inventory
+# ---------------------------------------------------------------------------
+
+
+def test_bundles_expected_skills():
+    names = bundled_skill_names()
+    assert "scalify" in names
+    assert "scalify-debug" in names
+    assert "scalify-relay" in names
+    assert "scalify-director" in names
+    assert "scalify-build" in names
+    assert "scalify-deploy" in names
+
+
+def test_bundled_skills_have_required_frontmatter():
+    for name in readable_skill_names():
+        text = skill_content(name)
+        assert text.startswith("---\n"), f"{name}: missing frontmatter"
+        assert f"name: {name}" in text, f"{name}: frontmatter name doesn't match"
+        assert "description:" in text, f"{name}: frontmatter missing description"
+
+
+# ---------------------------------------------------------------------------
+# Reference skills: resolvable by `show`, never written by `install`
+# ---------------------------------------------------------------------------
+
+
+def test_reference_skills_are_readable():
+    """`scalify skills show <reference>` is the only way to reach the material."""
+    for name in reference_skill_names():
+        assert skill_content(name).strip(), f"{name}: resolved to empty content"
+
+
+def test_a_default_install_writes_no_reference_skill(tmp_path: Path):
+    """The whole point of the split.
+
+    A reference skill written to a target would sit in every agent's context on
+    every task — the cost this mechanism exists to avoid. This is the default
+    set, not an absolute bar: an explicit `skills=[<name>]` or a path token does
+    install one, and `test_uninstalling_a_reference_skill_by_name_is_accepted`
+    covers taking it back off. Checked across all three targets rather than one,
+    because each is written by a different code path.
+    """
+    results = install(scope="project", project_root=tmp_path)
+    written = {r.skill for r in results}
+    leaked = written & set(reference_skill_names())
+    assert not leaked, f"reference skills must not be installed, but install wrote: {sorted(leaked)}"
+
+    for name in reference_skill_names():
+        assert not (tmp_path / f".claude/skills/{name}/SKILL.md").exists()
+        assert not (tmp_path / f".cursor/rules/{name}.mdc").exists()
+    agents = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+    for name in reference_skill_names():
+        assert f"<!-- {name}:start -->" not in agents
+
+
+def test_reference_skills_are_not_in_the_default_install_set():
+    """`default_skill_names()` is what install, uninstall, status and prune all
+    walk, so keeping reference skills out of it is what makes them uninstallable
+    by construction rather than by four separate filters."""
+    assert set(default_skill_names()).isdisjoint(reference_skill_names())
+
+
+def test_reference_skills_are_disjoint_from_retired():
+    """A name in both would be pruned from disk while still being served by
+    `show` — two subsystems disagreeing about whether it exists."""
+    assert set(RETIRED_SKILLS).isdisjoint(reference_skill_names())
+
+
+def test_every_reference_skill_is_cited_by_an_installed_skill():
+    """A reference skill nobody names is unreachable.
+
+    Only installed skills reach an agent's context, so the citation has to come
+    from one of those — a reference skill citing another would be a chain whose
+    first link nothing pulls.
+    """
+    corpus = "\n".join(skill_content(name) for name in bundled_skill_names())
+    for name in reference_skill_names():
+        assert name in corpus, f"{name} is never cited by an installed skill, so nothing would load it"
+
+
+def test_installing_a_reference_skill_by_name_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Refused with the command that does work, rather than silently accepted.
+
+    An agent that reaches for `--skill <reference>` has the right intent and the
+    wrong verb, so the refusal has to name `show` or it just looks like the
+    material is unavailable.
+
+    `install_cmd` takes its project root from `Path.cwd()`, which `CliRunner`
+    does not change, so the chdir is what makes the containment assertion mean
+    anything: without it a regression writes into the checkout being tested.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "AGENTS.md").touch()
+    target = reference_skill_names()[0]
+    runner = CliRunner()
+    result = runner.invoke(app, ["install", "--scope", "project", "--skill", target], catch_exceptions=False)
+
+    assert result.exit_code != 0
+    # Rich wraps the refusal inside a bordered panel, so the message is only a
+    # contiguous string once the borders and wrap points are collapsed away.
+    # The colour codes have to go with them: under a colour-enabled terminal the
+    # border carries its own escapes, which survive collapsing whitespace and
+    # land mid-phrase at exactly the wrap point this assertion spans.
+    flattened = " ".join(_ANSI_RE.sub("", result.output).replace("│", " ").split())
+    assert f"scalify skills show {target}" in flattened, result.output
+    assert not (tmp_path / f".claude/skills/{target}").exists()
+    assert not (tmp_path / f".cursor/rules/{target}.mdc").exists()
+    assert f"<!-- {target}:start -->" not in (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+
+
+def test_uninstalling_a_reference_skill_by_name_is_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The install-side refusal must not strand what an explicit install put down.
+
+    A reference skill only reaches disk when something asked for it by path or
+    through `install()`, and a bare `uninstall` walks `default_skill_names()`,
+    which excludes it — so naming it is the only route left. Refusing the name on
+    both verbs would leave the file there permanently.
+    """
+    monkeypatch.chdir(tmp_path)
+    name = reference_skill_names()[0]
+    install(scope="project", project_root=tmp_path, skills=[name], targets=["claude-code"])
+    installed = tmp_path / ".claude" / "skills" / name / "SKILL.md"
+    assert installed.exists(), "an explicit install() should have written the reference skill"
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["uninstall", "--scope", "project", "--skill", name], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    assert not installed.exists()
+
+
+def test_scalify_skill_content_has_required_sections():
+    text = skill_content("scalify").lower()
+    assert "scalify --json discover" in text
+    assert "routing" in text or "--where" in text
+    assert "nodes ls" in text  # the node introspection surface
+    assert "envelope" in text  # the section that documents the output contract
+
+
+def test_scalify_debug_skill_covers_common_error_codes():
+    text = skill_content("scalify-debug")
+    for code in ("server_not_running", "cloud_not_configured", "workflow_not_api_format", "prompt_rejected"):
+        assert code in text, f"scalify-debug skill should mention {code}"
+
+
+def test_custom_node_skill_snapshot_keeps_runtime_contract():
+    """The product-loaded artifact is a router, not the authoring manual."""
+    router = skill_content("scalify-custom-nodes")
+    assert "knowledge authoring invocation" in router
+    assert "knowledge authoring troubleshooting" in router
+    assert "io.ScalifyNode" not in router
+    # The router grows with the class count — it lists one command and one packaged
+    # fallback per retrieval class — so a flat byte cap goes stale and the next class
+    # gets paid for by squeezing the prose. Bound the fixed prose and the per-class
+    # cost separately instead. Tighter than a flat 2500 at the six classes this
+    # started with; it still has to stay far under `before_body // 3` below.
+    assert len(router.encode()) < 1300 + 160 * len(knowledge.AUTHORING_CLASSES)
+
+    corpus = "\n".join(skill_content(name) for name in reference_skill_names())
+    for needle in (
+        "V1 is legacy but supported",
+        "SEARCH_REQUIRED",
+        "SEARCH_OPTIONAL",
+        "SEARCH_AVOID",
+        "reference fidelity is unverified",
+        "Cloud-incompatible",
+        "filesystem presence is never proof",
+        "Do not promise hot reload",
+        "scalify node publish --token",
+        "WEB_DIRECTORY",
+        "node_replacement",
+        "Never put credentials in widget values",
+        "object_info_stale",
+        "never compares equal to itself",
+    ):
+        assert needle in corpus
+
+
+def test_custom_node_validation_names_what_to_refresh():
+    """A bare "restart ScalifyUI and refresh" reads as "reload the browser tab"
+    or "run `scalify nodes refresh`"; neither re-reads `/object_info`."""
+    text = " ".join(skill_content("scalify-custom-nodes-validation").split())
+    assert not re.search(r"(?i)restart(ed)?,? (scalifyui )?(and )?refresh\b", text)
+    assert not re.search(r"(?i)(refresh|reload)(ing)? (the |your )?(scalifyui )?(browser|page|tab)\b", text)
+    assert "restart ScalifyUI and re-run that command" in text
+    assert "`scalify nodes refresh` re-pulls annotations, not `/object_info`" in text
+    assert "browser reload changes neither" in text
+
+
+def test_custom_node_search_routes_have_positive_and_negative_controls():
+    """A search cue without an avoid control teaches indiscriminate search."""
+    text = skill_content("scalify-custom-nodes-search")
+    for route in ("SEARCH_REQUIRED", "SEARCH_OPTIONAL", "SEARCH_AVOID"):
+        assert route in text
+    assert "self-contained" in text
+    assert "untrusted" in text
+
+
+def test_custom_node_caching_fallback_states_the_silent_failure_mode():
+    """The two facts an author cannot read off their own node's source.
+
+    A signature that raises is swallowed into a NaN, so the symptom is endless
+    recomputation and never a crash — saying "crash" sends the author looking
+    for a traceback that is never emitted. And `rawLink` is the one input mode
+    where a linked input is not `None`, so a flat "every linked input is None"
+    is the wrong contract for it.
+    """
+    text = " ".join(skill_content("scalify-custom-nodes-caching").split())
+    assert "never compares equal to itself" in text
+    assert "recomputes every run" in text
+    assert not re.search(r"(?i)\bis (therefore )?a crash\b", text)
+    assert "rawLink" in text
+    assert "every ancestor's signature" in text
+
+
+def test_custom_node_caching_fallback_names_the_hiddens_that_are_not_populated():
+    """The signature pass is not an execution pass, so most hiddens are empty.
+
+    `IsChangedCache.get` calls `get_input_data(node["inputs"], class_def, node_id, None)`
+    with no `dynprompt` and no `extra_data`, so `PROMPT` is `{}` and `DYNPROMPT`,
+    `EXTRA_PNGINFO`, `EXECUTION_LIST` and the auth-token hiddens are `None`. Only
+    `UNIQUE_ID` is real. An author told "hidden inputs are real" fingerprints a
+    constant and ships the stale-output bug this slice exists to prevent.
+    """
+    text = " ".join(skill_content("scalify-custom-nodes-caching").split())
+    assert "UNIQUE_ID" in text
+    assert "`PROMPT` arrives as `{}`" in text
+    assert not re.search(r"(?i)hidden inputs are real", text)
+
+
+def test_custom_node_caching_fallback_qualifies_size_and_mtime_with_a_digest():
+    """Size plus mtime misses a same-size in-place rewrite; core hashes contents."""
+    text = " ".join(skill_content("scalify-custom-nodes-caching").split())
+    assert "content digest" in text
+    assert "LoadImage" in text
+
+
+def test_custom_node_caching_fallback_states_what_to_hashable_accepts():
+    """`to_hashable` takes scalars, Mapping and Sequence; anything else is a sentinel."""
+    text = " ".join(skill_content("scalify-custom-nodes-caching").split())
+    assert "unhashable sentinel" in text
+    assert not re.search(r"(?i)containers of those", text)
+
+
+def test_custom_node_initial_context_and_jit_budget_fixture():
+    """Measured fixture: unrelated turns pay only for the small router."""
+    fixture = json.loads((Path(__file__).parent / "fixtures/custom_node_context_budget.json").read_text())
+    router = skill_content("scalify-custom-nodes")
+    names = [name for name in reference_skill_names() if name.startswith("scalify-custom-nodes-")]
+    slices = [skill_content(name) for name in names]
+    before_body = fixture["initial_context"]["before"]["bytes"]
+    initial_bytes = len(router.encode())
+    assert initial_bytes == fixture["initial_context"]["after"]["bytes"]
+    assert len(router.split()) == fixture["initial_context"]["after"]["tokens"]
+    jit_bytes = [len(body.encode()) for body in slices]
+    fixture_order = (
+        "invocation",
+        "ecosystem-reference",
+        "api-schema",
+        "validation",
+        "dependencies-capabilities",
+        "troubleshooting",
+        "packaging-publishing",
+        "frontend-extension",
+        "v1-to-v3-migration",
+        "execution-caching",
+    )
+    assert sorted(jit_bytes) == sorted(fixture["jit_added"][key]["bytes"] for key in fixture_order)
+    assert initial_bytes < before_body // 3
+    assert max(jit_bytes) < before_body // 3
+    assert all(body not in router for body in slices)
+
+
+def test_loaded_custom_node_skill_routes_without_preloading_authoring_body(tmp_path: Path):
+    """Mutation-sensitive product path: inspect what a real default install writes."""
+    install(scope="project", project_root=tmp_path, targets=["claude-code"])
+    loaded = (tmp_path / ".claude/skills/scalify-custom-nodes/SKILL.md").read_text()
+    assert "knowledge authoring invocation" in loaded
+    assert "knowledge authoring validation" in loaded
+    assert "io.ScalifyNode" not in loaded
+
+    mutated = loaded.replace("knowledge authoring invocation", "knowledge model invocation")
+    assert "knowledge authoring invocation" in loaded
+    assert "knowledge authoring invocation" not in mutated
+
+
+def test_scalify_skill_covers_cloud_setup_and_routing():
+    # Cloud guidance was folded into the consolidated `scalify` skill's
+    # "Cloud" gotchas section when the standalone scalify-cloud skill was retired.
+    text = skill_content("scalify")
+    for needle in ("scalify cloud login", "cloud set-base-url", "--where cloud"):
+        assert needle in text, f"scalify skill should mention {needle}"
+
+
+def test_bundled_frontmatter_parses_as_yaml():
+    """Substring checks pass on frontmatter that no YAML parser will read.
+
+    Claude Code parses the block this writes to ``.claude/skills/<name>/SKILL.md``,
+    so an unquoted ``description`` carrying a ``": "`` loads here and fails there.
+    """
+    import yaml
+
+    for name in bundled_skill_names():
+        front = skill_content(name).split("---\n", 2)[1]
+        parsed = yaml.safe_load(front)
+        assert parsed["name"] == name, f"{name}: frontmatter name doesn't match"
+        assert parsed["description"].strip(), f"{name}: frontmatter description is empty"
+
+
+def test_quoted_description_reads_back_without_its_quotes():
+    """A description quoted to carry a ``": "`` must not render with the quotes."""
+    quoted = '---\nname: x\ndescription: "Do a thing with scalify-cli: turn it on."\n---\n\nBody.\n'
+    assert frontmatter_description(quoted) == "Do a thing with scalify-cli: turn it on."
+
+
+def test_bundled_description_reads_back_unquoted():
+    """The real value that broke, not a stand-in.
+
+    ``scalify-build``'s description is quoted in its frontmatter because it carries
+    a ``": "``. Dropping the YAML read would render those quotes to the user, and
+    a synthetic fixture would not notice.
+    """
+    desc = frontmatter_description(skill_content("scalify-build"))
+    assert desc.startswith("Build a custom ScalifyUI environment"), desc
+    assert not desc.startswith('"'), "the frontmatter quotes leaked into the description"
+
+
+def test_installed_skill_file_parses_as_yaml(tmp_path: Path):
+    """Claude Code reads the file install() writes, not the one in the package."""
+    import yaml
+
+    install(scope="project", project_root=tmp_path, targets=["claude-code"])
+    for name in bundled_skill_names():
+        front = (tmp_path / f".claude/skills/{name}/SKILL.md").read_text(encoding="utf-8").split("---\n", 2)[1]
+        assert yaml.safe_load(front)["name"] == name
+
+
+def test_path_installed_skill_is_current_not_stale(tmp_path: Path):
+    """A skill with no bundled copy to compare against must not be stale for ever."""
+    name = "my-skill"
+    skill_dir = tmp_path / name
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(f"---\nname: {name}\ndescription: Local.\n---\n\nLocal.\n", "utf-8")
+    target = tmp_path / "target"
+    target.mkdir()
+
+    install(scope="project", project_root=target, skills=[str(skill_dir)], targets=["claude-code"])
+
+    from scalify_cli.skills import _compute_skill_state, read_manifest
+
+    installed = target / ".claude" / "skills" / name / "SKILL.md"
+    assert _compute_skill_state(installed, name, read_manifest()) == "current"
+
+
+def test_one_unwritable_target_skips_only_itself(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """One failure skips one target; every other target still lands."""
+    import scalify_cli.skills as skills_pkg
+
+    def boom(path, content, *, skill_name):
+        raise OSError(f"[Errno 13] Permission denied: {path}")
+
+    monkeypatch.setattr(skills_pkg, "_write_cursor_rule", boom)
+
+    results = install(scope="project", project_root=tmp_path)
+    by_kind: dict[str, set[str]] = {}
+    for r in results:
+        by_kind.setdefault(r.kind, set()).add(r.action)
+
+    assert by_kind["cursor"] == {"skipped"}
+    assert by_kind["claude-code"] == {"wrote"}, "a failing cursor write must not abort the rest"
+    assert by_kind["agents-md"] == {"wrote"}
+    assert len([r for r in results if r.action == "skipped"]) == len(bundled_skill_names())
+
+
+def test_description_is_read_the_way_the_agent_host_reads_it():
+    """A ``#`` after a space opens a YAML comment, and the description stops there.
+
+    The regex this replaced returned the whole line, which disagreed with what
+    Claude Code and Cursor show, since both parse the frontmatter as YAML. Losing
+    the tail is the point: what ``scalify skills list`` prints is now what the agent
+    host actually got.
+    """
+    doc = "---\nname: x\ndescription: Costs 50% # careful with quotas\n---\n\nBody.\n"
+    assert frontmatter_description(doc) == "Costs 50%"
+
+
+def test_scalify_skill_routes_to_every_sibling():
+    """The driver skill tells an agent which siblings to skim, so it must name them all."""
+    text = skill_content("scalify")
+    for name in bundled_skill_names():
+        if name != "scalify":
+            assert f"`{name}`" in text, f"scalify skill should route to {name}"
+
+
+def test_scalify_build_skill_covers_the_build_group():
+    """The three verbs a build cannot be produced without: write the spec, send
+    it, cut it. `test_no_mentions_of_nonexistent_commands` resolves every
+    mention against the live Typer tree, so these two guards together mean the
+    skill names the real path and only the real path."""
+    text = skill_content("scalify-build")
+    for needle in ("scalify build init", "scalify build push", "scalify build release"):
+        assert needle in text, f"scalify-build skill should mention {needle}"
+
+
+def test_scalify_deploy_skill_covers_the_deploy_group():
+    """The verbs a deployment cannot be created, inspected, or ended without.
+
+    `stop` earns its place here rather than being one verb among many: a
+    deployment bills until something ends it, so a skill that can raise compute
+    and not give it back is the one shape of incompleteness that costs money.
+    `test_no_mentions_of_nonexistent_commands` resolves every mention against the
+    live Typer tree, so these two guards together mean the skill names the real
+    path and only the real path.
+    """
+    text = skill_content("scalify-deploy")
+    for needle in ("scalify deploy up", "scalify deploy run", "scalify deploy status", "scalify deploy stop"):
+        assert needle in text, f"scalify-deploy skill should mention {needle}"
+
+
+def test_build_and_deploy_skills_hand_off_to_each_other():
+    """Splitting one skill in two only works if each names the other.
+
+    The build skill stops at a green release and the deploy skill assumes one, so
+    the seam between them is the exact point an agent needs the pointer — and it
+    is invisible to `test_scalify_skill_routes_to_every_sibling`, which only checks
+    the driver skill.
+    """
+    assert "scalify-deploy" in skill_content("scalify-build"), "scalify-build should hand off to scalify-deploy"
+    assert "scalify-build" in skill_content("scalify-deploy"), "scalify-deploy should point back at scalify-build"
+
+
+def test_skill_content_rejects_unknown_name():
+    with pytest.raises(ValueError) as exc:
+        skill_content("not-a-real-skill")
+    assert "not-a-real-skill" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Planning
+# ---------------------------------------------------------------------------
+
+
+def test_plan_install_default_covers_every_skill_and_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    plans = plan_install(scope="user", project_root=tmp_path / "anywhere")
+    skill_target_pairs = {(p.skill, p.kind) for p in plans}
+    expected = {(name, kind) for name in default_skill_names() for kind in ("claude-code", "cursor", "agents-md")}
+    assert skill_target_pairs == expected
+
+
+def test_plan_install_project_scope_paths(tmp_path: Path):
+    plans = plan_install(scope="project", project_root=tmp_path, skills=["scalify-debug"])
+    paths = {p.kind: p.path for p in plans}
+    assert paths["claude-code"] == tmp_path / ".claude" / "skills" / "scalify-debug" / "SKILL.md"
+    assert paths["cursor"] == tmp_path / ".cursor" / "rules" / "scalify-debug.mdc"
+    assert paths["agents-md"] == tmp_path / "AGENTS.md"
+
+
+def test_plan_install_filters_by_skill(tmp_path: Path):
+    plans = plan_install(scope="project", project_root=tmp_path, skills=["scalify", "scalify-debug"])
+    assert {p.skill for p in plans} == {"scalify", "scalify-debug"}
+
+
+# ---------------------------------------------------------------------------
+# Install
+# ---------------------------------------------------------------------------
+
+
+def test_install_writes_every_skill_to_every_target(tmp_path: Path):
+    results = install(scope="project", project_root=tmp_path)
+    for r in results:
+        assert r.action == "wrote", f"unexpected action for {r.skill}/{r.kind}: {r.action}"
+        assert r.path.exists()
+
+    for name in bundled_skill_names():
+        claude = (tmp_path / f".claude/skills/{name}/SKILL.md").read_text(encoding="utf-8")
+        assert claude.startswith("---\n")
+        assert f"name: {name}" in claude
+
+        cursor = (tmp_path / f".cursor/rules/{name}.mdc").read_text(encoding="utf-8")
+        assert "alwaysApply: false" in cursor
+
+    agents_md = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+    for name in bundled_skill_names():
+        assert f"<!-- {name}:start -->" in agents_md
+        assert f"<!-- {name}:end -->" in agents_md
+
+
+def test_install_one_skill_only(tmp_path: Path):
+    install(scope="project", project_root=tmp_path, skills=["scalify-debug"])
+    assert (tmp_path / ".claude/skills/scalify-debug/SKILL.md").exists()
+    assert not (tmp_path / ".claude/skills/scalify/SKILL.md").exists()
+    assert not (tmp_path / ".claude/skills/scalify-relay/SKILL.md").exists()
+    agents = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+    assert "<!-- scalify-debug:start -->" in agents
+    assert "<!-- scalify:start -->" not in agents
+    assert "<!-- scalify-relay:start -->" not in agents
+
+
+def test_install_is_idempotent_across_skills(tmp_path: Path):
+    install(scope="project", project_root=tmp_path)
+    install(scope="project", project_root=tmp_path)
+    agents_md = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+    for name in bundled_skill_names():
+        assert agents_md.count(f"<!-- {name}:start -->") == 1
+        assert agents_md.count(f"<!-- {name}:end -->") == 1
+
+
+def test_install_preserves_existing_agents_md_content(tmp_path: Path):
+    (tmp_path / "AGENTS.md").write_text("# My project agent notes\n\nKeep this.\n", encoding="utf-8")
+    install(scope="project", project_root=tmp_path, targets=["agents-md"])
+    text = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+    assert "# My project agent notes" in text
+    assert "Keep this." in text
+
+
+def test_dry_run_does_not_touch_disk(tmp_path: Path):
+    results = install(scope="project", project_root=tmp_path, dry_run=True)
+    for r in results:
+        assert r.action == "would_write"
+        assert not r.path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Uninstall
+# ---------------------------------------------------------------------------
+
+
+def test_uninstall_removes_all_skills_and_keeps_other_agents_md(tmp_path: Path):
+    (tmp_path / "AGENTS.md").write_text("# keep me\n\n", encoding="utf-8")
+    install(scope="project", project_root=tmp_path)
+    for name in bundled_skill_names():
+        assert (tmp_path / f".claude/skills/{name}/SKILL.md").exists()
+
+    uninstall(scope="project", project_root=tmp_path)
+    for name in bundled_skill_names():
+        assert not (tmp_path / f".claude/skills/{name}/SKILL.md").exists()
+        assert not (tmp_path / f".cursor/rules/{name}.mdc").exists()
+
+    agents_md = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+    assert "# keep me" in agents_md
+    for name in bundled_skill_names():
+        assert f"<!-- {name}:start -->" not in agents_md
+
+
+def test_uninstall_can_target_one_skill(tmp_path: Path):
+    install(scope="project", project_root=tmp_path)
+    uninstall(scope="project", project_root=tmp_path, skills=["scalify-debug"])
+    assert not (tmp_path / ".claude/skills/scalify-debug/SKILL.md").exists()
+    assert (tmp_path / ".claude/skills/scalify/SKILL.md").exists()
+    assert (tmp_path / ".claude/skills/scalify-relay/SKILL.md").exists()
+
+
+def test_uninstall_is_safe_on_clean_tree(tmp_path: Path):
+    results = uninstall(scope="project", project_root=tmp_path)
+    for r in results:
+        assert r.action in {"absent", "removed"}
+
+
+# ---------------------------------------------------------------------------
+# Backup / atomic-write contracts (kept from the original)
+# ---------------------------------------------------------------------------
+
+
+def test_install_backs_up_user_edited_skill_md(tmp_path: Path):
+    skill_path = tmp_path / ".claude/skills/scalify/SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text("# my custom edits, please preserve me\n", encoding="utf-8")
+
+    install(scope="project", project_root=tmp_path, skills=["scalify"], targets=["claude-code"])
+
+    backups = list(skill_path.parent.glob("SKILL.md.*.bak"))
+    assert len(backups) == 1, f"expected exactly one backup, got {backups}"
+    assert "my custom edits" in backups[0].read_text(encoding="utf-8")
+    assert "my custom edits" not in skill_path.read_text(encoding="utf-8")
+
+
+def test_install_does_not_back_up_identical_content(tmp_path: Path):
+    install(scope="project", project_root=tmp_path, skills=["scalify"], targets=["claude-code"])
+    skill_path = tmp_path / ".claude/skills/scalify/SKILL.md"
+    install(scope="project", project_root=tmp_path, skills=["scalify"], targets=["claude-code"])
+    assert list(skill_path.parent.glob("SKILL.md.*.bak")) == []
+
+
+def test_install_atomic_write_does_not_leave_partial_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    skill_path = tmp_path / ".claude/skills/scalify/SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text("original\n", encoding="utf-8")
+
+    import os as real_os
+
+    real_replace = real_os.replace
+
+    def boom(src, dst):
+        raise OSError("simulated kill -9 between write and rename")
+
+    monkeypatch.setattr("scalify_cli.skills.os.replace", boom)
+
+    results = install(scope="project", project_root=tmp_path, skills=["scalify"], targets=["claude-code"])
+
+    assert results[0].action == "skipped"
+    assert skill_path.read_text(encoding="utf-8") == "original\n"
+    leftover = list(skill_path.parent.glob("*.tmp"))
+    assert leftover == [], f"tmp not cleaned: {leftover}"
+    monkeypatch.setattr("scalify_cli.skills.os.replace", real_replace)
+
+
+# ---------------------------------------------------------------------------
+# Retired-skill pruning (10 → 4 convergence)
+# ---------------------------------------------------------------------------
+
+
+def test_retired_and_bundled_are_disjoint():
+    assert set(RETIRED_SKILLS).isdisjoint(set(bundled_skill_names()))
+
+
+def _seed_retired_orphan(root: Path, name: str) -> tuple[Path, Path, Path]:
+    """Write a stale orphan for `name` across all three targets."""
+    claude = root / ".claude" / "skills" / name / "SKILL.md"
+    cursor = root / ".cursor" / "rules" / f"{name}.mdc"
+    agents = root / "AGENTS.md"
+    claude.parent.mkdir(parents=True, exist_ok=True)
+    cursor.parent.mkdir(parents=True, exist_ok=True)
+    claude.write_text("stale\n", encoding="utf-8")
+    cursor.write_text("stale\n", encoding="utf-8")
+    agents.write_text(f"# keep me\n\n<!-- {name}:start -->\nstale\n<!-- {name}:end -->\n", encoding="utf-8")
+    return claude, cursor, agents
+
+
+def test_prune_retired_removes_orphans(tmp_path: Path):
+    name = RETIRED_SKILLS[0]
+    claude, cursor, agents = _seed_retired_orphan(tmp_path, name)
+
+    results = prune_retired(scope="project", project_root=tmp_path)
+
+    assert not claude.exists()
+    assert not claude.parent.exists()  # empty <name>/ dir cleaned up too
+    assert not cursor.exists()
+    agents_text = agents.read_text(encoding="utf-8")
+    assert f"<!-- {name}:start -->" not in agents_text
+    assert "# keep me" in agents_text  # unrelated content preserved
+    removed = {(r.skill, r.kind) for r in results if r.action == "removed"}
+    assert (name, "claude-code") in removed
+    assert (name, "cursor") in removed
+    assert (name, "agents-md") in removed
+
+
+def test_prune_retired_is_absent_on_clean_tree(tmp_path: Path):
+    results = prune_retired(scope="project", project_root=tmp_path)
+    assert results, "should still report a plan per retired skill/target"
+    assert all(r.action == "absent" for r in results)
+
+
+def test_prune_retired_dry_run_does_not_delete(tmp_path: Path):
+    name = RETIRED_SKILLS[0]
+    claude, _cursor, _agents = _seed_retired_orphan(tmp_path, name)
+
+    results = prune_retired(scope="project", project_root=tmp_path, dry_run=True)
+
+    assert claude.exists(), "dry-run must not delete"
+    assert any(r.action == "would_remove" for r in results)
+
+
+def test_install_converges_old_machine(tmp_path: Path):
+    # Simulate a machine that installed a now-retired skill, then reinstall the
+    # current bundle and prune in one pass (as the install command does).
+    name = RETIRED_SKILLS[0]
+    claude, cursor, _agents = _seed_retired_orphan(tmp_path, name)
+
+    prune_retired(scope="project", project_root=tmp_path)
+    install(scope="project", project_root=tmp_path)
+
+    assert not claude.exists()
+    assert not cursor.exists()
+    for current in bundled_skill_names():
+        assert (tmp_path / ".claude" / "skills" / current / "SKILL.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# Path-based (third-party) skill install
+# ---------------------------------------------------------------------------
+
+
+def test_install_accepts_directory_path(tmp_path: Path):
+    """--skill ./my-skill/ (dir containing SKILL.md) installs a third-party skill."""
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    skill_content_text = "---\nname: my-skill\ndescription: Test skill.\n---\n\n# My Skill\nBody.\n"
+    (skill_dir / "SKILL.md").write_text(skill_content_text, encoding="utf-8")
+
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+
+    results = install(
+        scope="project",
+        project_root=target_root,
+        skills=[str(skill_dir)],
+        targets=["claude-code"],
+    )
+    assert results, "expected at least one result"
+    assert results[0].action == "wrote"
+
+    installed_path = target_root / ".claude" / "skills" / "my-skill" / "SKILL.md"
+    assert installed_path.exists(), f"expected SKILL.md at {installed_path}"
+    assert installed_path.read_text(encoding="utf-8") == skill_content_text
+
+
+def test_install_rejects_path_with_mismatched_name(tmp_path: Path):
+    """frontmatter name must match the directory name."""
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("---\nname: other-name\ndescription: d.\n---\nBody.\n", encoding="utf-8")
+    from scalify_cli.skills import load_skill_source
+
+    with pytest.raises(ValueError, match="other-name"):
+        load_skill_source(str(skill_dir))
+
+
+def test_skills_validate_command(tmp_path: Path):
+    """scalify skills validate <path> returns ok:true for a well-formed skill."""
+    import json
+
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: my-skill\ndescription: Test skill.\n---\n\n# My Skill\nBody.\n",
+        encoding="utf-8",
+    )
+
+    _force_json_renderer()
+    try:
+        runner = CliRunner()
+        result = runner.invoke(app, ["validate", str(skill_dir)])
+        assert result.exit_code == 0, f"expected exit 0, got {result.exit_code}\noutput: {result.output}"
+
+        # Last non-empty line is the envelope.
+        lines = [line for line in result.output.splitlines() if line.strip()]
+        envelope = json.loads(lines[-1])
+        assert envelope["ok"] is True
+        assert envelope["data"]["valid"] is True
+        assert envelope["data"]["name"] == "my-skill"
+    finally:
+        reset_renderer_for_testing()
+
+
+# ---------------------------------------------------------------------------
+# Security: slug guard — name must be a simple slug, no path traversal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad_name", ["../../evil", "/tmp/evil", "a/b", "a\\b", ".hidden", ".."])
+def test_load_skill_source_rejects_non_slug_names(tmp_path, bad_name):
+    """Frontmatter name must be a simple slug — traversal/absolute names are rejected
+    even when the token is a direct SKILL.md file path (no dir-match check applies)."""
+    from scalify_cli.skills import load_skill_source
+
+    md = tmp_path / "SKILL.md"
+    md.write_text(f"---\nname: {bad_name}\ndescription: d.\n---\nBody.\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="simple slug"):
+        load_skill_source(str(md))
+
+
+def test_load_skill_source_accepts_slug_names(tmp_path):
+    from scalify_cli.skills import load_skill_source
+
+    md = tmp_path / "SKILL.md"
+    md.write_text("---\nname: anime-video_v2\ndescription: d.\n---\nBody.\n", encoding="utf-8")
+    assert load_skill_source(str(md)).name == "anime-video_v2"
+
+
+def test_validate_command_rejects_evil_name(tmp_path: Path):
+    """scalify skills validate must exit 1 and emit skill_invalid for a traversal name."""
+    import json
+
+    md = tmp_path / "SKILL.md"
+    md.write_text("---\nname: ../../evil\ndescription: d.\n---\nBody.\n", encoding="utf-8")
+
+    _force_json_renderer()
+    try:
+        runner = CliRunner()
+        result = runner.invoke(app, ["validate", str(md)])
+        assert result.exit_code == 1, f"expected exit 1, got {result.exit_code}\noutput: {result.output}"
+
+        lines = [line for line in result.output.splitlines() if line.strip()]
+        envelope = json.loads(lines[-1])
+        assert envelope["ok"] is False
+        assert envelope["error"]["code"] == "skill_invalid"
+    finally:
+        reset_renderer_for_testing()
+
+
+# ---------------------------------------------------------------------------
+# Manifest (provenance + staleness) — Task 9
+# ---------------------------------------------------------------------------
+
+
+def test_install_records_manifest(tmp_path: Path):
+    """Installing writes a manifest entry: target path -> {skill, sha256, cli_version}."""
+    import hashlib
+
+    from scalify_cli.skills import manifest_path, read_manifest, skill_content
+
+    results = install(scope="project", project_root=tmp_path, skills=["scalify-debug"], targets=["claude-code"])
+    assert results[0].action == "wrote"
+
+    mpath = manifest_path()
+    assert mpath.exists(), f"manifest file not created at {mpath}"
+    manifest = read_manifest()
+
+    installed_path = str(tmp_path / ".claude" / "skills" / "scalify-debug" / "SKILL.md")
+    assert installed_path in manifest, f"manifest missing entry for {installed_path}"
+    entry = manifest[installed_path]
+    assert entry["skill"] == "scalify-debug"
+    assert "sha256" in entry
+    assert "cli_version" in entry
+
+    expected_sha = hashlib.sha256(skill_content("scalify-debug").encode("utf-8")).hexdigest()
+    assert entry["sha256"] == expected_sha
+
+
+def test_prune_skips_unmanaged_files(tmp_path: Path):
+    """A user-authored skill at a retired-name path is NOT deleted by prune when manifest exists."""
+    from scalify_cli.skills import manifest_path, write_manifest
+
+    # Seed a file at a retired-skill path but do NOT put it in the manifest.
+    retired_name = RETIRED_SKILLS[0]
+    claude_path = tmp_path / ".claude" / "skills" / retired_name / "SKILL.md"
+    claude_path.parent.mkdir(parents=True, exist_ok=True)
+    claude_path.write_text("# user-authored content — must survive\n", encoding="utf-8")
+
+    # Write a manifest that exists but does NOT contain this path.
+    mpath = manifest_path()
+    mpath.parent.mkdir(parents=True, exist_ok=True)
+    write_manifest({"some/other/path": {"skill": "scalify", "sha256": "abc", "cli_version": "0.0.0"}})
+
+    # Run prune — manifest exists but doesn't record this file as scalify-managed.
+    results = prune_retired(scope="project", project_root=tmp_path, targets=["claude-code"])
+
+    assert claude_path.exists(), "prune must NOT delete unmanaged files when manifest exists"
+    result_for_name = [r for r in results if r.skill == retired_name and r.kind == "claude-code"]
+    assert result_for_name, "should still report a result for the retired skill"
+    assert result_for_name[0].action == "absent"
+
+
+def test_status_reports_stale_and_modified(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """status distinguishes current / stale (bundled content moved on) / modified (user edited)."""
+    import hashlib
+    import json as _json
+
+    from scalify_cli.skills import read_manifest, write_manifest
+    from scalify_cli.skills.command import app
+
+    # status_cmd resolves project_root from Path.cwd() — point it at tmp_path.
+    monkeypatch.chdir(tmp_path)
+
+    runner = CliRunner()
+
+    def _invoke_status():
+        """Re-arm the JSON renderer for each CliRunner invocation (each creates a new stdout)."""
+        _force_json_renderer()
+        try:
+            result = runner.invoke(app, ["status", "--scope", "project"])
+        finally:
+            reset_renderer_for_testing()
+        return result
+
+    try:
+        # Step 1: install scalify-debug into claude-code only, then check status.
+        install(scope="project", project_root=tmp_path, skills=["scalify-debug"], targets=["claude-code"])
+        result = _invoke_status()
+        assert result.exit_code == 0, result.output
+        lines = [ln for ln in result.output.splitlines() if ln.strip()]
+        envelope = _json.loads(lines[-1])
+        rows = envelope["data"]["targets"]
+        debug_row = next((r for r in rows if r["skill"] == "scalify-debug" and r["kind"] == "claude-code"), None)
+        assert debug_row is not None
+        assert debug_row["state"] == "current"
+
+        # Step 2: edit the installed file — state should become 'modified'.
+        installed_path = tmp_path / ".claude" / "skills" / "scalify-debug" / "SKILL.md"
+        installed_path.write_text(installed_path.read_text(encoding="utf-8") + "\n# user edit\n", encoding="utf-8")
+
+        result2 = _invoke_status()
+        assert result2.exit_code == 0, result2.output
+        lines2 = [ln for ln in result2.output.splitlines() if ln.strip()]
+        envelope2 = _json.loads(lines2[-1])
+        rows2 = envelope2["data"]["targets"]
+        debug_row2 = next((r for r in rows2 if r["skill"] == "scalify-debug" and r["kind"] == "claude-code"), None)
+        assert debug_row2 is not None
+        assert debug_row2["state"] == "modified"
+
+        # Step 3: restore the file to bundled content but with an old (stale) manifest hash.
+        # file sha == manifest sha != bundled sha  →  state == 'stale'
+        stale_content = "# stale version of the skill\n"
+        installed_path.write_text(stale_content, encoding="utf-8")
+        manifest = read_manifest()
+        manifest[str(installed_path)] = {
+            "skill": "scalify-debug",
+            "sha256": hashlib.sha256(stale_content.encode("utf-8")).hexdigest(),
+            "cli_version": "0.0.0",
+        }
+        write_manifest(manifest)
+
+        result3 = _invoke_status()
+        assert result3.exit_code == 0, result3.output
+        lines3 = [ln for ln in result3.output.splitlines() if ln.strip()]
+        envelope3 = _json.loads(lines3[-1])
+        rows3 = envelope3["data"]["targets"]
+        debug_row3 = next((r for r in rows3 if r["skill"] == "scalify-debug" and r["kind"] == "claude-code"), None)
+        assert debug_row3 is not None
+        assert debug_row3["state"] == "stale"
+    finally:
+        reset_renderer_for_testing()
+
+
+# ---------------------------------------------------------------------------
+# Cursor rules carry the skill's own description
+# ---------------------------------------------------------------------------
+
+
+def test_cursor_rule_uses_the_skill_frontmatter_description(tmp_path: Path):
+    """Cursor decides whether to surface a rule from this line, so it has to be
+    the skill's real description rather than a generic label."""
+    install(scope="project", project_root=tmp_path, targets=["cursor"])
+
+    def _described(name: str) -> str:
+        rule = (tmp_path / f".cursor/rules/{name}.mdc").read_text(encoding="utf-8")
+        return json.loads(next(ln for ln in rule.splitlines() if ln.startswith("description:"))[len("description: ") :])
+
+    for name in bundled_skill_names():
+        assert _described(name) == frontmatter_description(skill_content(name))
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Build: a build, then deploy it.",
+        "#1 way to break YAML",
+        'Say "hello" to the parser',
+        "Costs 50% @ {runtime}: careful",
+    ],
+)
+def test_cursor_rule_frontmatter_parses_for_any_description(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, description: str
+):
+    """A skill's description is its own text, and a path-installed skill's is not
+    ours to constrain, so the rule has to stay loadable whatever it contains."""
+    yaml = pytest.importorskip("yaml")
+
+    skill_dir = tmp_path / "my-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: my-skill\ndescription: {description}\n---\n\nBody.\n", encoding="utf-8"
+    )
+    target = tmp_path / "target"
+    target.mkdir()
+
+    install(scope="project", project_root=target, skills=[str(skill_dir)], targets=["cursor"])
+
+    rule = (target / ".cursor/rules/my-skill.mdc").read_text(encoding="utf-8")
+    front = rule.split("---\n")[1]
+    assert yaml.safe_load(front)["description"] == description
+
+
+def test_cursor_description_falls_back_when_frontmatter_has_none(tmp_path: Path):
+    from scalify_cli.skills import _cursor_description_for
+
+    assert _cursor_description_for("x", "# no frontmatter\n") == "scalify CLI skill: x"
+
+
+# ---------------------------------------------------------------------------
+# Token resolution — the default set is names, never paths
+# ---------------------------------------------------------------------------
+
+
+def test_cwd_directory_named_like_a_skill_does_not_shadow_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Every ScalifyUI checkout has a `scalify/` directory, and `scalify` is a skill.
+
+    Resolving the default set by path would make a plain install crash there, or
+    quietly install whatever that directory contained into the user's agent config.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "scalify").mkdir()
+    (tmp_path / "scalify" / "SKILL.md").write_text(
+        "---\nname: scalify\ndescription: Impostor.\n---\n\nNot the bundled skill.\n", encoding="utf-8"
+    )
+    target = tmp_path / "target"
+    target.mkdir()
+
+    results = install(scope="project", project_root=target, targets=["claude-code"])
+
+    assert all(r.action == "wrote" for r in results), [r for r in results if r.action != "wrote"]
+    installed = (target / ".claude/skills/scalify/SKILL.md").read_text(encoding="utf-8")
+    assert installed == skill_content("scalify")
+    assert "Impostor" not in installed
+
+
+def test_plan_and_install_agree_on_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Both go through one resolution, so a name can never appear in one and not the other."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "scalify").mkdir()
+    planned = {p.skill for p in plan_install(scope="project", project_root=tmp_path / "t")}
+    installed = {r.skill for r in install(scope="project", project_root=tmp_path / "t", dry_run=True)}
+    assert planned == installed == set(default_skill_names())
+
+
+def test_manifest_entry_carries_exactly_skill_sha_and_version(tmp_path: Path):
+    """The manifest row is these three fields and nothing else.
+
+    It used to grow a ``source`` key for a skill fetched from another repository.
+    Asserting the absence of that key would now pass for any input, so pin the
+    whole shape instead.
+    """
+    from scalify_cli.skills import read_manifest
+
+    name = "my-skill"
+    skill_dir = tmp_path / name
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(f"---\nname: {name}\ndescription: Local.\n---\n\nLocal.\n", "utf-8")
+    target = tmp_path / "target"
+    target.mkdir()
+
+    install(scope="project", project_root=target, skills=[str(skill_dir)], targets=["claude-code"])
+
+    entry = read_manifest()[str(target / ".claude" / "skills" / name / "SKILL.md")]
+    assert set(entry) == {"skill", "sha256", "cli_version"}
+
+
+def test_description_is_read_from_frontmatter_only():
+    """A `description:` line in the body documents something else."""
+    body_only = "# No frontmatter\n\ndescription: not mine\n"
+    assert frontmatter_description(body_only) == ""
+
+    with_example = (
+        "---\nname: x\ndescription: The real one.\n---\n\n"
+        "Example config:\n\n```yaml\ndescription: an example, not this skill\n```\n"
+    )
+    assert frontmatter_description(with_example) == "The real one."
+
+
+# ---------------------------------------------------------------------------
+# Security: a path cannot take over a name the CLI ships
+# ---------------------------------------------------------------------------
+
+
+def _install_cli(monkeypatch, cwd: Path, *args: str):
+    """Run `scalify skills <args>` from `cwd` with the JSON renderer; return (result, last envelope)."""
+    monkeypatch.chdir(cwd)
+    _force_json_renderer()
+    try:
+        result = CliRunner().invoke(app, list(args))
+    finally:
+        reset_renderer_for_testing()
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    return result, json.loads(lines[-1]) if lines else None
+
+
+def _write_skill(path: Path, name: str, body: str = "Not the shipped skill.") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"---\nname: {name}\ndescription: d.\n---\n{body}\n", encoding="utf-8")
+
+
+def _project(tmp_path: Path) -> Path:
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "AGENTS.md").write_text("# mine\n", encoding="utf-8")
+    return root
+
+
+def _agent_files(root: Path) -> dict[str, str]:
+    return {
+        str(p.relative_to(root)): p.read_text(encoding="utf-8")
+        for p in sorted(root.rglob("*"))
+        if p.is_file() and p.name != "skills-manifest.json"
+    }
+
+
+@pytest.mark.parametrize(
+    ("layout", "name"),
+    [
+        ("notscalify/SKILL.md", "scalify"),  # a file in a folder of another name
+        ("scalify", "scalify"),  # a folder carrying the shipped name
+        ("pins/SKILL.md", "scalify-build-pins"),  # a reference skill's name
+        ("evil/SKILL.md", "Scalify"),  # one folder with `scalify` on macOS and Windows
+    ],
+)
+def test_install_refuses_a_path_declaring_a_shipped_name(monkeypatch, tmp_path: Path, layout: str, name: str):
+    root = _project(tmp_path)
+    token = tmp_path / "src" / layout
+    _write_skill(token / "SKILL.md" if not layout.endswith(".md") else token, name)
+    before = _agent_files(root)
+
+    result, envelope = _install_cli(monkeypatch, root, "install", "--scope", "project", "--skill", str(token))
+
+    assert result.exit_code == 1, result.output
+    assert envelope["ok"] is False
+    assert envelope["error"]["code"] == "skill_invalid"
+    assert repr(name) in envelope["error"]["message"]
+    assert "scalify skills show" in envelope["error"]["hint"]
+    assert _agent_files(root) == before
+
+
+def test_install_api_refuses_a_path_declaring_a_shipped_name(tmp_path: Path):
+    """The library entry point holds the same line as the command."""
+    md = tmp_path / "notscalify" / "SKILL.md"
+    _write_skill(md, "scalify")
+    with pytest.raises(ValueError, match="'scalify'"):
+        install(scope="project", project_root=tmp_path, skills=[str(md)], targets=["claude-code"])
+    assert not (tmp_path / ".claude").exists()
+
+
+def test_validate_refuses_a_path_declaring_a_shipped_name(monkeypatch, tmp_path: Path):
+    md = tmp_path / "notscalify" / "SKILL.md"
+    _write_skill(md, "scalify")
+    result, envelope = _install_cli(monkeypatch, tmp_path, "validate", str(md))
+    assert result.exit_code == 1, result.output
+    assert envelope["error"]["code"] == "skill_invalid"
+    assert "scalify skills show" in envelope["error"]["hint"]
+
+
+def test_install_accepts_the_shipped_reference_skill_by_its_installed_path(monkeypatch, tmp_path: Path):
+    import scalify_cli.skills as skills_pkg
+
+    root = _project(tmp_path)
+    shipped = Path(skills_pkg.__file__).parent / "scalify-build-pins"
+    result, envelope = _install_cli(
+        monkeypatch, root, "install", "--scope", "project", "--target", "claude-code", "--skill", str(shipped)
+    )
+    assert result.exit_code == 0, result.output
+    installed = root / ".claude" / "skills" / "scalify-build-pins" / "SKILL.md"
+    assert installed.read_text(encoding="utf-8") == skill_content("scalify-build-pins")
+    # ...and so does the copy that install just wrote, passed back by its own folder.
+    result, _ = _install_cli(
+        monkeypatch, root, "install", "--scope", "project", "--target", "cursor", "--skill", str(installed.parent)
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_install_accepts_an_unedited_copy_of_a_shipped_skill_with_crlf(monkeypatch, tmp_path: Path):
+    root = _project(tmp_path)
+    copy = tmp_path / "src" / "scalify" / "SKILL.md"
+    copy.parent.mkdir(parents=True)
+    copy.write_bytes(skill_content("scalify").replace("\n", "\r\n").encode("utf-8"))
+    result, _ = _install_cli(
+        monkeypatch, root, "install", "--scope", "project", "--target", "claude-code", "--skill", str(copy)
+    )
+    assert result.exit_code == 0, result.output
+    assert (root / ".claude" / "skills" / "scalify" / "SKILL.md").exists()
+
+
+def test_install_accepts_an_own_name_by_folder_and_by_file(monkeypatch, tmp_path: Path):
+    root = _project(tmp_path)
+    folder = tmp_path / "src" / "my-skill"
+    _write_skill(folder / "SKILL.md", "my-skill")
+    loose = tmp_path / "loose" / "SKILL.md"
+    _write_skill(loose, "my-other-skill")
+    for token in (folder, loose):
+        result, _ = _install_cli(
+            monkeypatch, root, "install", "--scope", "project", "--target", "claude-code", "--skill", str(token)
+        )
+        assert result.exit_code == 0, result.output
+    assert (root / ".claude" / "skills" / "my-skill" / "SKILL.md").exists()
+    assert (root / ".claude" / "skills" / "my-other-skill" / "SKILL.md").exists()
+
+
+def test_uninstall_by_path_still_removes_an_edited_shipped_skill(monkeypatch, tmp_path: Path):
+    root = _project(tmp_path)
+    install(scope="project", project_root=root, skills=["scalify"])
+    installed = root / ".claude" / "skills" / "scalify"
+    _write_skill(installed / "SKILL.md", "scalify", body="Edited by the user.")
+
+    result, _ = _install_cli(monkeypatch, root, "uninstall", "--scope", "project", "--skill", str(installed))
+
+    assert result.exit_code == 0, result.output
+    assert not (installed / "SKILL.md").exists()
+    assert not (root / ".cursor" / "rules" / "scalify.mdc").exists()
+    assert "scalify" not in (root / "AGENTS.md").read_text(encoding="utf-8").split("# mine", 1)[1]
+
+
+def test_agent_permissions_skill_names_every_permanently_refused_host():
+    """The skill tells the model not to request these, because `approve` vets
+    with `vet_host` and refuses them: a request for one waits until denied. A
+    host added to `_REFUSED_HOSTS` without a line here would be requested."""
+    from scalify_cli.agent import _REFUSED_HOSTS
+
+    rows = [
+        line
+        for line in skill_content("scalify-agent-permissions").splitlines()
+        if line.startswith("|") and "do **not** call `request_host`" in line
+    ]
+    assert len(rows) == 1, "expected exactly one 'never request this host' row in the blocked-by table"
+    for host in _REFUSED_HOSTS:
+        assert host in rows[0], f"the row should name the refused host {host}"

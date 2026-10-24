@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scalify.khulnasoft.com/schemas/deploy_logs.json",
+  "title": "scalify deploy logs --json data payload",
+  "description": "The latest ScalifyUI log snapshot captured by a deployment health probe.",
+  "type": "object",
+  "required": ["scalifyuiLog", "deploymentId"],
+  "additionalProperties": true,
+  "properties": {
+    "capturedAt": {"type": ["string", "null"], "format": "date-time"},
+    "scalifyuiLog": {"type": "string"},
+    "deploymentId": {"type": "string", "minLength": 1}
+  }
+}

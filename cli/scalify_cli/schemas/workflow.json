@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scalify workflow *",
+  "description": "Output shape for workflow editing commands (slots, set-slot, vary) and the read-only notes reader.",
+  "type": "object",
+  "properties": {
+    "workflow": { "type": "string" },
+    "count": { "type": "integer" },
+    "total": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "list: every saved workflow matching the filters, across all pages. `count` is only the rows on this page; answer \"how many\" from `total`. Omitted when the server reported no usable total."
+    },
+    "has_more": { "type": "boolean", "description": "list: more matching workflows exist past this page." },
+    "next_offset": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "list: the `--offset` for the next page; present only when `has_more` is true and the source paged by the offset requested."
+    },
+    "slots": { "type": "array" },
+    "notes": {
+      "type": "array",
+      "description": "notes: the Note/MarkdownNote documentation nodes the workflow carries, in graph order (top-level nodes first, then each subgraph definition).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "description": "node id as serialized in the workflow" },
+          "type": { "type": "string", "enum": ["Note", "MarkdownNote"] },
+          "title": { "type": ["string", "null"], "description": "author-set node title; null when the node uses its default title" },
+          "text": { "type": "string", "description": "the note body (widgets_values[0]); empty string when the node carries no usable text" },
+          "pos": { "description": "canvas position, passed through verbatim — litegraph has serialized this as both [x, y] and {\"0\": x, \"1\": y}; null when absent" },
+          "size": { "description": "canvas size, passed through verbatim (same shape caveat as pos); null when absent" },
+          "subgraph": {
+            "type": ["object", "null"],
+            "description": "null for a top-level note; {id, name} of the owning subgraph definition otherwise",
+            "properties": {
+              "id": {},
+              "name": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    },
+    "format": { "type": "string", "enum": ["py"], "description": "print: output form. Only `py` today." },
+    "source": { "type": "string", "description": "print: the rendered Python-like source, one line per node." },
+    "bindings": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "print: binding name -> node id. Interior subgraph nodes use qualified keys/ids, e.g. \"10/3/primitive_int\" -> \"10/3/6\"."
+    },
+    "node_count": { "type": ["integer", "null"], "minimum": 0, "description": "print: nodes that got a rendered line (top level + subgraph interiors). null for `scalify workflow get` on a non-JSON body." },
+    "skipped": {
+      "type": "array",
+      "description": "print: nodes not rendered as their own line. UI-only splicing nodes (reason \"spliced\", or \"inlined into <id>.<input>\" for a PrimitiveNode); notes, which are rendered as `#`-comments in `source` AND listed here with reason \"note\".",
+      "items": {
+        "type": "object",
+        "required": ["id", "type", "reason"],
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "type": "string" },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "applied": { "type": "array" },
+    "warnings": { "type": "array" },
+    "wrote": { "type": ["string", "null"], "description": "file written, or null when nothing was written (set-slot --stdout)" },
+    "out": { "type": "string", "description": "set-slot: where the result went — \"stdout\" when --stdout returned it instead of writing the file" },
+    "workflow_json": { "type": "object", "description": "set-slot --stdout: the modified workflow itself (human mode prints it raw on stdout instead)" },
+    "variants": { "type": ["array", "null"], "description": "vary without --out-dir: the produced workflows (human mode prints them as NDJSON on stdout instead); null when they were written to --out-dir" },
+    "written": { "type": "array" },
+    "out_dir": { "type": ["string", "null"] },
+    "variations_summary": { "type": "array" },
+    "item_map": {
+      "type": "object",
+      "description": "compose: foreach item -> provenance map. Mirrors the `_meta.items` block embedded in each written workflow (`_meta.schema == \"compose/1\"`).",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "nodes": { "type": "array", "items": { "type": "string" }, "description": "node ids this item's branch produced (numerically sorted, includes the save node)" },
+          "save_node": { "type": ["string", "null"], "description": "auto-appended save node id, null when the branch is terminal" },
+          "prefix": { "type": "string", "description": "per-item output filename prefix (<output_prefix>/<item key>)" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,418 @@
+import os
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+
+import typer
+import yaml
+
+from scalify_cli import constants, logging, utils
+from scalify_cli.config_manager import ConfigManager
+
+# Route prints through the output shim so they land on stderr in JSON mode
+# rather than corrupting the envelope on stdout.
+from scalify_cli.output import rprint as print  # noqa: A001 - intentional shadowing
+from scalify_cli.utils import singleton
+
+
+@dataclass
+class ModelPath:
+    path: str
+
+
+@dataclass
+class Model:
+    name: str | None = None
+    url: str | None = None
+    paths: list[ModelPath] = field(default_factory=list)
+    hash: str | None = None
+    type: str | None = None
+
+
+@dataclass
+class Basics:
+    name: str | None = None
+    updated_at: datetime = None
+
+
+@dataclass
+class CustomNode:
+    # Todo: Add custom node fields for scalify-lock.yaml
+    pass
+
+
+@dataclass
+class ScalifyLockYAMLStruct:
+    basics: Basics
+    models: list[Model] = field(default_factory=list)
+    custom_nodes: list[CustomNode] = field(default_factory=list)
+
+
+def _paths_match(path_a: str, path_b: str) -> bool:
+    try:
+        return os.path.samefile(path_a, path_b)
+    except (FileNotFoundError, OSError):
+        return os.path.realpath(path_a) == os.path.realpath(path_b)
+
+
+def _has_scalifyui_markers(path: str) -> bool:
+    """Check for ScalifyUI-specific files/directories when git metadata isn't available."""
+    markers = ["main.py", "scalify", "nodes.py", "scalify_extras", "scalify_api"]
+    return sum(os.path.exists(os.path.join(path, m)) for m in markers) >= 4
+
+
+def _find_scalifyui_root(path: str) -> str | None:
+    """Walk up from *path* looking for a directory with ScalifyUI markers."""
+    cur = os.path.abspath(path)
+    if not os.path.isdir(cur):
+        cur = os.path.dirname(cur)
+    while True:
+        if _has_scalifyui_markers(cur):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return None
+        cur = parent
+
+
+def check_scalify_repo(path) -> tuple[bool, str | None]:
+    """Check whether *path* is (or is inside) a ScalifyUI installation.
+
+    Returns ``(True, resolved_path)`` on success, ``(False, None)`` otherwise.
+    Git remote-URL matching is tried first; if that fails (no ``.git``, fork,
+    mirror, zip download, portable build) a file-based marker check is used as
+    a fallback.
+    """
+    if not os.path.exists(path):
+        return False, None
+    # Imported lazily: GitPython costs ~90ms to import and is only needed on
+    # this detection path, not for every CLI invocation.
+    import git
+
+    try:
+        repo = git.Repo(path, search_parent_directories=True)
+        path_is_scalify_repo = any(remote.url in constants.SCALIFY_ORIGIN_URL_CHOICES for remote in repo.remotes)
+
+        # If it's within the custom node repo, lookup from the parent directory.
+        if not path_is_scalify_repo and "custom_nodes" in path:
+            parts = path.split(os.sep)
+            try:
+                index = parts.index("custom_nodes")
+                parent = os.sep.join(parts[:index])
+
+                repo = git.Repo(parent, search_parent_directories=True)
+                path_is_scalify_repo = any(remote.url in constants.SCALIFY_ORIGIN_URL_CHOICES for remote in repo.remotes)
+            except ValueError:
+                pass
+
+        if path_is_scalify_repo:
+            return True, str(repo.working_dir)
+    # Not in a git repo at all
+    # pylint: disable=E1101  # no-member
+    except git.exc.InvalidGitRepositoryError:
+        pass
+
+    # Fallback: file-based detection for non-git installations (zip downloads,
+    # portable builds, forks with non-standard remotes, etc.)
+    marker_root = _find_scalifyui_root(path)
+    if marker_root is not None:
+        return True, marker_root
+
+    return False, None
+
+
+# Generate and update this following method using chatGPT
+def save_yaml(file_path: str, metadata: ScalifyLockYAMLStruct):
+    data = {
+        "basics": {
+            "name": metadata.basics.name,
+            "updated_at": metadata.basics.updated_at.isoformat(),
+        },
+        "models": [
+            {
+                "model": m.name,
+                "url": m.url,
+                "paths": [{"path": p.path} for p in m.paths],
+                "hash": m.hash,
+                "type": m.type,
+            }
+            for m in metadata.models
+        ],
+        "custom_nodes": [],
+    }
+    with open(file_path, "w", encoding="utf-8") as file:
+        yaml.safe_dump(data, file, default_flow_style=False, allow_unicode=True)
+
+
+class WorkspaceType(Enum):
+    CURRENT_DIR = "current_dir"
+    DEFAULT = "default"
+    SPECIFIED = "specified"
+    RECENT = "recent"
+
+
+@singleton
+class WorkspaceManager:
+    def __init__(
+        self,
+    ):
+        self.config_manager = ConfigManager()
+        self.metadata = ScalifyLockYAMLStruct(basics=Basics(), models=[])
+        self.specified_workspace = None
+        self.use_here = None
+        self.use_recent = None
+        self.skip_prompting = None
+        self._flags_set = False
+        self._resolved: tuple[str | None, WorkspaceType | None] | None = None
+
+    def setup_workspace_manager(
+        self,
+        specified_workspace: str | None = None,
+        use_here: bool | None = None,
+        use_recent: bool | None = None,
+        skip_prompting: bool | None = None,
+    ):
+        self.specified_workspace = specified_workspace
+        self.use_here = use_here
+        self.use_recent = use_recent
+        self.skip_prompting = skip_prompting
+        self._flags_set = True
+        self._resolved = None
+
+    def _resolve(self) -> tuple[str | None, WorkspaceType | None]:
+        """Resolve the workspace on first read and cache it.
+
+        Deferred because ``get_workspace_path`` runs ``check_scalify_repo``, which
+        imports GitPython and opens the repo — 40 ms warm, more on a cold cache,
+        that every workspace-free command (``knowledge``, ``cloud``, ``skills``,
+        ...) would otherwise pay in the Typer callback before dispatch.
+        """
+        if self._resolved is None:
+            self._resolved = self.get_workspace_path() if self._flags_set else (None, None)
+        return self._resolved
+
+    # The setters and deleters are what keep ``patch.object(manager,
+    # "workspace_path", ...)`` working across the test suite: patching a property
+    # needs both, and unpatching goes through the deleter.
+    @property
+    def workspace_path(self) -> str | None:
+        return self._resolve()[0]
+
+    @workspace_path.setter
+    def workspace_path(self, value: str | None):
+        self._resolved = (value, (self._resolved or (None, None))[1])
+
+    @workspace_path.deleter
+    def workspace_path(self):
+        self._resolved = None
+
+    @property
+    def workspace_type(self) -> WorkspaceType | None:
+        return self._resolve()[1]
+
+    @workspace_type.setter
+    def workspace_type(self, value: WorkspaceType | None):
+        self._resolved = ((self._resolved or (None, None))[0], value)
+
+    @workspace_type.deleter
+    def workspace_type(self):
+        self._resolved = None
+
+    def set_recent_workspace(self, path: str):
+        """
+        Sets the most recent workspace path in the configuration.
+        """
+        self.config_manager.set(constants.CONFIG_KEY_RECENT_WORKSPACE, os.path.abspath(path))
+
+    def set_default_workspace(self, path: str):
+        """
+        Sets the default workspace path in the configuration.
+        """
+        self.config_manager.set(constants.CONFIG_KEY_DEFAULT_WORKSPACE, os.path.abspath(path))
+
+    def set_default_launch_extras(self, extras: str):
+        """
+        Sets the default workspace path in the configuration.
+        """
+        self.config_manager.set(constants.CONFIG_KEY_DEFAULT_LAUNCH_EXTRAS, extras.strip())
+
+    def __get_specified_workspace(self) -> str | None:
+        if self.specified_workspace is None:
+            return None
+
+        return os.path.abspath(os.path.expanduser(self.specified_workspace))
+
+    def get_workspace_path(self) -> tuple[str, WorkspaceType]:
+        """
+        Retrieves a workspace path based on user input and defaults. This function does not validate the existence of a validate ScalifyUI workspace.
+        1. Specified Workspace (--workspace)
+        2. Most Recent (if --recent is True)
+        3. Current Directory (if --here is True)
+        4. Current Directory (if current dir is ScalifyUI repo and --no-here is not True;
+           returns DEFAULT if cwd matches the configured default workspace)
+        5. Default Workspace (if a default workspace has been set using `scalify set-default`)
+        6. Most Recent Workspace (if --no-recent is not True)
+        7. Fallback Default Workspace ('~/scalify' for linux or ~/Documents/scalify for windows/macos)
+
+        """
+        # Check for explicitly specified workspace first
+        specified_workspace = self.__get_specified_workspace()
+        if specified_workspace:
+            return specified_workspace, WorkspaceType.SPECIFIED
+
+        # Check for recent workspace if requested
+        if self.use_recent:
+            recent_workspace = self.config_manager.get(constants.CONFIG_KEY_RECENT_WORKSPACE)
+            if recent_workspace:
+                return recent_workspace, WorkspaceType.RECENT
+            else:
+                print(
+                    "[bold red]warn: No recent workspace has been set.[/bold red]"
+                )  # If a path has been explicitly specified, cancel the command for safety.
+                raise typer.Exit(code=1)
+
+        # Check for current workspace if requested
+        if self.use_here is True:
+            current_directory = os.getcwd()
+            found_scalify_repo, scalify_path = check_scalify_repo(current_directory)
+            if found_scalify_repo:
+                return scalify_path, WorkspaceType.CURRENT_DIR
+            else:
+                return (
+                    os.path.join(current_directory, "ScalifyUI"),
+                    WorkspaceType.CURRENT_DIR,
+                )
+
+        # Check the current directory for a ScalifyUI
+        if self.use_here is None:
+            current_directory = os.getcwd()
+            found_scalify_repo, scalify_path = check_scalify_repo(os.path.join(current_directory))
+            # If it's in a sub dir of the ScalifyUI repo, get the repo working dir
+            if found_scalify_repo:
+                default_workspace = self.config_manager.get(constants.CONFIG_KEY_DEFAULT_WORKSPACE)
+                if default_workspace and _paths_match(scalify_path, default_workspace):
+                    return scalify_path, WorkspaceType.DEFAULT
+                return scalify_path, WorkspaceType.CURRENT_DIR
+
+        # Check for user-set default workspace
+        default_workspace = self.config_manager.get(constants.CONFIG_KEY_DEFAULT_WORKSPACE)
+
+        if default_workspace and check_scalify_repo(default_workspace)[0]:
+            return default_workspace, WorkspaceType.DEFAULT
+
+        # Fallback to the most recent workspace if it exists
+        if self.use_recent is None:
+            recent_workspace = self.config_manager.get(constants.CONFIG_KEY_RECENT_WORKSPACE)
+            if recent_workspace:
+                if check_scalify_repo(recent_workspace)[0]:
+                    return recent_workspace, WorkspaceType.RECENT
+                else:
+                    self.config_manager.set(constants.CONFIG_KEY_RECENT_WORKSPACE, "")
+                    print(
+                        f"[bold red]warn: Recent workspace '{recent_workspace}' is not a valid ScalifyUI path. Reset.[/bold red]"
+                    )
+
+        # Check for scalify-cli default workspace
+        default_workspace = utils.get_not_user_set_default_workspace()
+        return default_workspace, WorkspaceType.DEFAULT
+
+    def scan_dir(self):
+        if not self.workspace_path:
+            return []
+
+        logging.info(f"Scanning directory: {self.workspace_path}")
+        model_files = []
+        for root, _dirs, files in os.walk(self.workspace_path):
+            for file in files:
+                if file.endswith(constants.SUPPORTED_PT_EXTENSIONS):
+                    model_files.append(os.path.join(root, file))
+        return model_files
+
+    def load_metadata(self):
+        file_path = os.path.join(self.workspace_path, constants.SCALIFY_LOCK_YAML_FILE)
+        if os.path.exists(file_path):
+            with open(file_path, encoding="utf-8") as file:
+                return yaml.safe_load(file)
+        else:
+            return {}
+
+    def save_metadata(self):
+        file_path = os.path.join(self.workspace_path, constants.SCALIFY_LOCK_YAML_FILE)
+        save_yaml(file_path, self.metadata)
+
+    def _reported_manager_state(self) -> tuple[str, str]:
+        """Reconcile the configured manager mode against what is actually installed.
+
+        Reporting-only: this never feeds ``scalify launch`` flag injection, which
+        keeps reading :func:`resolve_manager_gui_mode` directly (user intent).
+
+        The global per-user ``manager_gui_mode`` config key can drift out of sync
+        with a given workspace, so ``scalify env`` reconciles the two:
+
+        Every mode that expects a working Manager — the enabling modes
+        (``enable-gui`` / ``disable-gui`` / ``enable-legacy-gui``; ``disable-gui``
+        still enables the Manager, it only hides its UI) and ``"not-installed"``
+        — is reconciled against what is actually on disk:
+
+        * no Manager anywhere → report ``"not-installed"``;
+        * an on-disk legacy clone → report ``"legacy"`` (the Manager is present,
+          but cm-cli venv integration is unavailable, so an ``enable-*`` config
+          overstates what works).
+
+        ``"disable"`` is user intent and is always left untouched, as is any
+        unrecognised mode string.
+
+        Returns ``(manager_mode, manager_detected)``.
+        """
+        # Lazy import to avoid circular dependency
+        from scalify_cli.command.custom_nodes.cm_cli_util import detect_manager_installation, resolve_manager_gui_mode
+
+        detected = detect_manager_installation()
+        mode = resolve_manager_gui_mode(not_installed_value="not-installed")
+
+        if mode in ("enable-gui", "disable-gui", "enable-legacy-gui", "not-installed"):
+            if detected == "none":
+                mode = "not-installed"
+            elif detected == "legacy-clone":
+                mode = "legacy"
+
+        return mode, detected
+
+    def fill_print_table(self):
+        config_manager = ConfigManager()
+        mode, _detected = self._reported_manager_state()
+
+        status_map = {
+            "disable": "[bold red]Disabled[/bold red]",
+            "enable-gui": "[bold green]GUI Enabled[/bold green]",
+            "disable-gui": "[bold yellow]GUI Disabled[/bold yellow]",
+            "enable-legacy-gui": "[bold cyan]Legacy GUI[/bold cyan]",
+            "legacy": "[bold yellow]Legacy clone (cm-cli unavailable)[/bold yellow]",
+            "not-installed": "[dim]Not Installed[/dim]",
+        }
+        manager_status = status_map.get(mode, "[bold green]GUI Enabled[/bold green]")
+
+        uv_compile_value = config_manager.get(constants.CONFIG_KEY_UV_COMPILE_DEFAULT)
+        if uv_compile_value is not None and str(uv_compile_value).lower() == "true":
+            uv_compile_status = "[bold green]Enabled[/bold green]"
+        else:
+            uv_compile_status = "[dim]Disabled[/dim]"
+
+        return [
+            ("Current selected workspace", f"[bold green]→ {self.workspace_path}[/bold green]"),
+            ("Manager", manager_status),
+            ("UV Compile Default", uv_compile_status),
+        ]
+
+    def fill_data(self) -> dict:
+        """Structured workspace info for ``scalify env --json``."""
+        config_manager = ConfigManager()
+        uv_compile_value = config_manager.get(constants.CONFIG_KEY_UV_COMPILE_DEFAULT)
+        mode, detected = self._reported_manager_state()
+        return {
+            "path": str(self.workspace_path) if self.workspace_path else None,
+            "type": self.workspace_type.value if self.workspace_type is not None else None,
+            "manager_mode": mode,
+            "manager_detected": detected,
+            "uv_compile_default": (str(uv_compile_value).lower() == "true" if uv_compile_value is not None else False),
+        }

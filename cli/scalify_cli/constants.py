@@ -1,0 +1,129 @@
+import os
+from enum import Enum
+
+
+class OS(str, Enum):
+    WINDOWS = "windows"
+    MACOS = "macos"
+    LINUX = "linux"
+
+
+class PROC(str, Enum):
+    X86_64 = "x86_64"
+    ARM = "arm"
+
+
+SCALIFY_GITHUB_URL = "https://github.com/khulnasoft/scalify"
+
+MANAGER_REQUIREMENTS_FILE = "manager_requirements.txt"
+
+DEFAULT_SCALIFY_MODEL_PATH = "models"
+# ScalifyUI's own directory names are singular — `input/` and `output/`, not
+# `inputs/`/`outputs/`. Named here rather than spelled inline so the deploy
+# asset allowlist and the install layout cannot drift apart.
+DEFAULT_SCALIFY_INPUT_PATH = "input"
+DEFAULT_SCALIFY_OUTPUT_PATH = "output"
+DEFAULT_SCALIFY_WORKSPACE = {
+    OS.WINDOWS: os.path.join(os.path.expanduser("~"), "Documents", "scalify", "ScalifyUI"),
+    OS.MACOS: os.path.join(os.path.expanduser("~"), "Documents", "scalify", "ScalifyUI"),
+    OS.LINUX: os.path.join(os.path.expanduser("~"), "scalify", "ScalifyUI"),
+}
+
+DEFAULT_CONFIG = {
+    OS.WINDOWS: os.path.join(os.path.expanduser("~"), "AppData", "Local", "scalify-cli"),
+    OS.MACOS: os.path.join(os.path.expanduser("~"), "Library", "Application Support", "scalify-cli"),
+    OS.LINUX: os.path.join(os.path.expanduser("~"), ".config", "scalify-cli"),
+}
+
+CONTEXT_KEY_WORKSPACE = "workspace"
+CONTEXT_KEY_RECENT = "recent"
+CONTEXT_KEY_HERE = "here"
+
+CONFIG_KEY_DEFAULT_WORKSPACE = "default_workspace"
+CONFIG_KEY_DEFAULT_LAUNCH_EXTRAS = "default_launch_extras"
+CONFIG_KEY_RECENT_WORKSPACE = "recent_workspace"
+CONFIG_KEY_ENABLE_TRACKING = "enable_tracking"
+CONFIG_KEY_USER_ID = "user_id"
+CONFIG_KEY_INSTALL_EVENT_TRIGGERED = "install_event_triggered"
+CONFIG_KEY_BACKGROUND = "background"
+CONFIG_KEY_BACKGROUND_LOG = "background_log"  # workspace logfile path for the background server
+CONFIG_KEY_MANAGER_GUI_ENABLED = "manager_gui_enabled"  # Legacy, kept for backward compatibility
+CONFIG_KEY_MANAGER_GUI_MODE = "manager_gui_mode"  # Valid: "disable", "enable-gui", "disable-gui", "enable-legacy-gui"
+CONFIG_KEY_UV_COMPILE_DEFAULT = "uv_compile_default"
+# Persistent "always proceed" for credit-spending `scalify generate` calls
+# (the spend gate). Set via `scalify generate consent always|ask`.
+CONFIG_KEY_SPEND_AUTO_CONFIRM = "spend.auto_confirm"
+
+CIVITAI_API_TOKEN_KEY = "civitai_api_token"
+CIVITAI_API_TOKEN_ENV_KEY = "CIVITAI_API_TOKEN"
+CIVITAI_ALLOWED_HOSTS: tuple[str, ...] = ("civitai.com", "civitai.red")
+HF_API_TOKEN_KEY = "hf_api_token"
+HF_API_TOKEN_ENV_KEY = "HF_API_TOKEN"
+# Hosts the HF bearer token may be sent to. `check_huggingface_url` accepts the
+# first two; `hf.co` is the official short form Hugging Face redirects from.
+HF_ALLOWED_HOSTS: tuple[str, ...] = ("huggingface.co", "huggingface.com", "hf.co")
+
+ARIA2_SERVER_ENV_KEY = "SCALIFYUI_MANAGER_ARIA2_SERVER"
+ARIA2_SECRET_ENV_KEY = "SCALIFYUI_MANAGER_ARIA2_SECRET"
+CONFIG_KEY_DEFAULT_DOWNLOADER = "default_downloader"
+
+DEFAULT_TRACKING_VALUE = True
+
+CONFIG_KEY_DEFAULT_PROJECT_DIR = "default_project_dir"
+
+SCALIFY_LOCK_YAML_FILE = "scalify.lock.yaml"
+
+# TODO: figure out a better way to check if this is a scalify repo
+SCALIFY_ORIGIN_URL_CHOICES = {
+    "git@github.com:Khulnasoft/ScalifyUI.git",
+    "git@github.com:khulnasoft/scalify.git",
+    "git@github.com:drip-art/scalify.git",
+    "git@github.com:ltdrdata/ScalifyUI.git",
+    "https://github.com/Khulnasoft/ScalifyUI.git",
+    "https://github.com/khulnasoft/scalify.git",
+    "https://github.com/drip-art/ScalifyUI.git",
+    "https://github.com/ltdrdata/ScalifyUI.git",
+    "https://github.com/Khulnasoft/ScalifyUI",
+    "https://github.com/khulnasoft/scalify",
+    "https://github.com/drip-art/ScalifyUI",
+    "https://github.com/ltdrdata/ScalifyUI",
+}
+
+
+class CUDAVersion(str, Enum):
+    v13_0 = "13.0"
+    v12_9 = "12.9"
+    v12_8 = "12.8"
+    v12_6 = "12.6"
+    v12_4 = "12.4"
+    v12_1 = "12.1"
+    v11_8 = "11.8"
+
+
+class ROCmVersion(str, Enum):
+    v7_2 = "7.2"
+    v7_1 = "7.1"
+    v7_0 = "7.0"
+    v6_3 = "6.3"
+    v6_2 = "6.2"
+    v6_1 = "6.1"
+
+
+class GPU_OPTION(str, Enum):
+    CPU = None
+    NVIDIA = "nvidia"
+    AMD = "amd"
+    INTEL_ARC = "intel_arc"
+    MAC_M_SERIES = "mac_m_series"
+    MAC_INTEL = "mac_intel"
+
+
+# Referencing supported pt extension from ScalifyUI
+# https://github.com/khulnasoft/scalify/blob/a88b0ebc2d2f933c94e42aa689c42e836eedaf3c/folder_paths.py#L5
+SUPPORTED_PT_EXTENSIONS = (".ckpt", ".pt", ".bin", ".pth", ".safetensors")
+
+NODE_ZIP_FILENAME = "node.zip"
+
+# The default minor version series to download from python-build-standalone.
+# The exact patch version is resolved dynamically from the release metadata.
+DEFAULT_STANDALONE_PYTHON_MINOR_VERSION = "3.12"

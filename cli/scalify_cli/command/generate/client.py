@@ -1,0 +1,226 @@
+"""HTTP client for the Scalify cloud API.
+
+A thin wrapper around httpx that:
+- attaches ``Authorization: Bearer $SCALIFY_API_KEY`` to every request,
+- targets ``$SCALIFY_API_BASE_URL`` (defaulting to ``https://api.scalify.khulnasoft.com``),
+- splits a request payload into JSON or multipart based on the endpoint's
+  declared content-type, streaming any ``format: binary`` fields as files.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from scalify_cli.command.generate import spec
+from scalify_cli.command.generate.schema import FlagDef
+
+
+class ApiError(RuntimeError):
+    def __init__(self, status: int, body: str, message: str | None = None) -> None:
+        super().__init__(message or f"HTTP {status}: {body}")
+        self.status = status
+        self.body = body
+
+
+def resolve_api_key(explicit: str | None = None) -> str:
+    """Resolve a credential for the partner-API proxy.
+
+    Resolution order (shared chain in ``scalify_cli.credentials``,
+    ``purpose="partner"``): explicit ``--api-key`` flag → ``SCALIFY_API_KEY`` env
+    (handed in for this run, so it outranks a stored sign-in, which is then not
+    refreshed) → live OAuth session (refreshed if near expiry) → stored key.
+    Empty or whitespace-only env values count as unset. Raise if none resolve.
+
+    The proxy validates a non-``scalifyui-`` bearer token as a Firebase JWT
+    (see ``_auth_headers``), so the same session that powers
+    ``scalify run --where cloud`` authenticates partner-API calls too — no
+    separate API key required.
+    """
+    from scalify_cli.credentials import resolve_cloud_credential
+
+    cred = resolve_cloud_credential(purpose="partner", explicit=explicit, refresh=True)
+    if cred is not None:
+        return cred.value
+
+    raise ApiError(
+        401,
+        "",
+        "Not signed in. Run `scalify cloud login`, or pass --api-key / set "
+        "SCALIFY_API_KEY (get one at https://platform.scalify.khulnasoft.com/api-keys).",
+    )
+
+
+def _split_payload(
+    values: dict[str, Any], flags: list[FlagDef], content_type: str
+) -> tuple[
+    dict[str, Any] | None,
+    list[tuple[str, Any]] | None,
+    dict[str, Any] | list[tuple[str, str]] | None,
+]:
+    """Return (json_body, multipart_files, multipart_data).
+
+    For JSON endpoints: json_body is the dict, others are None.
+    For multipart: files is a list of (field_name, (filename, fileobj, mime)) tuples
+    and data is the non-file form fields (stringified or JSON-encoded as needed).
+    """
+    flag_by_name = {f.name: f for f in flags}
+    base_content_type = content_type.partition(";")[0].strip().lower()
+    json_content_type = base_content_type == "application/json" or base_content_type.endswith("+json")
+    if json_content_type:
+        return values, None, None
+    if base_content_type not in {"multipart/form-data", "application/x-www-form-urlencoded"}:
+        raise ApiError(0, "", f"Unsupported request content type: {content_type}")
+
+    files: list[tuple[str, Any]] = []
+    data: dict[str, Any] = {}
+
+    def form_scalar(name: str, item: Any) -> str:
+        if isinstance(item, (dict, list, tuple)):
+            raise ApiError(0, "", f"--{name}: nested form values are not supported")
+        if isinstance(item, bool):
+            return "true" if item else "false"
+        return str(item)
+
+    for name, value in values.items():
+        flag = flag_by_name.get(name)
+        if (
+            base_content_type == "application/x-www-form-urlencoded"
+            and flag
+            and (flag.kind == "binary" or (flag.kind == "array" and flag.item_kind == "binary"))
+        ):
+            raise ApiError(0, "", f"--{name}: binary values require multipart/form-data")
+        if base_content_type == "application/x-www-form-urlencoded" and flag and flag.kind == "array":
+            if not isinstance(value, (list, tuple)):
+                raise ApiError(0, "", f"--{name}: expected an array value")
+            data[name] = [form_scalar(name, item) for item in value]
+        elif base_content_type == "application/x-www-form-urlencoded" and flag and flag.kind == "object":
+            if not isinstance(value, dict):
+                raise ApiError(0, "", f"--{name}: expected an object value")
+            for key, item in value.items():
+                data[str(key)] = form_scalar(name, item)
+        elif base_content_type == "multipart/form-data" and flag and flag.kind == "binary":
+            path = Path(value) if not isinstance(value, Path) else value
+            if not path.is_file():
+                raise ApiError(0, "", f"--{name}: file not found: {path}")
+            files.append((name, (path.name, path.open("rb"), "application/octet-stream")))
+        elif (
+            base_content_type == "multipart/form-data" and flag and flag.kind == "array" and flag.item_kind == "binary"
+        ):
+            for p in value:
+                p = Path(p) if not isinstance(p, Path) else p
+                if not p.is_file():
+                    raise ApiError(0, "", f"--{name}: file not found: {p}")
+                files.append((name, (p.name, p.open("rb"), "application/octet-stream")))
+        elif flag and flag.kind in ("object", "array"):
+            # Multipart form fields are scalar — JSON-encode complex values.
+            import json as _json
+
+            data[name] = _json.dumps(value)
+        else:
+            data[name] = form_scalar(name, value)
+    if base_content_type == "multipart/form-data" and not files:
+        # httpx falls back to application/x-www-form-urlencoded when ``files``
+        # is empty. Filename-less file tuples force the declared multipart
+        # wire format for endpoints whose optional binary fields were omitted.
+        parts = [(name, (None, value)) for name, value in data.items()]
+        # An empty list is an internal sentinel: ``send_request`` emits a true
+        # zero-part multipart body rather than inventing a field the API did
+        # not declare.
+        return None, parts, None
+    return None, files or None, data
+
+
+def _auth_headers(api_key: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+    # The server accepts two key types on different headers:
+    #   - "scalifyui-..." API keys → X-API-Key (validated by sha256 lookup)
+    #   - Firebase ID tokens     → Authorization: Bearer (validated as a JWT)
+    # See scalify-api server/middleware/authentication/scalify_firebase_auth.go.
+    headers = {"User-Agent": "scalify-cli/api", "Scalify-Env": "scalify-cli", "Scalify-Usage-Source": "scalify-cli"}
+    if api_key.startswith("scalifyui-"):
+        headers["X-API-Key"] = api_key
+    else:
+        headers["Authorization"] = f"Bearer {api_key}"
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def send_request(
+    endpoint: spec.Endpoint,
+    values: dict[str, Any],
+    flags: list[FlagDef],
+    api_key: str,
+    timeout: float = 120.0,
+) -> httpx.Response:
+    """Send the initial request for `endpoint` with the given typed values."""
+    from scalify_cli.command.generate import adapters as _adapters
+
+    adapter = _adapters.get(endpoint.id)
+    url_path = _adapters.resolve_path(endpoint.path, values, adapter) if adapter else endpoint.path
+    url = spec.base_url() + url_path
+    if adapter is not None:
+        json_body, files, data = adapter.build_body(values, api_key), None, None
+    else:
+        json_body, files, data = _split_payload(values, flags, endpoint.request_content_type)
+    headers = _auth_headers(api_key)
+    try:
+        method = endpoint.method.lower()
+        if method == "get":
+            return httpx.get(url, params=values, headers=headers, timeout=timeout)
+        base_content_type = endpoint.request_content_type.partition(";")[0].strip().lower()
+        json_content_type = base_content_type == "application/json" or base_content_type.endswith("+json")
+        if base_content_type == "multipart/form-data" and files == []:
+            boundary = "scalify-cli-empty"
+            empty_headers = {**headers, "Content-Type": f"multipart/form-data; boundary={boundary}"}
+            kwargs = {"content": f"--{boundary}--\r\n".encode(), "headers": empty_headers, "timeout": timeout}
+            if method == "post":
+                return httpx.post(url, **kwargs)
+            return httpx.request(method.upper(), url, **kwargs)
+        if method == "post" and json_content_type:
+            return httpx.post(url, json=json_body, headers=headers, timeout=timeout)
+        if method == "post":
+            return httpx.post(url, files=files, data=data, headers=headers, timeout=timeout)
+        if json_content_type:
+            return httpx.request(method.upper(), url, json=json_body, headers=headers, timeout=timeout)
+        return httpx.request(method.upper(), url, files=files, data=data, headers=headers, timeout=timeout)
+    finally:
+        # Ensure file handles from multipart are closed even on httpx errors.
+        if files:
+            for _name, payload in files:
+                fileobj = payload[1]
+                try:
+                    fileobj.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+def get(url: str, api_key: str, timeout: float = 60.0) -> httpx.Response:
+    """GET helper for polling sibling endpoints and downloading result URLs."""
+    if url.startswith("/"):
+        url = spec.base_url() + url
+    return httpx.get(url, headers=_auth_headers(api_key), timeout=timeout)
+
+
+def download_bytes(url: str, timeout: float = 120.0) -> bytes:
+    """Fetch result media. These URLs are usually pre-signed and not Scalify-hosted,
+    so we don't send the Scalify bearer token."""
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        r = client.get(url)
+        r.raise_for_status()
+        return r.content
+
+
+def raise_for_status(resp: httpx.Response) -> None:
+    if resp.status_code < 400:
+        return
+    try:
+        body = resp.json()
+        import json as _json
+
+        body_str = _json.dumps(body, indent=2)
+    except Exception:  # noqa: BLE001
+        body_str = resp.text
+    raise ApiError(resp.status_code, body_str)

@@ -1,0 +1,2071 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+from scalify_cli import workflow_print
+from scalify_cli.cql.engine import Graph
+from scalify_cli.workflow_print import PrintUnsupported, binding_name, class_expr, py_literal, render_py
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(scope="module")
+def sd15_graph() -> Graph:
+    return Graph.from_object_info(json.loads((FIXTURES / "sd15_object_info.json").read_text()))
+
+
+@pytest.fixture
+def sd15_workflow() -> dict:
+    return json.loads((FIXTURES / "sd15_ui_workflow.json").read_text())
+
+
+SD15_GOLDEN = """\
+checkpoint_loader_simple = CheckpointLoaderSimple(ckpt_name="v1-5-pruned-emaonly-fp16.safetensors")  # 4
+empty_latent_image = EmptyLatentImage(width=512, height=512, batch_size=1)  # 5
+clip_text_encode = CLIPTextEncode(clip=checkpoint_loader_simple.CLIP, text="beautiful scenery nature glass bottle landscape, purple galaxy bottle,")  # 6
+clip_text_encode_2 = CLIPTextEncode(clip=checkpoint_loader_simple.CLIP, text="text, watermark")  # 7
+ksampler = KSampler(model=checkpoint_loader_simple.MODEL, positive=clip_text_encode, negative=clip_text_encode_2, latent_image=empty_latent_image, seed=685468484323813, control_after_generate="randomize", steps=20, cfg=8, sampler_name="euler", scheduler="normal", denoise=1)  # 3
+vae_decode = VAEDecode(samples=ksampler, vae=checkpoint_loader_simple.VAE)  # 8
+save_image = SaveImage(images=vae_decode, filename_prefix="SD1.5")  # 9
+"""
+
+
+def test_sd15_golden_source(sd15_workflow, sd15_graph):
+    res = render_py(sd15_workflow, sd15_graph)
+    body = (
+        "\n".join(ln for ln in res.source.splitlines() if not ln.startswith("# note") and not ln.startswith("# group"))
+        + "\n"
+    )
+    assert body == SD15_GOLDEN
+    assert res.bindings == {
+        "checkpoint_loader_simple": "4",
+        "empty_latent_image": "5",
+        "clip_text_encode": "6",
+        "clip_text_encode_2": "7",
+        "ksampler": "3",
+        "vae_decode": "8",
+        "save_image": "9",
+    }
+    assert res.node_count == 7
+    assert {s["type"] for s in res.skipped} == {"MarkdownNote"}
+    assert len(res.skipped) == 4
+
+
+def test_sd15_groups_are_visible_in_the_source(sd15_workflow, sd15_graph):
+    # The in-app agent's canvas read (this renderer) must enumerate canvas
+    # groups, not just nodes and links, or an agent asked "are there any
+    # groups on the canvas?" has no way to answer correctly even when one is
+    # drawn on screen with a title bar. The bundled sd15 fixture carries
+    # three real, titled groups; each must reach the rendered source.
+    groups = sd15_workflow["groups"]
+    assert groups, "fixture must define at least one group to prove this"
+    src = render_py(sd15_workflow, sd15_graph).source
+    for group in groups:
+        assert group["title"] in src
+
+    # And the membership a reader infers from the comment should match what
+    # the bounding boxes actually enclose (verified by hand against the
+    # fixture's node pos/size): group 1 encloses only the checkpoint loader,
+    # group 3 encloses both CLIPTextEncode nodes, group 2 encloses the
+    # EmptyLatentImage — KSampler/VAEDecode/SaveImage sit outside every box.
+    assert '# group 1 "Step 1 - Load model": nodes 4' in src
+    assert '# group 3 "Step 2 - Prompt": nodes 6, 7' in src
+    assert '# group 2 "Step 3 - Image size": nodes 5' in src
+
+
+def test_sd15_notes_print_as_comments(sd15_workflow, sd15_graph):
+    src = render_py(sd15_workflow, sd15_graph).source
+    assert '# note 11 "Note: Model link": [Tutorial](https://docs.scalify.khulnasoft.com/tutorials/basic/text-to-image) (+' in src
+    assert '# note 14 "Note: Output": Image will auto-save' in src  # single-line note: no (+N lines)
+    assert "(+0 lines)" not in src
+
+
+@pytest.mark.parametrize(
+    "cls,expected",
+    [
+        ("KSampler", "ksampler"),
+        ("CLIPTextEncode", "clip_text_encode"),
+        ("CheckpointLoaderSimple", "checkpoint_loader_simple"),
+        ("KSampler (Advanced)", "ksampler_advanced"),
+        ("VHS_LoadVideo", "vhs_load_video"),
+        ("class", "class_"),
+        ("123Node", "n123_node"),
+        ("", "node"),
+    ],
+)
+def test_binding_name_shape(cls, expected):
+    assert binding_name(cls, {}) == expected
+
+
+def test_binding_name_dedupes_in_call_order():
+    used = {}
+    assert [binding_name("KSampler", used) for _ in range(3)] == ["ksampler", "ksampler_2", "ksampler_3"]
+
+
+def test_class_expr():
+    assert class_expr("KSampler") == "KSampler"
+    assert class_expr("KSampler (Advanced)") == 'Node["KSampler (Advanced)"]'
+    assert class_expr("VHS_LoadVideo") == "VHS_LoadVideo"
+
+
+def test_py_literal():
+    assert py_literal('a "quoted" str') == '"a \\"quoted\\" str"'
+    assert (
+        py_literal(8.0) == "8.0" and py_literal(8) == "8" and py_literal(True) == "True" and py_literal(None) == "None"
+    )
+    assert py_literal([1, "x"]) == '[1, "x"]' and py_literal({"k": 1}) == '{"k": 1}'
+
+
+def _mini(nodes, links):
+    return {"nodes": nodes, "links": links, "version": 0.4}
+
+
+def _node(id_, type_, inputs=(), outputs=(), widgets=None, **extra):
+    n = {
+        "id": id_,
+        "type": type_,
+        "mode": 0,
+        "inputs": [dict(i) for i in inputs],
+        "outputs": [dict(o) for o in outputs],
+        "widgets_values": list(widgets or []),
+    }
+    n.update(extra)
+    return n
+
+
+def test_mode_annotations_and_title(sd15_graph):
+    wf = _mini(
+        [
+            _node(
+                1,
+                "EmptyLatentImage",
+                outputs=[{"name": "LATENT", "type": "LATENT", "links": [1]}],
+                widgets=[64, 64, 1],
+                mode=4,
+            ),
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 1}, {"name": "vae", "type": "VAE", "link": None}],
+                mode=2,
+                title="Decode it",
+            ),
+        ],
+        [[1, 1, 0, 2, 0, "LATENT"]],
+    )
+    src = render_py(wf, sd15_graph).source
+    assert "empty_latent_image = EmptyLatentImage(width=64, height=64, batch_size=1)  # 1 mode=bypass" in src
+    assert 'vae_decode = VAEDecode(samples=empty_latent_image, vae=None)  # 2 "Decode it" mode=mute' in src
+
+
+def test_unknown_class_prints_positional_widgets(sd15_graph):
+    wf = _mini(
+        [
+            _node(
+                1, "EmptyLatentImage", outputs=[{"name": "LATENT", "type": "LATENT", "links": [1]}], widgets=[64, 64, 1]
+            ),
+            _node(2, "My Custom Thing", inputs=[{"name": "latent", "type": "LATENT", "link": 1}], widgets=["a", 2]),
+        ],
+        [[1, 1, 0, 2, 0, "LATENT"]],
+    )
+    res = render_py(wf, sd15_graph)
+    assert (
+        'my_custom_thing = Node["My Custom Thing"](latent=empty_latent_image, widgets=["a", 2])  # 2 class not in catalog'
+        in res.source
+    )
+    assert res.warnings == ["node 2: class 'My Custom Thing' not in catalog; widgets printed positionally"]
+
+
+def test_no_catalog_prints_everything_positionally(sd15_workflow):
+    res = render_py(sd15_workflow, None)
+    assert (
+        'ksampler = KSampler(model=checkpoint_loader_simple.MODEL, positive=clip_text_encode, negative=clip_text_encode_2, latent_image=empty_latent_image, widgets=[685468484323813, "randomize", 20, 8, "euler", "normal", 1])  # 3 class not in catalog'
+        in res.source
+    )
+
+
+def test_topological_order_ties_by_id(sd15_graph):
+    # 9 feeds 3; both have no other deps -> 9 must print before 3 even though 3 < 9
+    wf = _mini(
+        [
+            _node(
+                3,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 1}, {"name": "vae", "type": "VAE", "link": None}],
+            ),
+            _node(
+                9, "EmptyLatentImage", outputs=[{"name": "LATENT", "type": "LATENT", "links": [1]}], widgets=[1, 1, 1]
+            ),
+            _node(
+                5, "EmptyLatentImage", outputs=[{"name": "LATENT", "type": "LATENT", "links": []}], widgets=[2, 2, 1]
+            ),
+        ],
+        [[1, 9, 0, 3, 0, "LATENT"]],
+    )
+    lines = list(render_py(wf, sd15_graph).source.splitlines())
+    assert [ln.rsplit("# ", 1)[1].split()[0] for ln in lines] == ["5", "9", "3"]
+
+
+def test_multi_output_ref_uses_name_single_output_bare(sd15_graph):
+    src = render_py(json.loads((FIXTURES / "sd15_ui_workflow.json").read_text()), sd15_graph).source
+    assert "clip=checkpoint_loader_simple.CLIP" in src and "samples=ksampler," in src
+
+
+def test_non_identifier_output_name_uses_out_index(sd15_graph):
+    wf = _mini(
+        [
+            _node(
+                1,
+                "EmptyLatentImage",
+                outputs=[
+                    {"name": "LATENT", "type": "LATENT", "links": [1]},
+                    {"name": "weird name", "type": "X", "links": []},
+                ],
+                widgets=[1, 1, 1],
+            ),
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 1}, {"name": "vae", "type": "VAE", "link": None}],
+            ),
+        ],
+        [[1, 1, 0, 2, 0, "LATENT"]],
+    )
+    src = render_py(wf, sd15_graph).source
+    assert "samples=empty_latent_image.LATENT" in src  # 2 outputs -> named
+    wf["nodes"][0]["outputs"][0]["name"] = "has space"
+    assert "samples=empty_latent_image.out[0]" in render_py(wf, sd15_graph).source
+
+
+def test_cycle_is_refused(sd15_graph):
+    wf = _mini(
+        [
+            _node(
+                1,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 2}, {"name": "vae", "type": "VAE", "link": None}],
+                outputs=[{"name": "IMAGE", "type": "IMAGE", "links": [1]}],
+            ),
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 1}, {"name": "vae", "type": "VAE", "link": None}],
+                outputs=[{"name": "IMAGE", "type": "IMAGE", "links": [2]}],
+            ),
+        ],
+        [[1, 1, 0, 2, 0, "IMAGE"], [2, 2, 0, 1, 0, "IMAGE"]],
+    )
+    with pytest.raises(PrintUnsupported) as e:
+        render_py(wf, sd15_graph)
+    assert e.value.reasons == ["link cycle among nodes 1, 2"]
+
+
+def test_dangling_link_renders_marked_instead_of_refusing(sd15_graph):
+    wf = _mini(
+        [
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 1}, {"name": "vae", "type": "VAE", "link": None}],
+            )
+        ],
+        [[1, 99, 0, 2, 0, "LATENT"]],
+    )
+    res = render_py(wf, sd15_graph)
+    assert (
+        "VAEDecode(samples=None, vae=None)  # 2 samples BROKEN link 1: its source node 99 does not exist" in res.source
+    )
+    assert res.warnings == [
+        "BROKEN link 1 into input 'samples' of node 2: its source node 99 does not exist; printed as None — "
+        "re-wire it with `connect <source>.<output> 2.samples`"
+    ]
+
+
+def test_out_of_range_output_slot_renders_marked_instead_of_refusing(sd15_graph):
+    """The eff-oob-edit shape: three link rows from an output slot their
+    source does not have used to refuse the whole print."""
+    wf = _stale_slot_workflow([1, 1, 0, 2, 0, "LATENT"])
+    wf["links"] = [[1, 1, 3, 2, 0, "LATENT"]]
+    res = render_py(wf, sd15_graph)
+    assert res.node_count == 2
+    assert (
+        "VAEDecode(samples=None, vae=None)  # 2 samples BROKEN link 1: node 1 has no output slot 3 (it has 1)"
+        in res.source
+    )
+    assert res.warnings == [
+        "BROKEN link 1 into input 'samples' of node 2: node 1 has no output slot 3 (it has 1); printed as None — "
+        "re-wire it with `connect 1.<output> 2.samples`"
+    ]
+
+
+def test_missing_output_metadata_is_unknown_not_broken(sd15_graph):
+    source = _node(1, "EmptyLatentImage", widgets=[512, 512, 1])
+    source.pop("outputs")
+    target = _node(
+        2,
+        "VAEDecode",
+        inputs=[
+            {"name": "samples", "type": "LATENT", "link": 1},
+            {"name": "vae", "type": "VAE", "link": None},
+        ],
+    )
+
+    res = render_py(_mini([source, target], [[1, 1, 0, 2, 0, "LATENT"]]), sd15_graph)
+
+    assert "samples=empty_latent_image.LATENT" in res.source
+    assert not any("BROKEN link 1" in warning for warning in res.warnings)
+
+
+def test_out_of_range_output_slot_inside_a_definition_is_marked_and_qualified(sd15_graph):
+    wf = json.loads((FIXTURES / "subgraph_template_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "subgraph_object_info.json").read_text()))
+    sg = next(s for s in wf["definitions"]["subgraphs"] if s["id"] == "d33c1791-dfd2-4102-8540-aa63e4434cd2")
+    link = next(
+        lk for lk in sg["links"] if str(lk["origin_id"]) not in ("-10", "-20") and str(lk["target_id"]) != "-20"
+    )
+    link["origin_slot"] = 9
+    res = render_py(wf, graph)
+    assert any(
+        w.startswith(f"BROKEN link {link['id']} into input ") and f"of node 10/{link['target_id']}:" in w
+        for w in res.warnings
+    ), res.warnings
+    assert f"BROKEN link {link['id']}: node {link['origin_id']} has no output slot 9" in res.source
+
+
+def test_out_of_range_definition_output_boundary_renders_none_with_warning():
+    wf = json.loads((FIXTURES / "subgraph_template_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "subgraph_object_info.json").read_text()))
+    sg = next(s for s in wf["definitions"]["subgraphs"] if s["id"] == "d33c1791-dfd2-4102-8540-aa63e4434cd2")
+    link = next(lk for lk in sg["links"] if str(lk["target_id"]) == "-20" and str(lk["origin_id"]) != "-10")
+    link["origin_slot"] = 9
+
+    res = render_py(wf, graph)
+
+    assert any(
+        f"output link {link['id']} references output slot 9 on node {link['origin_id']}" in warning
+        for warning in res.warnings
+    )
+    assert ".out[9]" not in res.source
+    assert "OUT." in res.source and " = None" in res.source
+
+
+def test_output_boundary_from_a_node_without_output_metadata_is_not_rejected():
+    wf = json.loads((FIXTURES / "subgraph_template_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "subgraph_object_info.json").read_text()))
+    sg = next(s for s in wf["definitions"]["subgraphs"] if s["id"] == "d33c1791-dfd2-4102-8540-aa63e4434cd2")
+    link = next(lk for lk in sg["links"] if str(lk["target_id"]) == "-20" and str(lk["origin_id"]) != "-10")
+    source = next(node for node in sg["nodes"] if str(node.get("id")) == str(link["origin_id"]))
+    source.pop("outputs", None)
+
+    res = render_py(wf, graph)
+
+    assert not any("which has 0 outputs; it was ignored" in warning for warning in res.warnings)
+    assert "OUT." in res.source
+    assert " = None" not in next(line for line in res.source.splitlines() if line.lstrip().startswith("OUT."))
+
+
+def test_broken_link_repair_uses_the_actual_holder_when_declared_target_is_missing(sd15_graph):
+    wf = _stale_slot_workflow([7, 1, 9, 99, 0, "LATENT"])
+    wf["nodes"][1]["inputs"][0]["link"] = None
+    wf["nodes"].append(
+        _node(
+            3,
+            "VAEDecode",
+            inputs=[{"name": "samples", "type": "LATENT", "link": 7}, {"name": "vae", "type": "VAE", "link": None}],
+        )
+    )
+
+    res = render_py(wf, sd15_graph)
+
+    warning = next(warning for warning in res.warnings if warning.startswith("BROKEN link 7"))
+    assert "input 'samples' of node 3" in warning
+    assert "`connect 1.<output> 3.samples`" in warning
+    assert "node 99" not in warning
+
+
+def test_legacy_group_node_is_refused(sd15_graph):
+    wf = _mini([_node(1, "workflow>MyGroup")], [])
+    with pytest.raises(PrintUnsupported) as e:
+        render_py(wf, sd15_graph)
+    assert e.value.reasons == ["node 1 is a legacy group node (workflow>MyGroup)"]
+
+
+def test_promotion_traversal_limit_is_a_structured_print_failure():
+    subgraph_id = "11111111-2222-3333-4444-555555555555"
+    workflow = _mini([_node(1, subgraph_id)], [])
+    workflow["definitions"] = {
+        "subgraphs": [{"id": subgraph_id, "inputs": [], "outputs": [], "nodes": [], "links": []}]
+    }
+
+    with (
+        mock.patch(
+            "scalify_cli.cql.promoted.promoted_inputs",
+            side_effect=workflow_print._promoted.PromotionTraversalLimitError("promoted input traversal exceeded"),
+        ),
+        pytest.raises(PrintUnsupported, match="promoted input traversal exceeded") as exc,
+    ):
+        render_py(workflow, None)
+
+    assert exc.value.reasons == ["promoted input traversal exceeded"]
+
+
+def test_reroute_is_spliced(sd15_graph):
+    wf = _mini(
+        [
+            _node(
+                1, "EmptyLatentImage", outputs=[{"name": "LATENT", "type": "LATENT", "links": [1]}], widgets=[1, 1, 1]
+            ),
+            _node(
+                5,
+                "Reroute",
+                inputs=[{"name": "", "type": "*", "link": 1}],
+                outputs=[{"name": "", "type": "LATENT", "links": [2]}],
+            ),
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 2}, {"name": "vae", "type": "VAE", "link": None}],
+            ),
+        ],
+        [[1, 1, 0, 5, 0, "LATENT"], [2, 5, 0, 2, 0, "LATENT"]],
+    )
+    res = render_py(wf, sd15_graph)
+    assert "vae_decode = VAEDecode(samples=empty_latent_image, vae=None)  # 2" in res.source
+    assert "Reroute" not in res.source
+    assert {"id": "5", "type": "Reroute", "reason": "spliced"} in res.skipped
+
+
+def test_reroute_chain_and_unlinked_reroute(sd15_graph):
+    wf = _mini(
+        [
+            _node(
+                1, "EmptyLatentImage", outputs=[{"name": "LATENT", "type": "LATENT", "links": [1]}], widgets=[1, 1, 1]
+            ),
+            _node(
+                5,
+                "Reroute",
+                inputs=[{"name": "", "type": "*", "link": 1}],
+                outputs=[{"name": "", "type": "LATENT", "links": [2]}],
+            ),
+            _node(
+                6,
+                "Reroute",
+                inputs=[{"name": "", "type": "*", "link": 2}],
+                outputs=[{"name": "", "type": "LATENT", "links": [3]}],
+            ),
+            _node(
+                7,
+                "Reroute",
+                inputs=[{"name": "", "type": "*", "link": None}],
+                outputs=[{"name": "", "type": "VAE", "links": [4]}],
+            ),
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 3}, {"name": "vae", "type": "VAE", "link": 4}],
+            ),
+        ],
+        [[1, 1, 0, 5, 0, "LATENT"], [2, 5, 0, 6, 0, "LATENT"], [3, 6, 0, 2, 0, "LATENT"], [4, 7, 0, 2, 1, "VAE"]],
+    )
+    res = render_py(wf, sd15_graph)
+    assert "vae_decode = VAEDecode(samples=empty_latent_image, vae=None)  # 2 vae unlinked via reroute 7" in res.source
+
+
+def test_get_set_is_spliced(sd15_graph):
+    wf = _mini(
+        [
+            _node(
+                1, "EmptyLatentImage", outputs=[{"name": "LATENT", "type": "LATENT", "links": [1]}], widgets=[1, 1, 1]
+            ),
+            _node(5, "SetNode", inputs=[{"name": "LATENT", "type": "*", "link": 1}], widgets=["lat"]),
+            _node(6, "GetNode", outputs=[{"name": "LATENT", "type": "LATENT", "links": [2]}], widgets=["lat"]),
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 2}, {"name": "vae", "type": "VAE", "link": None}],
+            ),
+        ],
+        [[1, 1, 0, 5, 0, "LATENT"], [2, 6, 0, 2, 0, "LATENT"]],
+    )
+    res = render_py(wf, sd15_graph)
+    assert "vae_decode = VAEDecode(samples=empty_latent_image, vae=None)  # 2" in res.source
+    assert {s["type"] for s in res.skipped} == {"SetNode", "GetNode"}
+
+
+def test_get_without_set_warns(sd15_graph):
+    wf = _mini(
+        [
+            _node(6, "GetNode", outputs=[{"name": "LATENT", "type": "LATENT", "links": [2]}], widgets=["nope"]),
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 2}, {"name": "vae", "type": "VAE", "link": None}],
+            ),
+        ],
+        [[2, 6, 0, 2, 0, "LATENT"]],
+    )
+    res = render_py(wf, sd15_graph)
+    assert "samples=None" in res.source
+    assert "node 2: input 'samples' reads GetNode 6 variable 'nope' that no SetNode publishes" in res.warnings
+
+
+def test_primitive_node_is_noted_on_target(sd15_graph):
+    wf = _mini(
+        [
+            _node(
+                12,
+                "PrimitiveNode",
+                outputs=[{"name": "STRING", "type": "STRING", "links": [1]}],
+                widgets=["hello", "fixed"],
+            ),
+            _node(1, "EmptyLatentImage", outputs=[], widgets=[1, 1, 1]),
+            _node(
+                6,
+                "CLIPTextEncode",
+                inputs=[
+                    {"name": "clip", "type": "CLIP", "link": None},
+                    {"name": "text", "type": "STRING", "widget": {"name": "text"}, "link": 1},
+                ],
+                widgets=["hello"],
+            ),
+        ],
+        [[1, 12, 0, 6, 1, "STRING"]],
+    )
+    res = render_py(wf, sd15_graph)
+    assert 'clip_text_encode = CLIPTextEncode(clip=None, text="hello")  # 6 text from primitive 12' in res.source
+    assert {"id": "12", "type": "PrimitiveNode", "reason": "inlined into 6.text"} in res.skipped
+
+
+def test_subgraph_instance_and_definition(sd15_graph):
+    wf = json.loads((FIXTURES / "subgraph_template_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "subgraph_object_info.json").read_text()))
+    res = render_py(wf, graph)
+    src = res.source
+    # instance line: exposed inputs by name, non-identifier names via **{...}
+    inst = next(ln for ln in src.splitlines() if "# 10 " in ln)
+    assert inst.startswith('generate_image_1 = Subgraph["Generate Image 1"](')
+    assert '**{"images.image0":' in inst
+    # definition block printed once, names its instances and the address form
+    assert "# subgraph d33c1791-dfd2-4102-8540-aa63e4434cd2" in src
+    # item 6: the header states BOTH address forms — inner-node ids and the
+    # (differently shaped) keys the `bindings` map uses.
+    assert "instances: 10" in src and "address inner nodes as 10/<id>" in src
+    header = next(ln for ln in src.splitlines() if ln.startswith("# subgraph d33c1791"))
+    assert header.endswith("(address inner nodes as 10/<id>; bindings keyed 10/<name>)")
+    assert any(k.startswith("10/") and res.bindings[k].startswith("10/") for k in res.bindings)
+    assert "IN.value" in src and "OUT.IMAGE = " in src
+    # inner nodes are addressable
+    assert any(v.startswith("10/") or "/" in v for v in res.bindings.values())
+    # interior instance 3 of definition f2228dc9 (node 19's subgraph) is itself a
+    # subgraph instance whose own definition is missing from the fixture; it's
+    # printed opaquely with a warning rather than refusing the whole render.
+    assert (
+        "node 19/3: subgraph definition 6d92985e-3e1e-49e2-acea-91c5259d86a8 missing; printed opaquely" in res.warnings
+    )
+    # no skipped id is a bare top-level id of a DIFFERENT node: the interior
+    # MarkdownNote (bare inner id "5", inside da09b826 which is itself nested
+    # under instance 10 at inner id 3) must be addressed "10/3/5", not "5" —
+    # top-level node 5 is an unrelated SaveImage.
+    top_level_ids = {str(n["id"]) for n in wf["nodes"]}
+    assert not any(s["id"] in top_level_ids for s in res.skipped)
+    assert {"id": "10/3/5", "type": "MarkdownNote", "reason": "note"} in res.skipped
+    # da09b826 ("Batch Prompt Iterator") is instantiated only by inner node 3
+    # of instance 10 — its header must show the fully qualified address, and
+    # inner-node addressing follows the same qualified path.
+    assert (
+        '# subgraph da09b826-d678-40e0-a4e4-5f2178043ab6 "Batch Prompt Iterator" — instances: 10/3 '
+        "(address inner nodes as 10/3/<id>; bindings keyed 10/3/<name>)" in src
+    )
+    assert any(v.startswith("10/3/") for v in res.bindings.values())
+    # bracket/binding for that nested instance (no title of its own) fall back
+    # to the definition's own name, not the bare inner id.
+    assert 'Subgraph["Batch Prompt Iterator"](' in src
+    assert "batch_prompt_iterator = " in src
+
+
+def test_subgraph_instance_print_uses_positional_fallback_for_a_stale_input_name(sd15_graph):
+    subgraph_id = "22222222-3333-4444-5555-666666666666"
+    definition = {
+        "id": subgraph_id,
+        "name": "Mapped input",
+        "inputs": [{"name": "cfg", "type": "STRING", "linkIds": [1]}],
+        "outputs": [],
+        "nodes": [
+            _node(
+                2,
+                "CLIPTextEncode",
+                inputs=[
+                    {"name": "clip", "type": "CLIP", "link": None},
+                    {"name": "text", "type": "STRING", "widget": {"name": "text"}, "link": 1},
+                ],
+                widgets=["interior"],
+            )
+        ],
+        "links": [{"id": 1, "origin_id": -10, "origin_slot": 0, "target_id": 2, "target_slot": 1}],
+    }
+    source = _node(
+        1,
+        "EmptyLatentImage",
+        outputs=[{"name": "LATENT", "type": "LATENT", "links": [5]}],
+        widgets=[64, 64, 1],
+    )
+    instance = _node(10, subgraph_id, inputs=[{"name": "stale", "link": 5}], widgets=["host"])
+    wf = _mini([source, instance], [[5, 1, 0, 10, 0, "STRING"]])
+    wf["definitions"] = {"subgraphs": [definition]}
+
+    line = next(line for line in render_py(wf, sd15_graph).source.splitlines() if "# 10 subgraph" in line)
+
+    assert "cfg=empty_latent_image" in line
+
+
+def test_missing_subgraph_definition_prints_opaquely(sd15_graph):
+    wf = _mini([_node(10, "d33c1791-dfd2-4102-8540-aa63e4434cd2")], [])
+    res = render_py(wf, sd15_graph)
+    line = next(ln for ln in res.source.splitlines() if "# 10 " in ln)
+    assert line == (
+        'd33c1791_dfd2_4102_8540_aa63e4434cd2 = Subgraph["d33c1791-dfd2-4102-8540-aa63e4434cd2"]()'
+        "  # 10 subgraph d33c1791-dfd2-4102-8540-aa63e4434cd2 definition missing"
+    )
+    assert "node 10: subgraph definition d33c1791-dfd2-4102-8540-aa63e4434cd2 missing; printed opaquely" in res.warnings
+
+
+def test_reroute_splice_orders_source_before_consumer(sd15_graph):
+    # source 9 -> reroute 5 -> consumer 2. Without resolving the splice before
+    # toposort, the direct link (5 -> 2) drops (Reroute is never printable),
+    # 9 and 2 both have indegree 0, and ties break ascending -> 2 would print
+    # before 9 (use-before-definition).
+    wf = _mini(
+        [
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 1}, {"name": "vae", "type": "VAE", "link": None}],
+            ),
+            _node(
+                5,
+                "Reroute",
+                inputs=[{"name": "", "type": "*", "link": 2}],
+                outputs=[{"name": "", "type": "LATENT", "links": [1]}],
+            ),
+            _node(
+                9, "EmptyLatentImage", outputs=[{"name": "LATENT", "type": "LATENT", "links": [2]}], widgets=[1, 1, 1]
+            ),
+        ],
+        [[1, 5, 0, 2, 0, "LATENT"], [2, 9, 0, 5, 0, "LATENT"]],
+    )
+    res = render_py(wf, sd15_graph)
+    ids_in_order = [ln.rsplit("# ", 1)[1].split()[0] for ln in res.source.splitlines()]
+    assert ids_in_order.index("9") < ids_in_order.index("2")
+
+
+def test_get_set_splice_orders_source_before_consumer(sd15_graph):
+    # source 9 -> SetNode 5 -> GetNode 6 -> consumer 2, same numeric-id trap.
+    wf = _mini(
+        [
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 1}, {"name": "vae", "type": "VAE", "link": None}],
+            ),
+            _node(6, "GetNode", outputs=[{"name": "LATENT", "type": "LATENT", "links": [1]}], widgets=["v"]),
+            _node(5, "SetNode", inputs=[{"name": "LATENT", "type": "*", "link": 2}], widgets=["v"]),
+            _node(
+                9, "EmptyLatentImage", outputs=[{"name": "LATENT", "type": "LATENT", "links": [2]}], widgets=[1, 1, 1]
+            ),
+        ],
+        [[1, 6, 0, 2, 0, "LATENT"], [2, 9, 0, 5, 0, "LATENT"]],
+    )
+    res = render_py(wf, sd15_graph)
+    ids_in_order = [ln.rsplit("# ", 1)[1].split()[0] for ln in res.source.splitlines()]
+    assert ids_in_order.index("9") < ids_in_order.index("2")
+
+
+def test_cycle_through_reroute_is_refused(sd15_graph):
+    # node 1's samples <- node 2 directly; node 2's samples <- node 1 via
+    # reroute 5. Once spliced this is a genuine 2-node cycle, not two
+    # independent, unordered edges.
+    wf = _mini(
+        [
+            _node(
+                1,
+                "VAEDecode",
+                inputs=[
+                    {"name": "samples", "type": "LATENT", "link": 10},
+                    {"name": "vae", "type": "VAE", "link": None},
+                ],
+                outputs=[{"name": "IMAGE", "type": "IMAGE", "links": [20]}],
+            ),
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[
+                    {"name": "samples", "type": "LATENT", "link": 30},
+                    {"name": "vae", "type": "VAE", "link": None},
+                ],
+                outputs=[{"name": "IMAGE", "type": "IMAGE", "links": [40]}],
+            ),
+            _node(
+                5,
+                "Reroute",
+                inputs=[{"name": "", "type": "*", "link": 20}],
+                outputs=[{"name": "", "type": "IMAGE", "links": [30]}],
+            ),
+        ],
+        [[10, 2, 0, 1, 0, "IMAGE"], [20, 1, 0, 5, 0, "IMAGE"], [30, 5, 0, 2, 0, "IMAGE"]],
+    )
+    with pytest.raises(PrintUnsupported) as e:
+        render_py(wf, sd15_graph)
+    assert e.value.reasons == ["link cycle among nodes 1, 2"]
+
+
+def test_regular_node_nonidentifier_input_uses_kwargs_dict(sd15_graph):
+    wf = _mini(
+        [
+            _node(
+                1, "EmptyLatentImage", outputs=[{"name": "LATENT", "type": "LATENT", "links": [1]}], widgets=[1, 1, 1]
+            ),
+            _node(
+                8,
+                "BatchImagesNode",
+                inputs=[
+                    {"name": "images.image0", "type": "IMAGE", "link": None},
+                    {"name": "images.image1", "type": "IMAGE", "link": 1},
+                ],
+            ),
+        ],
+        [[1, 1, 0, 8, 1, "IMAGE"]],
+    )
+    res = render_py(wf, sd15_graph)
+    line = next(ln for ln in res.source.splitlines() if "# 8" in ln)
+    assert "images.image0=" not in line
+    assert "images.image1=" not in line
+    assert '**{"images.image0": None, "images.image1": empty_latent_image}' in line
+
+
+def test_widget_backed_input_with_live_link_uses_edge_ref(sd15_graph):
+    wf = _mini(
+        [
+            _node(20, "TextSource", outputs=[{"name": "STRING", "type": "STRING", "links": [1]}]),
+            _node(
+                6,
+                "CLIPTextEncode",
+                inputs=[
+                    {"name": "clip", "type": "CLIP", "link": None},
+                    {"name": "text", "type": "STRING", "widget": {"name": "text"}, "link": 1},
+                ],
+                widgets=["stale"],
+            ),
+        ],
+        [[1, 20, 0, 6, 1, "STRING"]],
+    )
+    res = render_py(wf, sd15_graph)
+    assert "clip_text_encode = CLIPTextEncode(clip=None, text=text_source)  # 6" in res.source
+    assert "stale" not in res.source
+
+
+def test_sd15_golden_unaffected_by_live_link_widget_fix(sd15_workflow, sd15_graph):
+    # No input in the sd15 fixture has both a "widget" key and a live link
+    # from a real node, so the fix in test_widget_backed_input_with_live_link_uses_edge_ref
+    # must not touch this golden.
+    res = render_py(sd15_workflow, sd15_graph)
+    body = (
+        "\n".join(ln for ln in res.source.splitlines() if not ln.startswith("# note") and not ln.startswith("# group"))
+        + "\n"
+    )
+    assert body == SD15_GOLDEN
+
+
+def test_definition_lists_every_instance_address(sd15_graph):
+    # INNER is instantiated directly at top level (node 200) AND nested inside
+    # OUTER's own interior (inner node 5 of OUTER's instance, node 100) — its
+    # header must list both, not just whichever was discovered first.
+    inner_uuid = "11111111-2222-3333-4444-555555555555"
+    outer_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    outer_def = {
+        "id": outer_uuid,
+        "name": "Outer",
+        "nodes": [{"id": 5, "type": inner_uuid, "inputs": [], "outputs": [], "widgets_values": []}],
+        "links": [],
+        "inputs": [],
+        "outputs": [],
+    }
+    inner_def = {"id": inner_uuid, "name": "Inner", "nodes": [], "links": [], "inputs": [], "outputs": []}
+    wf = {
+        "nodes": [
+            _node(100, outer_uuid),
+            _node(200, inner_uuid),
+        ],
+        "links": [],
+        "definitions": {"subgraphs": [outer_def, inner_def]},
+        "version": 0.4,
+    }
+    res = render_py(wf, sd15_graph)
+    header = next(ln for ln in res.source.splitlines() if ln.startswith(f"# subgraph {inner_uuid}"))
+    assert "100/5" in header
+    assert "200" in header
+
+
+# ---------------------------------------------------------------------------
+# Final review wave: malformed input, dotted widget names, nested subgraph
+# instance addressing, catalog defaults, bypass markers.
+# ---------------------------------------------------------------------------
+
+SEEDREAM_GOLDEN_LINE = (
+    'byte_dance_seedream_node_v2 = ByteDanceSeedreamNodeV2(prompt="A sci-fi cyberpunk graphic design poster. '
+    "In the center, a striking portrait of a female android with glossy, liquid chrome skin. A vivid swirling "
+    "streak of neon orange, yellow, and pink liquid paint brush stroke horizontally covers her eyes, soft "
+    "smudged color overlay with smooth flowing pigment texture, no cracks or broken facial surfaces. The "
+    "background is a dark, textured charcoal gray. Behind the central figure, large bold white futuristic "
+    'typography reads \\"Seedream 5.0 Pro\\" with a subtle digital glitch and halftone texture. The composition '
+    "is decorated with technical HUD elements, thin white lines, geometric wireframe diagrams, barcodes, and "
+    "small sci-fi text boxes. Semi-transparent glassy spheres with grid textures overlap the foreground, "
+    'creating depth. The overall mood is high-tech, dystopian, and avant-garde.", model="seedream 5.0 pro", '
+    'seed=0, control_after_generate="randomize", watermark=False, thinking=True, '
+    '**{"model.images.image_1": None, "model.size_preset": "(1K) 1024x1024 (1:1)", "model.width": 2048, '
+    '"model.height": 2048})  # 1 model.images grows IMAGE'
+)
+
+
+def test_seedream_dynamic_combo_golden():
+    # A dynamic combo expands into DOTTED sub-widget names ("model.size_preset")
+    # that are not Python identifiers: they must land in the trailing **{...},
+    # not be pasted in as `model.size_preset=...` (which does not parse).
+    import ast
+
+    wf = json.loads((FIXTURES / "seedream_5_0_pro_t2i_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "object_info_bytedance_seedream_v2.json").read_text()))
+    res = render_py(wf, graph)
+    ast.parse(res.source)  # the whole render is syntactically valid Python
+
+    line = next(ln for ln in res.source.splitlines() if "  # 1 " in ln)
+    # The auto-grow group `model.images` owns no widget slot; it is named in
+    # the comment (with its element type) so the reader knows it exists.
+    assert line == SEEDREAM_GOLDEN_LINE
+    kwargs = line.split("**{", 1)[1]
+    for frag in (
+        '"model.size_preset": "(1K) 1024x1024 (1:1)"',
+        '"model.width": 2048',
+        '"model.height": 2048',
+    ):
+        assert frag in kwargs
+    assert "model.size_preset=" not in line and "model.width=" not in line
+    # R11: `thinking` has no serialized widget value; the catalog default prints.
+    assert "thinking=True" in line
+
+
+def test_non_identifier_proxy_names_use_subscripts(sd15_graph):
+    uuid = "22222222-3333-4444-5555-666666666666"
+    sg_def = {
+        "id": uuid,
+        "name": "Odd Names",
+        "inputs": [{"name": "my value", "type": "LATENT", "linkIds": [1]}],
+        "outputs": [{"name": "final image", "type": "IMAGE", "linkIds": [2]}],
+        "nodes": [
+            _node(
+                7,
+                "VAEDecode",
+                inputs=[
+                    {"name": "samples", "type": "LATENT", "link": 1},
+                    {"name": "vae", "type": "VAE", "link": None},
+                ],
+                outputs=[{"name": "IMAGE", "type": "IMAGE"}],
+            )
+        ],
+        "links": [
+            {"id": 1, "origin_id": -10, "origin_slot": 0, "target_id": 7, "target_slot": 0},
+            {"id": 2, "origin_id": 7, "origin_slot": 0, "target_id": -20, "target_slot": 0},
+        ],
+    }
+    wf = {
+        "nodes": [_node(10, uuid, inputs=[{"name": "my value", "type": "LATENT", "link": None}])],
+        "links": [],
+        "definitions": {"subgraphs": [sg_def]},
+        "version": 0.4,
+    }
+    src = render_py(wf, sd15_graph).source
+    assert 'vae_decode = VAEDecode(samples=IN["my value"], vae=None)  # 7' in src
+    assert 'OUT["final image"] = vae_decode' in src
+    assert "IN.my value" not in src and "OUT.final image" not in src
+
+
+@pytest.mark.parametrize("slot", [None, "0"])
+def test_non_integer_link_slot_renders_marked_not_raised(sd15_graph, slot):
+    wf = _mini(
+        [
+            _node(
+                1, "EmptyLatentImage", outputs=[{"name": "LATENT", "type": "LATENT", "links": [7]}], widgets=[1, 1, 1]
+            ),
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 7}, {"name": "vae", "type": "VAE", "link": None}],
+            ),
+        ],
+        [[7, 1, slot, 2, 0, "LATENT"]],
+    )
+    res = render_py(wf, sd15_graph)
+    assert "samples BROKEN link 7: it has a non-integer slot" in res.source
+
+
+def test_non_string_node_type_is_reported_not_crashed():
+    wf = _mini([_node(1, {"not": "a class"})], [])
+
+    with pytest.raises(PrintUnsupported) as exc:
+        render_py(wf, None)
+
+    assert exc.value.reasons == ["node 1 has non-string type {'not': 'a class'}"]
+
+
+def test_malformed_input_entry_is_skipped_with_warning(sd15_graph):
+    n = _node(2, "VAEDecode", inputs=[{"name": "samples", "type": "LATENT", "link": None}])
+    n["inputs"].extend(["junk", 7])
+    res = render_py(_mini([n], []), sd15_graph)
+    assert "vae_decode = VAEDecode(samples=None)  # 2" in res.source
+    assert "node 2: ignoring malformed input entry 'junk'" in res.warnings
+    assert "node 2: ignoring malformed input entry 7" in res.warnings
+
+
+def test_malformed_output_entry_falls_back_to_index_ref_with_warning(sd15_graph):
+    # litegraph has been seen to serialize junk into `outputs` too, not just
+    # `inputs` (see test_malformed_input_entry_is_skipped_with_warning above).
+    # A source node not in the catalog keeps the graph-metadata fallback from
+    # masking the bug: `.out[<slot>]` is the only name left to fall back to.
+    src = _node(1, "UnknownSrcNode", widgets=[1, 1, 1])
+    src["outputs"] = ["junk", "junk2"]
+    tgt = _node(
+        2,
+        "VAEDecode",
+        inputs=[{"name": "samples", "type": "LATENT", "link": 7}, {"name": "vae", "type": "VAE", "link": None}],
+    )
+    res = render_py(_mini([src, tgt], [[7, 1, 0, 2, 0, "LATENT"]]), sd15_graph)
+    assert ".out[0]" in res.source
+    assert "node 1: malformed outputs entry at slot 0; referenced by index" in res.warnings
+
+
+def test_input_without_name_key_does_not_raise(sd15_graph):
+    wf = _mini([_node(2, "VAEDecode", inputs=[{"type": "LATENT", "link": None}])], [])
+    res = render_py(wf, sd15_graph)
+    assert 'vae_decode = VAEDecode(**{"": None})  # 2' in res.source
+    assert res.warnings == []
+
+
+def test_duplicate_node_id_is_refused(sd15_graph):
+    wf = _mini(
+        [
+            _node(1, "EmptyLatentImage", widgets=[1, 1, 1]),
+            _node(1, "VAEDecode", inputs=[{"name": "samples", "type": "LATENT", "link": None}]),
+        ],
+        [],
+    )
+    with pytest.raises(PrintUnsupported) as e:
+        render_py(wf, sd15_graph)
+    assert e.value.reasons == ["duplicate node id 1"]
+
+
+def test_definition_validation_reasons_identify_the_subgraph():
+    subgraph_id = "22222222-3333-4444-5555-666666666666"
+    definition = {
+        "id": subgraph_id,
+        "name": "Duplicate nodes",
+        "inputs": [],
+        "outputs": [],
+        "nodes": [_node(1, "First"), _node(1, "Second")],
+        "links": [],
+    }
+    wf = _mini([_node(10, subgraph_id)], [])
+    wf["definitions"] = {"subgraphs": [definition]}
+
+    with pytest.raises(PrintUnsupported) as error:
+        render_py(wf, None)
+
+    assert error.value.reasons == [f"subgraph {subgraph_id}: duplicate node id 1"]
+
+
+def test_nested_definition_expands_through_every_ancestor_instance(sd15_graph):
+    # Outer is instantiated TWICE (100, 200); its interior — rendered once,
+    # under the first instance — holds Inner at inner id 5. Inner therefore
+    # really exists at 100/5 AND 200/5, and its header must say so.
+    inner_uuid = "33333333-4444-5555-6666-777777777777"
+    outer_uuid = "44444444-5555-6666-7777-888888888888"
+    outer_def = {
+        "id": outer_uuid,
+        "name": "Outer",
+        "nodes": [_node(5, inner_uuid)],
+        "links": [],
+        "inputs": [],
+        "outputs": [],
+    }
+    inner_def = {"id": inner_uuid, "name": "Inner", "nodes": [], "links": [], "inputs": [], "outputs": []}
+    wf = {
+        "nodes": [_node(100, outer_uuid), _node(200, outer_uuid)],
+        "links": [],
+        "definitions": {"subgraphs": [outer_def, inner_def]},
+        "version": 0.4,
+    }
+    res = render_py(wf, sd15_graph)
+    header = next(ln for ln in res.source.splitlines() if ln.strip().startswith(f"# subgraph {inner_uuid}"))
+    assert "instances: 100/5, 200/5" in header
+    # bindings may still key off the first instance only
+    assert "address inner nodes as 100/5/<id>; bindings keyed 100/5/<name>" in header
+
+
+def test_bypassed_source_is_marked_on_the_consumer(sd15_graph):
+    wf = _mini(
+        [
+            _node(
+                1,
+                "EmptyLatentImage",
+                outputs=[{"name": "LATENT", "type": "LATENT", "links": [1]}],
+                widgets=[64, 64, 1],
+                mode=4,
+            ),
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 1}, {"name": "vae", "type": "VAE", "link": None}],
+            ),
+        ],
+        [[1, 1, 0, 2, 0, "LATENT"]],
+    )
+    src = render_py(wf, sd15_graph).source
+    # the link still prints as wired; the marker is the only difference
+    assert "vae_decode = VAEDecode(samples=empty_latent_image, vae=None)  # 2 samples via bypassed 1" in src
+
+
+def test_bypass_marker_does_not_touch_the_sd15_golden(sd15_workflow, sd15_graph):
+    res = render_py(sd15_workflow, sd15_graph)
+    body = (
+        "\n".join(ln for ln in res.source.splitlines() if not ln.startswith("# note") and not ln.startswith("# group"))
+        + "\n"
+    )
+    assert body == SD15_GOLDEN
+    assert "via bypassed" not in res.source
+
+
+def test_definition_output_warning_is_not_double_qualified(sd15_graph):
+    # A GetNode with no SetNode wired straight to the definition's output: the
+    # warning names the OUT pseudo-target, and must not repeat the instance id.
+    uuid = "55555555-6666-7777-8888-999999999999"
+    sg_def = {
+        "id": uuid,
+        "name": "Dangling Out",
+        "inputs": [],
+        "outputs": [{"name": "IMAGE", "type": "IMAGE", "linkIds": [1]}],
+        "nodes": [_node(9, "GetNode", outputs=[{"name": "IMAGE", "type": "IMAGE"}], widgets=["nope"])],
+        "links": [{"id": 1, "origin_id": 9, "origin_slot": 0, "target_id": -20, "target_slot": 0}],
+    }
+    wf = {
+        "nodes": [_node(11, uuid)],
+        "links": [],
+        "definitions": {"subgraphs": [sg_def]},
+        "version": 0.4,
+    }
+    res = render_py(wf, sd15_graph)
+    assert "OUT.IMAGE = None" in res.source
+    assert "node 11/OUT: input 'IMAGE' reads GetNode 11/9 variable 'nope' that no SetNode publishes" in res.warnings
+    assert not any("11/11" in w for w in res.warnings)
+
+
+def test_reroute_cycle_warns_instead_of_silently_printing_none(sd15_graph):
+    wf = _mini(
+        [
+            _node(
+                5,
+                "Reroute",
+                inputs=[{"name": "", "type": "*", "link": 1}],
+                outputs=[{"name": "", "type": "LATENT", "links": [3]}],
+            ),
+            _node(
+                6,
+                "Reroute",
+                inputs=[{"name": "", "type": "*", "link": 2}],
+                outputs=[{"name": "", "type": "LATENT", "links": [1]}],
+            ),
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 3}, {"name": "vae", "type": "VAE", "link": None}],
+            ),
+        ],
+        [[1, 6, 0, 5, 0, "LATENT"], [2, 5, 0, 6, 0, "LATENT"], [3, 5, 0, 2, 0, "LATENT"]],
+    )
+    res = render_py(wf, sd15_graph)
+    assert "vae_decode = VAEDecode(samples=None, vae=None)  # 2" in res.source
+    assert "node 2: input 'samples' unresolved through a reroute/getnode cycle" in res.warnings
+
+
+def test_non_object_top_level_node_entries_are_ignored_with_warning(sd15_graph):
+    # litegraph has been seen to serialize a bare `null` into `nodes[]`. `_validate`
+    # used to call `.get("type")` on every entry with no isinstance check, so this
+    # raised AttributeError instead of rendering the rest of the workflow.
+    wf = _mini(
+        [None, _node(1, "EmptyLatentImage", widgets=[64, 64, 1]), "junk"],
+        [],
+    )
+    res = render_py(wf, sd15_graph)
+    assert "empty_latent_image = EmptyLatentImage(width=64, height=64, batch_size=1)  # 1" in res.source
+    assert "workflow: ignoring 2 non-object node entries" in res.warnings
+
+
+def test_non_dict_definitions_block_is_ignored_with_warning(sd15_graph):
+    # `(workflow.get("definitions") or {}).get("subgraphs")` assumed `definitions`
+    # was a dict; a non-empty list is truthy so `or {}` never fired, and `.get`
+    # raised AttributeError. A malformed `definitions` block now degrades to "no
+    # definitions" plus a warning, matching `_extract_notes` in command/workflow.py.
+    wf = _mini([_node(1, "EmptyLatentImage", widgets=[64, 64, 1])], [])
+    wf["definitions"] = [1]
+    res = render_py(wf, sd15_graph)
+    assert "empty_latent_image = EmptyLatentImage(width=64, height=64, batch_size=1)  # 1" in res.source
+    assert "workflow: ignoring non-object definitions block" in res.warnings
+
+
+@pytest.mark.parametrize("subgraphs", [5, "abc", {"a": 1}], ids=["int", "str", "dict"])
+def test_non_list_subgraphs_block_is_ignored_with_warning(sd15_graph, subgraphs):
+    # One level below the case above: a dict `definitions` whose `subgraphs` is
+    # truthy but not a list used to be iterated (TypeError on an int).
+    wf = _mini([_node(1, "EmptyLatentImage", widgets=[64, 64, 1])], [])
+    wf["definitions"] = {"subgraphs": subgraphs}
+    res = render_py(wf, sd15_graph)
+    assert "empty_latent_image = EmptyLatentImage(width=64, height=64, batch_size=1)  # 1" in res.source
+    assert "workflow: ignoring non-list definitions.subgraphs block" in res.warnings
+
+
+def test_non_string_output_name_falls_back_to_out_index(sd15_graph):
+    # A dict outputs[slot] with a truthy non-string "name" (e.g. an int) used to
+    # reach `_IDENT.match(out_name)` and raise TypeError. It must fall back to the
+    # indexed `.out[<slot>]` form instead, same as a non-identifier string name.
+    wf = _mini(
+        [
+            _node(
+                1,
+                "EmptyLatentImage",
+                outputs=[
+                    {"name": 1, "type": "LATENT", "links": [1]},
+                    {"name": "extra", "type": "X", "links": []},
+                ],
+                widgets=[1, 1, 1],
+            ),
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 1}, {"name": "vae", "type": "VAE", "link": None}],
+            ),
+        ],
+        [[1, 1, 0, 2, 0, "LATENT"]],
+    )
+    src = render_py(wf, sd15_graph).source
+    assert "samples=empty_latent_image.out[0]" in src
+
+
+def test_bypass_mode_on_resolved_subgraph_instance(sd15_graph):
+    sub_id = "d33c1791-dfd2-4102-8540-aa63e4434cd2"
+    wf = _mini([_node(10, sub_id, mode=4)], [])
+    wf["definitions"] = {"subgraphs": [{"id": sub_id, "name": "MySub", "nodes": [], "links": []}]}
+    res = render_py(wf, sd15_graph)
+    line = next(ln for ln in res.source.splitlines() if "# 10 " in ln)
+    assert line == f'my_sub = Subgraph["MySub"]()  # 10 subgraph {sub_id} mode=bypass'
+
+
+def test_bypass_mode_on_missing_subgraph_definition(sd15_graph):
+    wf = _mini([_node(10, "d33c1791-dfd2-4102-8540-aa63e4434cd2", mode=4)], [])
+    res = render_py(wf, sd15_graph)
+    line = next(ln for ln in res.source.splitlines() if "# 10 " in ln)
+    assert line == (
+        'd33c1791_dfd2_4102_8540_aa63e4434cd2 = Subgraph["d33c1791-dfd2-4102-8540-aa63e4434cd2"]()'
+        "  # 10 subgraph d33c1791-dfd2-4102-8540-aa63e4434cd2 definition missing mode=bypass"
+    )
+
+
+# ---------------------------------------------------------------------------
+# A link whose target input slot the node no longer has (a stale link left
+# behind after the node's inputs changed: converted widgets, dynamic or
+# auto-grow inputs). The editor loads such a workflow — its link fixer keeps
+# the link only while an output still lists it and never wires it into an
+# input — so the printer renders everything else and reports the link.
+# ---------------------------------------------------------------------------
+
+
+def _stale_slot_workflow(extra_link):
+    return _mini(
+        [
+            _node(
+                1,
+                "EmptyLatentImage",
+                outputs=[{"name": "LATENT", "type": "LATENT", "links": [1]}],
+                widgets=[512, 512, 1],
+            ),
+            _node(
+                2,
+                "VAEDecode",
+                inputs=[{"name": "samples", "type": "LATENT", "link": 1}, {"name": "vae", "type": "VAE", "link": None}],
+                outputs=[{"name": "IMAGE", "type": "IMAGE", "links": []}],
+            ),
+        ],
+        [[1, 1, 0, 2, 0, "LATENT"], extra_link],
+    )
+
+
+def test_out_of_range_input_slot_renders_and_warns(sd15_graph):
+    res = render_py(_stale_slot_workflow([7, 1, 0, 2, 6, "LATENT"]), sd15_graph)
+    assert res.node_count == 2
+    assert "samples=empty_latent_image" in res.source
+    assert "vae=None" in res.source
+    assert res.warnings == [
+        # Link 1 already carries node 1's LATENT into `samples`: the stale row is
+        # a duplicate of a live link, so nothing is sent to be re-wired.
+        "link 7 targets input slot 6 on node 2, which has 2 inputs; a leftover row — input 'samples' already gets "
+        "that value from node 1 output 0 through another link, so nothing needs re-wiring"
+    ]
+
+
+def test_out_of_range_input_slot_adds_no_ordering_edge(sd15_graph):
+    # A stale link pointing BACK from 2 to 1 must not turn into a false cycle.
+    wf = _stale_slot_workflow([7, 2, 0, 1, 6, "IMAGE"])
+    res = render_py(wf, sd15_graph)
+    assert [ln.rsplit("# ", 1)[1].split()[0] for ln in res.source.splitlines()] == ["1", "2"]
+    assert res.warnings == [
+        "link 7 targets input slot 6 on node 1, which has 0 inputs; no input holds it, so it feeds nothing and was "
+        "ignored. It was wired from node 2 output 0 — if that value was meant for node 1, re-wire it with "
+        "`connect 2.0 1.<input>` rather than retyping the value"
+    ]
+
+
+def test_out_of_range_input_slot_held_by_an_input_renders_through_that_input(sd15_graph):
+    # The input side is what the node reads: an input that holds the link id is
+    # wired, whatever slot index the link row itself records.
+    wf = _stale_slot_workflow([7, 1, 0, 2, 6, "LATENT"])
+    wf["links"] = [[7, 1, 0, 2, 6, "LATENT"]]
+    wf["nodes"][1]["inputs"][0]["link"] = 7
+    res = render_py(wf, sd15_graph)
+    assert "samples=empty_latent_image" in res.source
+    assert res.warnings == [
+        "link 7 targets input slot 6 on node 2, which has 2 inputs; rendered through input 'samples', which holds it"
+    ]
+
+
+def test_out_of_range_input_slot_inside_a_definition_is_qualified(sd15_graph):
+    wf = json.loads((FIXTURES / "subgraph_template_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "subgraph_object_info.json").read_text()))
+    sg = next(s for s in wf["definitions"]["subgraphs"] if s["id"] == "d33c1791-dfd2-4102-8540-aa63e4434cd2")
+    # An extra interior link row nothing holds, aimed past the target's inputs.
+    src = next(n for n in sg["nodes"] if n.get("outputs"))
+    tgt = next(n for n in sg["nodes"] if n is not src)
+    bad = {"id": 9999, "origin_id": src["id"], "origin_slot": 0, "target_id": tgt["id"], "target_slot": 42, "type": "*"}
+    sg["links"].append(bad)
+    res = render_py(wf, graph)
+    n_inputs = len(tgt.get("inputs") or [])
+    assert (
+        f"link 9999 targets input slot 42 on node 10/{tgt['id']}, which has {n_inputs} inputs; "
+        f"no input holds it, so it feeds nothing and was ignored. It was wired from node 10/{src['id']} output 0 — "
+        f"if that value was meant for node 10/{tgt['id']}, re-wire it with `connect 10/{src['id']}.0 "
+        f"10/{tgt['id']}.<input>` rather than retyping the value"
+    ) in res.warnings
+
+
+def test_out_of_range_input_slot_on_a_node_without_inputs_is_reported(sd15_graph):
+    wf = _stale_slot_workflow([7, 2, 0, 1, 0, "IMAGE"])
+    del wf["nodes"][0]["inputs"]
+    res = render_py(wf, sd15_graph)
+    assert [ln.rsplit("# ", 1)[1].split()[0] for ln in res.source.splitlines()] == ["1", "2"]
+    assert res.warnings == [
+        "link 7 targets input slot 0 on node 1, which has 0 inputs; no input holds it, so it feeds nothing and was "
+        "ignored. It was wired from node 2 output 0 — if that value was meant for node 1, re-wire it with "
+        "`connect 2.0 1.<input>` rather than retyping the value"
+    ]
+
+
+def test_out_of_range_input_slot_fed_by_the_definition_input_proxy_is_reported(sd15_graph):
+    wf = json.loads((FIXTURES / "subgraph_template_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "subgraph_object_info.json").read_text()))
+    sg = next(s for s in wf["definitions"]["subgraphs"] if s["id"] == "d33c1791-dfd2-4102-8540-aa63e4434cd2")
+    tgt = sg["nodes"][0]
+    sg["links"].append(
+        {"id": 9998, "origin_id": -10, "origin_slot": 0, "target_id": tgt["id"], "target_slot": 42, "type": "*"}
+    )
+    sg["inputs"][0]["linkIds"].append(9998)
+    res = render_py(wf, graph)
+    n_inputs = len(tgt.get("inputs") or [])
+    assert any(
+        f"link 9998 targets input slot 42 on node 10/{tgt['id']}, which has {n_inputs} inputs" in warning
+        and "a leftover row" in warning
+        for warning in res.warnings
+    )
+
+
+def test_malformed_definition_boundary_slots_warn_and_drop(sd15_graph):
+    subgraph_id = "22222222-3333-4444-5555-666666666666"
+    definition = {
+        "id": subgraph_id,
+        "name": "Malformed boundary slots",
+        "inputs": [{"name": "samples", "type": "LATENT", "linkIds": [1, 2]}],
+        "outputs": [{"name": "IMAGE", "type": "IMAGE", "linkIds": [3, 4]}],
+        "nodes": [
+            _node(
+                7,
+                "VAEDecode",
+                inputs=[
+                    {"name": "samples", "type": "LATENT", "link": 1},
+                    {"name": "vae", "type": "VAE", "link": 2},
+                ],
+                outputs=[{"name": "IMAGE", "type": "IMAGE"}],
+            )
+        ],
+        "links": [
+            {"id": 1, "origin_id": -10, "origin_slot": "0", "target_id": 7, "target_slot": 0},
+            {"id": 2, "origin_id": -10, "origin_slot": 0, "target_id": 7, "target_slot": -1},
+            {"id": 3, "origin_id": 7, "origin_slot": "0", "target_id": -20, "target_slot": 0},
+            {"id": 4, "origin_id": 7, "origin_slot": 0, "target_id": -20, "target_slot": -1},
+        ],
+    }
+    wf = _mini([_node(10, subgraph_id)], [])
+    wf["definitions"] = {"subgraphs": [definition]}
+
+    res = render_py(wf, sd15_graph)
+
+    assert "IN.samples" in res.source
+    assert "OUT.IMAGE = None" not in res.source
+    warnings = "\n".join(res.warnings)
+    assert "input link 1 declares boundary slot '0' but is listed under input slot 0" in warnings
+    assert "non-integer input slot" not in warnings
+    assert "rendered through input 'vae'" in warnings
+    assert "invalid source slot '0'; it was ignored" in warnings
+    assert "output link 4 declares boundary slot -1 but is listed under output slot 0" in warnings
+    assert "rendered through input 'samples'" not in warnings
+
+
+def test_definition_input_proxy_uses_raw_slot_positions(sd15_graph):
+    subgraph_id = "22222222-3333-4444-5555-666666666666"
+    definition = {
+        "id": subgraph_id,
+        "name": "Raw boundary slots",
+        "inputs": [5, {"name": "samples", "type": "LATENT", "linkIds": [1]}],
+        "outputs": [],
+        "nodes": [
+            _node(
+                7,
+                "VAEDecode",
+                inputs=[
+                    {"name": "samples", "type": "LATENT", "link": 1},
+                    {"name": "vae", "type": "VAE", "link": None},
+                ],
+            )
+        ],
+        "links": [{"id": 1, "origin_id": -10, "origin_slot": 1, "target_id": 7, "target_slot": 0}],
+    }
+    wf = _mini([_node(10, subgraph_id)], [])
+    wf["definitions"] = {"subgraphs": [definition]}
+
+    res = render_py(wf, sd15_graph)
+
+    assert "samples=IN.samples" in res.source
+    assert not any("references input slot 1" in warning for warning in res.warnings)
+
+
+def test_output_proxy_target_slot_out_of_range_is_dropped(sd15_graph):
+    wf = json.loads((FIXTURES / "subgraph_template_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "subgraph_object_info.json").read_text()))
+    sg = next(s for s in wf["definitions"]["subgraphs"] if s["id"] == "d33c1791-dfd2-4102-8540-aa63e4434cd2")
+    link = next(item for item in sg["links"] if str(item.get("target_id")) == "-20")
+    link["target_slot"] = 4
+
+    res = render_py(wf, graph)
+
+    assert "OUT.out4" not in res.source
+    assert any("declares boundary slot 4 but is listed under output slot" in w for w in res.warnings)
+
+
+def test_in_range_unheld_definition_input_proxy_link_is_reported_as_leftover():
+    wf = json.loads((FIXTURES / "subgraph_template_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "subgraph_object_info.json").read_text()))
+    sg = next(s for s in wf["definitions"]["subgraphs"] if s["id"] == "d33c1791-dfd2-4102-8540-aa63e4434cd2")
+    target = next(node for node in sg["nodes"] if node.get("inputs"))
+    sg["links"].append(
+        {
+            "id": 9999,
+            "origin_id": -10,
+            "origin_slot": 0,
+            "target_id": target["id"],
+            "target_slot": 0,
+            "type": "*",
+        }
+    )
+    sg["inputs"][0]["linkIds"].append(9999)
+
+    res = render_py(wf, graph)
+
+    assert any(
+        warning.startswith(f"link 9999 targets input slot 0 on node 10/{target['id']}") and "a leftover row" in warning
+        for warning in res.warnings
+    )
+
+
+def test_non_list_inputs_are_treated_as_empty_with_warning(sd15_graph):
+    node = _node(1, "EmptyLatentImage", widgets=[512, 512, 1])
+    node["inputs"] = 5
+    res = render_py(_mini([node], []), sd15_graph)
+    assert res.node_count == 1
+    assert res.warnings == ["node 1 has non-list inputs; treated as empty"]
+
+
+def test_non_list_outputs_keep_unknown_link_slots_live():
+    source = _node(1, "Source")
+    source["outputs"] = {"malformed": True}
+    target = _node(2, "Target", inputs=[{"name": "value", "link": 7}])
+
+    res = render_py(_mini([source, target], [[7, 1, 19, 2, 0]]), None)
+
+    assert "target = Target(value=source" in res.source
+    assert "node 1 has non-list outputs; treated as empty" in res.warnings
+    assert not any("BROKEN link 7" in warning for warning in res.warnings)
+
+
+def test_definition_inputs_are_normalized_before_promoted_lookup(sd15_graph):
+    subgraph_id = "22222222-3333-4444-5555-666666666666"
+    interior = _node(7, "VAEDecode")
+    interior["inputs"] = 5
+    definition = {
+        "id": subgraph_id,
+        "name": "Malformed inputs",
+        "inputs": [{"name": "samples", "type": "LATENT"}],
+        "outputs": [],
+        "nodes": [interior],
+        "links": [{"id": 1, "origin_id": -10, "origin_slot": 0, "target_id": 7, "target_slot": 0}],
+    }
+    wf = _mini([_node(10, subgraph_id)], [])
+    wf["definitions"] = {"subgraphs": [definition]}
+    res = render_py(wf, sd15_graph)
+    assert "node 10/7 has non-list inputs; treated as empty" in res.warnings
+
+
+def test_link_row_is_retargeted_to_the_input_that_holds_it(sd15_graph):
+    wf = _stale_slot_workflow([7, 1, 0, 2, 6, "LATENT"])
+    wf["links"] = [[7, 1, 0, 2, 6, "LATENT"]]
+    wf["nodes"].append(
+        _node(
+            3,
+            "VAEDecode",
+            inputs=[{"name": "samples", "type": "LATENT", "link": 7}, {"name": "vae", "type": "VAE", "link": None}],
+        )
+    )
+    res = render_py(wf, sd15_graph)
+    assert "samples=empty_latent_image" in next(line for line in res.source.splitlines() if "# 3" in line)
+    assert "rendered through input 'samples' on node 3" in res.warnings[0]
+
+
+@pytest.mark.parametrize(
+    ("declared_target", "declared_slot"),
+    [(999, "bad"), (999, -1), (2, "bad")],
+)
+def test_actual_holder_recovers_missing_or_malformed_declared_targets(sd15_graph, declared_target, declared_slot):
+    wf = _stale_slot_workflow([7, 1, 0, declared_target, declared_slot, "LATENT"])
+    wf["links"] = [[7, 1, 0, declared_target, declared_slot, "LATENT"]]
+    wf["nodes"][1]["inputs"][0]["link"] = None
+    wf["nodes"].append(
+        _node(
+            3,
+            "VAEDecode",
+            inputs=[{"name": "samples", "type": "LATENT", "link": 7}, {"name": "vae", "link": None}],
+        )
+    )
+
+    res = render_py(wf, sd15_graph)
+
+    assert "samples=empty_latent_image" in next(line for line in res.source.splitlines() if "# 3" in line)
+    assert any("rendered through input 'samples' on node 3, which holds it" in warning for warning in res.warnings)
+    assert not any("BROKEN link 7" in warning for warning in res.warnings)
+
+
+@pytest.mark.parametrize("malformed_slot", [True, False, 0.0])
+def test_malformed_target_slot_does_not_exact_match_a_holder(malformed_slot):
+    nodes = [_node(1, "A", outputs=[{"name": "out", "links": [7]}])]
+    nodes.append(
+        _node(
+            2,
+            "B",
+            inputs=[{"name": "first", "link": 7}, {"name": "second", "link": 7}],
+        )
+    )
+
+    warnings, _ignored, retargeted, dependencies = workflow_print._stale_input_slot_links(
+        nodes, [[7, 1, 0, 2, malformed_slot, "*"]]
+    )
+
+    assert retargeted == {workflow_print._link_key(7): (2, 0)}
+    assert dependencies == {workflow_print._link_key(7): [(2, 0), (2, 1)]}
+    assert any("non-integer input slot" in warning for warning in warnings)
+
+
+def test_duplicate_link_holder_preserves_the_real_cycle():
+    wf = _mini(
+        [
+            _node(1, "A", inputs=[{"name": "from_c", "link": 2}], outputs=[{"name": "out", "links": [1]}]),
+            _node(2, "B", inputs=[{"name": "from_a", "link": 1}]),
+            _node(
+                3,
+                "C",
+                inputs=[{"name": "duplicate", "link": 1}],
+                outputs=[{"name": "out", "links": [2]}],
+            ),
+        ],
+        [[1, 1, 0, 2, 0], [2, 3, 0, 1, 0]],
+    )
+
+    with pytest.raises(PrintUnsupported, match="link cycle among nodes 1, 2, 3"):
+        render_py(wf, None)
+
+
+def test_output_boundary_row_held_by_an_input_preserves_its_dependency_cycle():
+    subgraph_id = "22222222-3333-4444-5555-666666666666"
+    definition = {
+        "id": subgraph_id,
+        "name": "Boundary holder cycle",
+        "inputs": [],
+        "outputs": [{"name": "value", "type": "*", "linkIds": [1]}],
+        "nodes": [
+            _node(1, "A", inputs=[{"name": "from_b", "link": 2}], outputs=[{"name": "out", "links": [1]}]),
+            _node(2, "B", inputs=[{"name": "from_a", "link": 1}], outputs=[{"name": "out", "links": [2]}]),
+        ],
+        "links": [
+            {"id": 1, "origin_id": 1, "origin_slot": 0, "target_id": -20, "target_slot": 0},
+            {"id": 2, "origin_id": 2, "origin_slot": 0, "target_id": 1, "target_slot": 0},
+        ],
+    }
+    workflow = _mini([_node(10, subgraph_id)], [])
+    workflow["definitions"] = {"subgraphs": [definition]}
+
+    with pytest.raises(PrintUnsupported, match="link cycle among nodes 1, 2"):
+        render_py(workflow, None)
+
+
+def test_in_range_link_row_follows_the_actual_holder(sd15_graph):
+    wf = _stale_slot_workflow([7, 1, 0, 2, 0, "LATENT"])
+    wf["links"] = [[7, 1, 0, 2, 0, "LATENT"]]
+    wf["nodes"][1]["inputs"][0]["link"] = None
+    wf["nodes"].append(
+        _node(
+            3,
+            "VAEDecode",
+            inputs=[{"name": "samples", "type": "LATENT", "link": 7}, {"name": "vae", "type": "VAE", "link": None}],
+        )
+    )
+    res = render_py(wf, sd15_graph)
+    assert "samples=empty_latent_image" in next(line for line in res.source.splitlines() if "# 3" in line)
+    assert "but that input does not hold it" in res.warnings[0]
+
+
+def test_in_range_unheld_duplicate_is_reported_as_leftover(sd15_graph):
+    result = render_py(_stale_slot_workflow([7, 1, 0, 2, 1, "LATENT"]), sd15_graph)
+
+    assert result.warnings == [
+        "link 7 targets input slot 1 on node 2, but that input does not hold it; a leftover row — input 'samples' "
+        "already gets that value from node 1 output 0 through another link, so nothing needs re-wiring"
+    ]
+
+
+@pytest.mark.parametrize("malformed", [5, {}, "", False])
+def test_malformed_graph_containers_are_reported_not_crashed(malformed):
+    wf = {"nodes": malformed, "links": malformed, "groups": malformed, "definitions": {"subgraphs": malformed}}
+    res = render_py(wf, None)
+    assert "workflow: ignoring non-list nodes block" in res.warnings
+    assert "workflow: ignoring non-list links block" in res.warnings
+    assert "workflow: ignoring non-list groups block" in res.warnings
+    assert "workflow: ignoring non-list definitions.subgraphs block" in res.warnings
+
+
+def test_typed_distinct_holder_does_not_retarget_a_link_row():
+    nodes = [
+        _node(1, "Producer", outputs=[{"name": "value", "links": [7]}]),
+        _node(2, "Consumer", inputs=[{"name": "value", "link": "7"}]),
+    ]
+
+    warnings, broken, rest = workflow_print._broken_links(nodes, [[7, 1, 0, 999, 0, "*"]])
+
+    assert broken == {}
+    assert rest == []
+    assert warnings == ["link 7 targets missing node 999; it feeds nothing and was ignored"]
+
+
+def test_definition_non_list_link_ids_are_reported_and_treated_as_empty():
+    subgraph_id = "22222222-3333-4444-5555-666666666666"
+    wf = _mini([_node(10, subgraph_id)], [])
+    wf["definitions"] = {
+        "subgraphs": [
+            {
+                "id": subgraph_id,
+                "inputs": [{"name": "value", "type": "STRING", "linkIds": 1}],
+                "outputs": [{"name": "result", "type": "STRING", "linkIds": "2"}],
+                "nodes": [],
+                "links": [],
+            }
+        ]
+    }
+
+    res = render_py(wf, None)
+
+    assert f"subgraph {subgraph_id}: input slot 0 has non-list linkIds; treated as empty" in res.warnings
+    assert f"subgraph {subgraph_id}: output slot 0 has non-list linkIds; treated as empty" in res.warnings
+
+
+def test_definition_boundary_link_membership_wins_over_stale_row_slots():
+    subgraph_id = "22222222-3333-4444-5555-666666666666"
+    definition = {
+        "id": subgraph_id,
+        "name": "Boundary membership",
+        "inputs": [
+            {"name": "wrong", "type": "STRING", "linkIds": []},
+            {"name": "right", "type": "STRING", "linkIds": [1]},
+        ],
+        "outputs": [
+            {"name": "wrong_out", "type": "STRING", "linkIds": []},
+            {"name": "right_out", "type": "STRING", "linkIds": [2]},
+        ],
+        "nodes": [
+            _node(
+                7,
+                "Example",
+                inputs=[{"name": "value", "type": "STRING", "link": 1}],
+                outputs=[{"name": "result", "type": "STRING", "links": [2]}],
+            )
+        ],
+        "links": [
+            {"id": 1, "origin_id": -10, "origin_slot": False, "target_id": 7, "target_slot": 0},
+            {"id": 2, "origin_id": 7, "origin_slot": 0, "target_id": -20, "target_slot": 0.0},
+        ],
+    }
+    wf = _mini([_node(10, subgraph_id)], [])
+    wf["definitions"] = {"subgraphs": [definition]}
+
+    res = render_py(wf, None)
+
+    assert "value=IN.right" in res.source
+    assert "OUT.right_out = " in res.source
+    warnings = "\n".join(res.warnings)
+    assert "input link 1 declares boundary slot False but is listed under input slot 1" in warnings
+    assert "output link 2 declares boundary slot 0.0 but is listed under output slot 1" in warnings
+
+
+@pytest.mark.parametrize(
+    "definition_inputs, warning",
+    [
+        ([{"name": "value", "type": "STRING", "linkIds": []}], "no definition input lists it"),
+        ([{"name": "value", "type": "STRING", "linkIds": ["1"]}], "no definition input lists it"),
+        (
+            [
+                {"name": "first", "type": "STRING", "linkIds": [1]},
+                {"name": "second", "type": "STRING", "linkIds": [1]},
+            ],
+            "several definition inputs list it",
+        ),
+    ],
+)
+def test_unlisted_typed_or_ambiguous_input_boundary_membership_is_ignored(definition_inputs, warning):
+    subgraph_id = "22222222-3333-4444-5555-666666666666"
+    definition = {
+        "id": subgraph_id,
+        "inputs": definition_inputs,
+        "outputs": [],
+        "nodes": [_node(7, "Example", inputs=[{"name": "value", "type": "STRING", "link": 1}])],
+        "links": [{"id": 1, "origin_id": -10, "origin_slot": 0, "target_id": 7, "target_slot": 0}],
+    }
+    workflow = _mini([_node(10, subgraph_id)], [])
+    workflow["definitions"] = {"subgraphs": [definition]}
+
+    result = render_py(workflow, None)
+
+    assert "value=IN." not in result.source
+    assert any(warning in item for item in result.warnings)
+
+
+@pytest.mark.parametrize(
+    "definition_outputs, warning",
+    [
+        ([{"name": "value", "type": "STRING", "linkIds": []}], "no definition output lists it"),
+        ([{"name": "value", "type": "STRING", "linkIds": ["1"]}], "no definition output lists it"),
+    ],
+)
+def test_unlisted_typed_or_ambiguous_output_boundary_membership_is_ignored(definition_outputs, warning):
+    subgraph_id = "22222222-3333-4444-5555-666666666666"
+    definition = {
+        "id": subgraph_id,
+        "inputs": [],
+        "outputs": definition_outputs,
+        "nodes": [_node(7, "Example", outputs=[{"name": "value", "type": "STRING", "links": [1]}])],
+        "links": [{"id": 1, "origin_id": 7, "origin_slot": 0, "target_id": -20, "target_slot": 0}],
+    }
+    workflow = _mini([_node(10, subgraph_id)], [])
+    workflow["definitions"] = {"subgraphs": [definition]}
+
+    result = render_py(workflow, None)
+
+    assert not any(line.startswith("    OUT.") and " = example" in line for line in result.source.splitlines())
+    assert any(warning in item for item in result.warnings)
+
+
+def test_one_interior_source_can_render_multiple_definition_outputs():
+    subgraph_id = "22222222-3333-4444-5555-666666666666"
+    definition = {
+        "id": subgraph_id,
+        "inputs": [],
+        "outputs": [
+            {"name": "first", "type": "STRING", "linkIds": [1]},
+            {"name": "second", "type": "STRING", "linkIds": [1]},
+        ],
+        "nodes": [_node(7, "Example", outputs=[{"name": "value", "type": "STRING", "links": [1]}])],
+        "links": [{"id": 1, "origin_id": 7, "origin_slot": 0, "target_id": -20, "target_slot": 0}],
+    }
+    workflow = _mini([_node(10, subgraph_id)], [])
+    workflow["definitions"] = {"subgraphs": [definition]}
+
+    result = render_py(workflow, None)
+
+    assert "OUT.first = example" in result.source
+    assert "OUT.second = example" in result.source
+
+
+def test_definition_output_uses_the_first_live_definition_link():
+    subgraph_id = "22222222-3333-4444-5555-666666666666"
+    definition = {
+        "id": subgraph_id,
+        "inputs": [],
+        "outputs": [{"name": "result", "type": "STRING", "linkIds": [2, 1]}],
+        "nodes": [
+            _node(7, "FirstSource", outputs=[{"name": "value", "type": "STRING", "links": [1]}]),
+            _node(8, "SecondSource", outputs=[{"name": "value", "type": "STRING", "links": [2]}]),
+        ],
+        "links": [
+            {"id": 1, "origin_id": 7, "origin_slot": 0, "target_id": -20, "target_slot": 0},
+            {"id": 2, "origin_id": 8, "origin_slot": 0, "target_id": -20, "target_slot": 0},
+        ],
+    }
+    workflow = _mini([_node(10, subgraph_id)], [])
+    workflow["definitions"] = {"subgraphs": [definition]}
+
+    result = render_py(workflow, None)
+
+    assert "OUT.result = first_source" in result.source
+
+
+def test_null_link_id_is_warned_and_dropped(sd15_graph):
+    wf = _stale_slot_workflow([None, 1, 0, 2, 1, "LATENT"])
+    res = render_py(wf, sd15_graph)
+    assert any("link has null id and was ignored" in warning for warning in res.warnings)
+
+
+@pytest.mark.parametrize("link_id", [[], {}, True, 1.5])
+def test_invalid_link_id_is_warned_and_dropped(sd15_graph, link_id):
+    wf = _stale_slot_workflow([link_id, 1, 0, 2, 1, "LATENT"])
+
+    result = render_py(wf, sd15_graph)
+
+    assert result.source
+    assert any("link has invalid id and was ignored" in warning for warning in result.warnings)
+
+
+def test_string_and_integer_link_ids_remain_distinct():
+    wf = _mini(
+        [
+            _node(1, "SourceA", outputs=[{"name": "out", "links": [7]}]),
+            _node(2, "TargetA", inputs=[{"name": "x", "link": 7}]),
+            _node(3, "SourceB", outputs=[{"name": "out", "links": ["7"]}]),
+            _node(4, "TargetB", inputs=[{"name": "x", "link": "7"}]),
+        ],
+        [[7, 1, 0, 2, 0, "*"], ["7", 3, 0, 4, 0, "*"]],
+    )
+
+    result = render_py(wf, None)
+
+    assert "target_a = TargetA(x=source_a)" in result.source
+    assert "target_b = TargetB(x=source_b)" in result.source
+    assert not any("duplicate link id" in warning for warning in result.warnings)
+
+
+def test_broken_last_duplicate_row_evicts_an_earlier_live_row():
+    wf = _mini(
+        [
+            _node(1, "Source", outputs=[{"name": "out", "links": [7]}]),
+            _node(2, "Target", inputs=[{"name": "x", "link": 7}]),
+        ],
+        [[7, 1, 0, 2, 0, "*"], [7, 99, 0, 2, 0, "*"]],
+    )
+
+    result = render_py(wf, None)
+
+    assert "target = Target(x=None)" in result.source
+    assert "duplicate link id 7; using the last row" in result.warnings
+    assert any(warning.startswith("BROKEN link 7") for warning in result.warnings)
+
+
+def test_link_rows_that_only_differ_by_type_are_conflicting_duplicates():
+    wf = _mini(
+        [
+            _node(1, "Source", outputs=[{"name": "out", "links": [7]}]),
+            _node(2, "Target", inputs=[{"name": "x", "link": 7}]),
+        ],
+        [[7, 1, 0, 2, 0, "LATENT"], [7, 1, 0, 2, 0, "IMAGE"]],
+    )
+
+    result = render_py(wf, None)
+
+    assert "duplicate link id 7; using the last row" in result.warnings
+
+
+def test_typed_duplicate_link_rows_use_the_last_row():
+    wf = _mini([_node(1, "Source"), _node(2, "Target", inputs=[{"name": "x", "link": 7}])], [])
+    wf["links"] = [[7, 1, 0, 2, 0], [7, True, 0, 2, 0]]
+    result = render_py(wf, None)
+    assert "target = Target" in result.source
+
+    definition_rows = [
+        {"id": 7, "origin_id": 1, "origin_slot": 0, "target_id": 2, "target_slot": 0},
+        {"id": 7, "origin_id": 3, "origin_slot": 0, "target_id": 2, "target_slot": 0},
+    ]
+    errors: list[str] = []
+    warnings: list[str] = []
+    workflow_print._def_links({"links": definition_rows}, errors, warnings)
+    assert errors == []
+    assert warnings == ["duplicate link id 7; using the last row"]
+
+
+def test_definition_string_and_integer_link_ids_remain_distinct():
+    rows = [
+        {"id": 7, "origin_id": 1, "origin_slot": 0, "target_id": 2, "target_slot": 0},
+        {"id": "7", "origin_id": 3, "origin_slot": 0, "target_id": 4, "target_slot": 0},
+    ]
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    links = workflow_print._def_links({"links": rows}, errors, warnings)
+
+    assert errors == []
+    assert warnings == []
+    assert links[workflow_print._link_key(7)] == (1, 0, 2, 0)
+    assert links[workflow_print._link_key("7")] == (3, 0, 4, 0)
+
+
+def test_definition_duplicate_winner_keeps_its_last_serialized_position():
+    rows = [
+        {"id": 1, "origin_id": "first", "origin_slot": 0, "target_id": -20, "target_slot": 0},
+        {"id": 2, "origin_id": "middle", "origin_slot": 0, "target_id": -20, "target_slot": 0},
+        {"id": 1, "origin_id": "last", "origin_slot": 0, "target_id": -20, "target_slot": 0},
+    ]
+
+    links = workflow_print._def_links({"links": rows}, [], [])
+
+    assert list(links) == [workflow_print._link_key(2), workflow_print._link_key(1)]
+    assert links[workflow_print._link_key(1)][0] == "last"
+
+
+def test_duplicate_link_validation_does_not_scan_rows_twice():
+    rows = [[7, 1, index, 2, 0] for index in range(20)]
+    with mock.patch.object(
+        workflow_print, "_normalised_link_row", wraps=workflow_print._normalised_link_row
+    ) as normalize:
+        assert workflow_print._validate([], rows) == []
+    assert normalize.call_count == 0
+
+    definition_rows = [
+        {"id": 7, "origin_id": 1, "origin_slot": index, "target_id": 2, "target_slot": 0} for index in range(20)
+    ]
+    errors: list[str] = []
+    with mock.patch.object(
+        workflow_print, "_normalised_link_row", wraps=workflow_print._normalised_link_row
+    ) as normalize:
+        warnings = []
+        workflow_print._def_links({"links": definition_rows}, errors, warnings)
+    assert errors == []
+    assert warnings == ["duplicate link id 7; using the last row"]
+    assert normalize.call_count == len(definition_rows)
+
+
+def test_short_malformed_row_does_not_conflict_with_a_complete_link():
+    wf = _mini(
+        [_node(1, "Source", outputs=[{"name": "value"}]), _node(2, "Target", inputs=[{"name": "x", "link": 7}])],
+        [],
+    )
+    wf["links"] = [[7, True], [7, 1, 0, 2, 0]]
+
+    res = render_py(wf, None)
+
+    assert "target = Target(x=source" in res.source
+    assert "ignoring malformed link row [7, True]" in res.warnings
+
+
+def test_workflow_fields_cannot_spoof_normalisation_markers():
+    node = _node(1, "Example")
+    node["_workflow_print_nonlist_inputs"] = True
+    node["_workflow_print_nonlist_outputs"] = True
+    res = render_py(_mini([node], []), None)
+    assert not [warning for warning in res.warnings if "non-list" in warning]
+
+
+def test_malformed_definition_containers_and_null_link_are_warned_not_crashed():
+    subgraph_id = "22222222-3333-4444-5555-666666666666"
+    definition = {
+        "id": subgraph_id,
+        "name": "Malformed",
+        "nodes": [],
+        "links": 5,
+        "inputs": 5,
+        "outputs": 5,
+        "groups": 5,
+    }
+    wf = _mini([_node(10, subgraph_id)], [])
+    wf["definitions"] = {"subgraphs": [definition]}
+    res = render_py(wf, None)
+    for field in ("links", "inputs", "outputs", "groups"):
+        assert f"non-list {field} treated as empty" in "\n".join(res.warnings)
+
+    definition["links"] = [{"id": None, "origin_id": -10, "origin_slot": 0, "target_id": -20, "target_slot": 0}]
+    res = render_py(wf, None)
+    assert any("link has null id and was ignored" in warning for warning in res.warnings)
+
+
+@pytest.mark.parametrize("subgraph_id", [["unhashable"], {"unhashable": True}])
+def test_non_string_definition_ids_are_warned_not_indexed(subgraph_id):
+    workflow = _mini([], [])
+    workflow["definitions"] = {
+        "subgraphs": [{"id": subgraph_id, "name": "Malformed", "nodes": [], "links": [], "inputs": []}]
+    }
+
+    result = render_py(workflow, None)
+
+    assert result.node_count == 0
+    assert any("subgraph definition has non-string id" in warning for warning in result.warnings)
+
+
+def test_definition_retarget_preserves_a_declared_holder_when_an_earlier_duplicate_exists():
+    wf = json.loads((FIXTURES / "subgraph_template_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "subgraph_object_info.json").read_text()))
+    sg = next(s for s in wf["definitions"]["subgraphs"] if s["id"] == "d33c1791-dfd2-4102-8540-aa63e4434cd2")
+    sg["nodes"].insert(0, _node(99, "Unknown", inputs=[{"name": "socket", "type": "STRING", "link": 3}]))
+
+    res = render_py(wf, graph)
+
+    assert "IN.value" in res.source
+    assert "promoted widgets: IN.value" in res.source
+
+
+def test_definition_retarget_emits_a_qualified_warning():
+    wf = json.loads((FIXTURES / "subgraph_template_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "subgraph_object_info.json").read_text()))
+    sg = next(s for s in wf["definitions"]["subgraphs"] if s["id"] == "d33c1791-dfd2-4102-8540-aa63e4434cd2")
+    link = next(item for item in sg["links"] if item.get("id") == 3)
+    link["target_id"] = 9
+    link["target_slot"] = 1
+
+    res = render_py(wf, graph)
+
+    assert any(
+        warning.startswith("link 3 targets input slot 1 on node 10/9")
+        and warning.endswith("rendered through input 'value' on node 10/3, which holds it")
+        for warning in res.warnings
+    )
+    assert "promoted widgets: IN.value" in res.source
+
+
+def test_definition_retarget_calls_out_a_missing_declared_target():
+    wf = json.loads((FIXTURES / "subgraph_template_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "subgraph_object_info.json").read_text()))
+    sg = next(s for s in wf["definitions"]["subgraphs"] if s["id"] == "d33c1791-dfd2-4102-8540-aa63e4434cd2")
+    link = next(item for item in sg["links"] if item.get("id") == 3)
+    link["target_id"] = 999
+    link["target_slot"] = 1
+
+    res = render_py(wf, graph)
+
+    assert any(
+        warning.startswith("link 3 targets missing node 10/999")
+        and warning.endswith("rendered through input 'value' on node 10/3, which holds it")
+        for warning in res.warnings
+    )
+    assert "promoted widgets: IN.value" in res.source
+
+
+def test_definition_input_to_output_passthrough_is_never_retargeted():
+    wf = json.loads((FIXTURES / "subgraph_template_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "subgraph_object_info.json").read_text()))
+    sg = next(s for s in wf["definitions"]["subgraphs"] if s["id"] == "d33c1791-dfd2-4102-8540-aa63e4434cd2")
+    link = next(lk for lk in sg["links"] if lk.get("id") == 3)
+    link["target_id"] = -20
+    link["target_slot"] = 0
+    sg["outputs"][0]["linkIds"].append(3)
+
+    res = render_py(wf, graph)
+
+    assert "OUT.IMAGE = IN.value" in res.source
+
+
+def test_duplicate_boundary_membership_in_one_slot_is_not_ambiguous():
+    uuid = "aaaaaaaa-0000-4000-8000-aaaaaaaaaaaa"
+    wf = {
+        "nodes": [{"id": 10, "type": uuid, "inputs": [], "outputs": []}],
+        "links": [],
+        "definitions": {
+            "subgraphs": [
+                {
+                    "id": uuid,
+                    "name": "Repeated membership",
+                    "inputs": [{"name": "value", "type": "STRING", "linkIds": [1, 1]}],
+                    "outputs": [{"name": "result", "type": "STRING", "linkIds": [2, 2]}],
+                    "nodes": [
+                        {
+                            "id": 3,
+                            "type": "Transform",
+                            "inputs": [{"name": "value", "type": "STRING", "link": 1}],
+                            "outputs": [{"name": "result", "type": "STRING", "links": [2]}],
+                        }
+                    ],
+                    "links": [
+                        {"id": 1, "origin_id": -10, "origin_slot": 0, "target_id": 3, "target_slot": 0},
+                        {"id": 2, "origin_id": 3, "origin_slot": 0, "target_id": -20, "target_slot": 0},
+                    ],
+                }
+            ]
+        },
+    }
+
+    result = render_py(wf, None)
+
+    assert "value=IN.value" in result.source
+    assert "OUT.result = transform" in result.source
+    assert not any("several definition" in warning for warning in result.warnings)
+
+
+def test_missing_definition_target_warns_only_once():
+    wf = json.loads((FIXTURES / "subgraph_template_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "subgraph_object_info.json").read_text()))
+    sg = next(s for s in wf["definitions"]["subgraphs"] if s["id"] == "d33c1791-dfd2-4102-8540-aa63e4434cd2")
+    source = next(node for node in sg["nodes"] if node.get("outputs"))
+    sg["links"].append({"id": 9997, "origin_id": source["id"], "origin_slot": 0, "target_id": 999, "target_slot": 0})
+
+    res = render_py(wf, graph)
+
+    warnings = [warning for warning in res.warnings if "link 9997 targets missing node" in warning]
+    assert len(warnings) == 1, warnings
+
+
+def test_unheld_proxy_row_does_not_shift_promoted_widget_values():
+    wf = json.loads((FIXTURES / "subgraph_template_ui.json").read_text())
+    graph = Graph.from_object_info(json.loads((FIXTURES / "subgraph_object_info.json").read_text()))
+    sg = next(s for s in wf["definitions"]["subgraphs"] if s["id"] == "d33c1791-dfd2-4102-8540-aa63e4434cd2")
+    target = next(node for node in sg["nodes"] if node.get("id") == 3)
+    image_input = next(item for item in sg["inputs"] if item["name"] == "images.image0")
+    image_input["linkIds"].insert(0, 9999)
+    host = next(node for node in wf["nodes"] if node.get("id") == 10)
+    next(item for item in host["inputs"] if item.get("name") == "images.image0")["link"] = None
+    sg["links"].append(
+        {"id": 9999, "origin_id": -10, "origin_slot": 1, "target_id": target["id"], "target_slot": 0, "type": "*"}
+    )
+
+    res = render_py(wf, graph)
+
+    instance = next(line for line in res.source.splitlines() if "# 10 subgraph" in line)
+    assert 'aspect_ratio="16:9"' in instance
+    assert '"images.image0": "16:9"' not in instance
+    header = next(line for line in res.source.splitlines() if line.startswith("#   promoted widgets:"))
+    assert 'IN["images.image0"]' not in header
+    assert any(warning.startswith("link 9999 targets input slot 0") for warning in res.warnings)

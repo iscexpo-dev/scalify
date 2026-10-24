@@ -1,0 +1,171 @@
+import os
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _preserve_cwd():
+    """Restore the working directory after every test.
+
+    Several functions in scalify_cli.command.install (execute,
+    pip_install_scalifyui_dependencies) call os.chdir() as a side effect.
+    Without this fixture the changed CWD leaks into subsequent tests and
+    can cause hard-to-debug failures.
+    """
+    original = os.getcwd()
+    yield
+    os.chdir(original)
+
+
+@pytest.fixture(autouse=True)
+def _reset_renderer_singleton():
+    """The Renderer is a process-wide singleton (output.set_renderer).
+
+    A CliRunner test that invokes the app installs a renderer keyed to the
+    runner's piped streams; a later direct-call test would otherwise inherit
+    that JSON-mode renderer and have its capsys captures come up empty.
+
+    Reset before AND after every test so we always start from a clean default
+    (pretty mode, looking up current sys.stdout / sys.stderr).
+    """
+    from scalify_cli.output.renderer import reset_renderer_for_testing
+
+    reset_renderer_for_testing()
+    yield
+    reset_renderer_for_testing()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ambient_api_keys(monkeypatch):
+    """Clear the API keys a developer or CI shell may export.
+
+    ``scalify build`` and ``scalify deploy`` send ``SCALIFY_CLOUD_API_KEY`` ahead of any
+    sign-in, so a key left in the shell would turn every signed-out test into a
+    keyed one. A test that needs a key sets it itself.
+    """
+    monkeypatch.delenv("SCALIFY_CLOUD_API_KEY", raising=False)
+    monkeypatch.delenv("SCALIFY_API_KEY", raising=False)
+    # Handed-in tokens outrank a stored sign-in, so one left in the shell would
+    # turn every signed-in test into a token one.
+    monkeypatch.delenv("SCALIFY_CLOUD_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("SCALIFY_BUILDER_TOKEN", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_config_path(tmp_path, monkeypatch):
+    """Redirect the CLI's config dir to a per-test tmp path.
+
+    Without this, tests that exercise ``scalify set-default``, ``scalify auth
+    set-base-url``, ``scalify auth set-cloud-key``, etc. write to the user's
+    real ``~/Library/Application Support/scalify-cli/`` (or platform
+    equivalent) — wiping persisted state between runs. We saw this in
+    practice: ``where_default`` and ``cloud_base_url`` kept disappearing
+    mid-session because tests were clobbering them.
+    """
+    from scalify_cli import constants
+    from scalify_cli.config_manager import ConfigManager
+    from scalify_cli.utils import reset_singleton_for_testing
+
+    fake_root = tmp_path / "scalify-cli-config"
+    fake_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # constants.DEFAULT_CONFIG is a dict keyed by OS; patch all entries so
+    # whichever ``get_os()`` resolves to lands in our tmp dir.
+    for k in list(constants.DEFAULT_CONFIG.keys()):
+        monkeypatch.setitem(constants.DEFAULT_CONFIG, k, str(fake_root))
+    # ConfigManager is a @singleton that reads the config dir once, at
+    # construction — so repointing the dir alone leaves the FIRST test's
+    # in-memory config serving every later one. Any test that runs the CLI
+    # entrypoint writes `setup_nudged` into it, which then breaks the
+    # onboarding tests' "fresh config" premise hundreds of tests later.
+    reset_singleton_for_testing(ConfigManager)
+    yield fake_root
+    reset_singleton_for_testing(ConfigManager)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_object_info_cache_dir(tmp_path, monkeypatch):
+    """Redirect the ``object_info`` disk cache to a per-test tmp dir.
+
+    ``resilient_load_object_info`` (scalify_cli.cql.loader) reads/writes
+    ``~/.cache/scalify-cli/object_info-*.json`` (or ``$XDG_CACHE_HOME``) as a
+    side effect of every cache-first fetch. Now that `scalify run`'s UI-convert
+    and preflight-validate call sites route through it too, any test that
+    exercises those paths would otherwise read stale state from — or write
+    real dumps into — the developer's actual cache directory.
+    """
+    fake = tmp_path / "scalify-cli-cache"
+    fake.mkdir(mode=0o700, parents=True, exist_ok=True)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(fake))
+    monkeypatch.delenv("SCALIFY_CACHE_DIR", raising=False)
+    yield fake
+
+
+@pytest.fixture(autouse=True)
+def _isolate_jobs_state_dir(tmp_path, monkeypatch):
+    """Redirect ``jobs_state.state_dir`` to a per-test tmp dir.
+
+    Without this, tests that exercise ``scalify run`` mock-write state files
+    against a ``MagicMock`` prompt_id, polluting the user's real state dir
+    with garbage files. The defensive check in ``jobs_state.write`` now
+    also raises on non-string prompt_ids, but pinning the dir keeps the
+    real one untouched even when a future test forgets.
+    """
+    from scalify_cli import jobs_state
+
+    fake = tmp_path / "jobs"
+    fake.mkdir(mode=0o700, parents=True, exist_ok=True)
+    monkeypatch.setattr(jobs_state, "state_dir", lambda: fake)
+    yield fake
+
+
+@pytest.fixture(autouse=True)
+def _pin_usage_source_to_human(monkeypatch):
+    """Pin the submit paths' ``scalify_usage_source`` to the human-caller value.
+
+    ``caller.usage_source()`` is derived from the live environment, which under
+    pytest is not a stable input: stdout is captured (so ``detect_caller``
+    answers "pipe"), and a run driven by an agent harness exports
+    ``CLAUDECODE`` / ``AI_AGENT`` / ``SCALIFY_USER_AGENT`` into the test process.
+    Left alone, the same payload assertion would pass in a terminal and fail in
+    CI or under an agent.
+
+    So pin the baseline to the human-at-a-terminal value — the one that stayed
+    the bare ``scalify-cli`` — at the two places that send it. The patch is
+    deliberately applied to the *importing* modules rather than to
+    ``caller.detect_caller``: a global detect_caller patch also rewrites what
+    ``tracking`` and ``renderer`` see. A test that wants a different caller
+    re-patches the same names (see ``cloud/test_client.py``,
+    ``command/test_run.py``); ``caller.usage_source_for`` is tested directly in
+    ``output/test_caller.py`` and needs no pinning.
+    """
+    from scalify_cli import scalify_client
+    from scalify_cli.command.run import execution
+
+    for module in (scalify_client, execution):
+        monkeypatch.setattr(module, "usage_source", lambda: "scalify-cli")
+    yield
+
+
+@pytest.fixture
+def pretty_no_stdout(capsys):
+    """Assert pretty-mode commands write nothing to stdout.
+
+    Opt-in. Use in tests that exercise pretty-mode rendering to pin the
+    envelope contract: pretty mode is supposed to send all output to stderr
+    so the one-JSON-on-stdout invariant for JSON consumers can't be
+    silently violated by a stray ``print()`` or ``rich.print()`` call.
+
+    Usage:
+
+        def test_my_pretty_thing(pretty_no_stdout):
+            my_command(...)
+            # fixture asserts on teardown
+    """
+    yield
+    captured = capsys.readouterr()
+    if captured.out.strip():
+        raise AssertionError(
+            "Pretty mode wrote to stdout — the envelope contract requires "
+            "that to be empty (all output goes to stderr in pretty mode):\n"
+            f"  stdout = {captured.out!r}\n"
+        )

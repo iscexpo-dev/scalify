@@ -1,0 +1,360 @@
+import os
+import shutil
+import subprocess
+import time
+from datetime import datetime
+from textwrap import dedent
+
+import pytest
+
+from scalify_cli.resolve_python import resolve_workspace_python
+
+
+def e2e_test(func):
+    return pytest.mark.skipif(
+        os.getenv("TEST_E2E", "false") != "true",
+        reason="Test e2e is not explicitly enabled",
+    )(func)
+
+
+def exec(cmd: str, **kwargs) -> subprocess.CompletedProcess[str]:
+    cmd = dedent(cmd).strip()
+    print(f"cmd: {cmd}")
+
+    # These e2e tests assert on the human-readable (pretty) output. The CLI now
+    # auto-selects JSON mode when stdout isn't a TTY (and subprocess pipes never
+    # are), which would route human messages to stderr and emit envelopes on
+    # stdout. Pin SCALIFY_OUTPUT=pretty so the assertions keep matching; the JSON
+    # auto-selection path is covered by the unit tests in tests/scalify_cli/output.
+    run_env = dict(kwargs.pop("env", None) or os.environ)
+    run_env.setdefault("SCALIFY_OUTPUT", "pretty")
+
+    proc = subprocess.run(
+        args=cmd,
+        capture_output=True,
+        text=True,
+        shell=True,
+        encoding="utf-8",
+        check=False,
+        env=run_env,
+        **kwargs,
+    )
+    print(proc.stdout, proc.stderr)
+    return proc
+
+
+@pytest.fixture(scope="module")
+def workspace():
+    ws = os.path.join(os.getcwd(), f"scalify-{datetime.now().timestamp()}")
+    install_flags = os.getenv("TEST_E2E_SCALIFY_INSTALL_FLAGS", "--cpu")
+    scalify_url = os.getenv("TEST_E2E_SCALIFY_URL", "")
+    url_flag = f"--url {scalify_url}" if scalify_url else ""
+    # Run `scalify install` as its OWN command (not chained via a shell string) so
+    # its exit code is actually checked. When several commands are joined in one
+    # `shell=True` string, `/bin/sh -c` returns only the LAST command's status, so
+    # a failed install (e.g. `sys.exit(1)` on a PyTorch wheel-CDN TLS handshake
+    # failure) used to be masked by a later `scalify env` succeeding — the fixture
+    # limped on to `node update-cache` and reported a misleading
+    # "ScalifyUI-Manager not found" instead of the real network error.
+    #
+    # Wrap the network-bound install in a bounded retry (mirrors the node-install
+    # retry below) so a single transient blip is absorbed rather than nuking the
+    # whole matrix; a sustained CDN outage still fails fast with the true cause.
+    # Each attempt starts from a clean `ws`: a failed install can partially mutate
+    # the workspace (e.g. ScalifyUI already cloned), and without a reset a later
+    # attempt could short-circuit to success and mask a *deterministic* install
+    # regression. The retry is only meant to absorb transient failures, so we wipe
+    # the workspace between attempts to keep each one a true from-scratch install.
+    install_cmd = f"scalify --skip-prompt --workspace {ws} install {url_flag} {install_flags}"
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        if os.path.isdir(ws):
+            shutil.rmtree(ws, ignore_errors=True)
+        proc = exec(install_cmd)
+        if proc.returncode == 0:
+            break
+        print(f"[workspace] scalify install attempt {attempt}/{attempts} failed (rc={proc.returncode})")
+        if attempt < attempts:
+            backoff = 5 * attempt
+            print(f"[workspace] retrying scalify install after {backoff}s backoff")
+            time.sleep(backoff)
+    assert proc.returncode == 0, f"scalify install failed after {attempts} attempts:\n{proc.stdout}\n{proc.stderr}"
+
+    proc = exec(f"scalify --skip-prompt set-default {ws}")
+    assert proc.returncode == 0, f"set-default failed:\n{proc.stdout}\n{proc.stderr}"
+
+    proc = exec("scalify --skip-prompt --no-enable-telemetry env")
+    assert proc.returncode == 0, f"env failed:\n{proc.stdout}\n{proc.stderr}"
+
+    # Populate Manager cache before any node operations (blocking fetch).
+    proc = exec(f"scalify --workspace {ws} node update-cache")
+    assert proc.returncode == 0, f"update-cache failed:\n{proc.stderr}"
+
+    proc = exec(
+        f"""
+        scalify --workspace {ws} launch --background -- {os.getenv("TEST_E2E_SCALIFY_LAUNCH_FLAGS_EXTRA", "--cpu")}
+        """
+    )
+    assert proc.returncode == 0
+
+    yield ws
+
+    proc = exec(
+        f"""
+        scalify --workspace {ws} stop
+        """
+    )
+    assert proc.returncode == 0
+
+
+@pytest.fixture()
+def scalify_cli(workspace):
+    exec("scalify --skip-prompt --no-enable-telemetry env")
+    return f"scalify --workspace {workspace}"
+
+
+@e2e_test
+def test_model(scalify_cli):
+    url = "https://huggingface.co/guoyww/animatediff/resolve/cd71ae134a27ec6008b968d6419952b0c0494cf2/mm_sd_v14.ckpt?download=true"
+    path = os.path.join("models", "animatediff_models")
+    proc = exec(
+        f"""
+            {scalify_cli} model download --url {url} --relative-path {path} --filename animatediff_models
+        """
+    )
+    assert proc.returncode == 0
+
+    proc = exec(
+        f"""
+            {scalify_cli} model list --relative-path {path}
+        """
+    )
+    assert proc.returncode == 0
+    assert "animatediff_models" in proc.stdout
+
+    proc = exec(
+        f"""
+            {scalify_cli} model remove --relative-path {path} --model-names animatediff_models --confirm
+        """
+    )
+    assert proc.returncode == 0
+
+
+@e2e_test
+def test_node(scalify_cli, workspace):
+    node = "scalifyui-animatediff-evolved"
+
+    # Use --exit-on-fail so the CLI returns non-zero on git clone failure
+    # instead of silently succeeding. Retry to handle transient network
+    # errors (GitHub rate-limiting git clones on Actions runners).
+    for attempt in range(3):
+        proc = exec(
+            f"""
+                {scalify_cli} node install --exit-on-fail {node}
+            """
+        )
+        if proc.returncode == 0:
+            break
+    assert proc.returncode == 0, f"node install failed after 3 attempts:\n{proc.stderr}"
+
+    for attempt in range(3):
+        proc = exec(
+            f"""
+                {scalify_cli} node reinstall {node}
+            """
+        )
+        if proc.returncode == 0:
+            break
+    assert proc.returncode == 0, f"node reinstall failed after 3 attempts:\n{proc.stderr}"
+
+    proc = exec(
+        f"""
+            {scalify_cli} node show all
+        """
+    )
+    assert proc.returncode == 0
+    # cm-cli may display the repo name (ScalifyUI-AnimateDiff-Evolved) rather
+    # than the registry id (scalifyui-animatediff-evolved), so compare lowercase.
+    assert node.lower() in proc.stdout.lower()
+
+    proc = exec(
+        f"""
+            {scalify_cli} node update {node}
+        """
+    )
+    assert proc.returncode == 0
+
+    proc = exec(
+        f"""
+            {scalify_cli} node disable {node}
+        """
+    )
+    assert proc.returncode == 0
+
+    proc = exec(
+        f"""
+            {scalify_cli} node enable {node}
+        """
+    )
+    assert proc.returncode == 0
+
+    pubID = "scalifytest123"
+    pubToken = "6075cf7b-47e7-4c58-a3de-38f59a9bcc22"
+    proc = exec(
+        f"""
+            sed 's/PublisherId = ".*"/PublisherId = "{pubID}"/g' pyproject.toml
+            {scalify_cli} node publish --token {pubToken}
+        """,
+        env={"ENVIRONMENT": "stage"},
+        cwd=os.path.join(workspace, "custom_nodes", node),
+    )
+
+
+@e2e_test
+def test_manager_installed(scalify_cli, workspace):
+    """Verify ScalifyUI-Manager was installed via manager_requirements.txt."""
+    proc = exec(
+        f"""
+            {scalify_cli} node show all
+        """
+    )
+    assert proc.returncode == 0, f"node show all failed: {proc.stderr}"
+
+    # Check cm_cli is importable (Manager v4 installed as pip package)
+    ws_python = resolve_workspace_python(workspace)
+    proc = exec(
+        f"""
+            {ws_python} -c "import cm_cli; print('cm_cli OK')"
+        """
+    )
+    assert proc.returncode == 0, f"cm_cli import failed: {proc.stderr}"
+    assert "cm_cli OK" in proc.stdout
+
+
+@e2e_test
+def test_node_uv_compile(scalify_cli):
+    """Test --uv-compile flag for node install (requires Manager v4.1+)."""
+    node = "scalifyui-impact-pack"
+    proc = exec(
+        f"""
+            {scalify_cli} node install --uv-compile {node}
+        """
+    )
+    assert proc.returncode == 0
+
+    # Standalone uv-sync command
+    proc = exec(
+        f"""
+            {scalify_cli} node uv-sync
+        """
+    )
+    assert proc.returncode == 0
+
+
+@e2e_test
+def test_uv_compile_default_config(scalify_cli):
+    """Test scalify manager uv-compile-default config command."""
+    proc = exec(
+        f"""
+            {scalify_cli} manager uv-compile-default true
+        """
+    )
+    assert proc.returncode == 0
+    assert "enabled" in proc.stdout.lower()
+
+    # Verify it shows in env
+    proc = exec(
+        """
+            scalify --skip-prompt --no-enable-telemetry env
+        """
+    )
+    assert proc.returncode == 0
+    assert "UV Compile Default" in proc.stdout
+    assert "Enabled" in proc.stdout
+
+    # Disable it back
+    proc = exec(
+        f"""
+            {scalify_cli} manager uv-compile-default false
+        """
+    )
+    assert proc.returncode == 0
+    assert "disabled" in proc.stdout.lower()
+
+
+@e2e_test
+def test_install_version_latest_no_github_api(tmp_path):
+    """Regression test for issue #440.
+
+    Runs `scalify install --version latest` end-to-end and verifies:
+    - The command succeeds without a GitHub token in the environment.
+    - The resulting clone has a stable semver tag (v*) checked out — proving
+      the local-tag resolver actually picked something instead of failing
+      over to the rate-limited API.
+
+    Slow pip steps are skipped to keep this targeted at the version-resolution
+    path; the real protection is exercising the actual CLI command, so any
+    future refactor that puts `releases/latest` API calls back on this path
+    fails CI loudly.
+    """
+    # Use tmp_path (auto-cleaned) so the clone doesn't leak into cwd.
+    ws = str(tmp_path / "scalify-latest")
+    env = {**os.environ}
+    env.pop("GITHUB_TOKEN", None)  # mimic the user from the bug report
+
+    # Keep the command on a single line: bash uses `\` for line continuation but
+    # Windows cmd.exe uses `^` and treats a stray `\` as a positional argument.
+    proc = exec(
+        f"scalify --skip-prompt --workspace {ws} install --cpu --version latest "
+        "--skip-manager --skip-torch-or-directml --skip-requirement",
+        env=env,
+    )
+    assert proc.returncode == 0, f"install --version latest failed:\n{proc.stderr}"
+
+    # The actual property under test: we did NOT fall back to the GitHub API.
+    # Both fallback messages from checkout_stable_scalifyui mention "GitHub API"
+    # - "querying GitHub API" and "trying GitHub API as a last resort" - so
+    # catch either via the shared substring, keeping the assertion tight even if
+    # exact wording changes.
+    combined = proc.stdout + proc.stderr
+    assert "GitHub API" not in combined, (
+        f"Install fell back to the GitHub API — local-tag resolution must have failed.\nOutput:\n{combined}"
+    )
+
+    # `--workspace ws` clones directly into ws (matches the existing fixture's behavior).
+    assert os.path.isdir(os.path.join(ws, ".git")), f"no git repo at {ws}"
+
+    head = subprocess.run(
+        ["git", "-C", ws, "describe", "--tags", "--exact-match", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert head.returncode == 0, (
+        f"HEAD is not on a tag — local tag resolution must have silently failed. stderr: {head.stderr}"
+    )
+    tag = head.stdout.strip()
+    assert tag.startswith("v") and tag.count(".") == 2, f"Expected a v<major>.<minor>.<patch> stable tag, got: {tag!r}"
+    # Pre-releases (v*-rc1, v*-beta) must be skipped to mirror GitHub's releases/latest.
+    assert "-" not in tag, f"Resolver picked a pre-release tag: {tag!r}"
+
+
+@e2e_test
+def test_run(scalify_cli):
+    url = "https://huggingface.co/Khulnasoft/stable-diffusion-v1-5-archive/resolve/main/v1-5-pruned-emaonly-fp16.safetensors?download=true"
+    path = os.path.join("models", "checkpoints")
+    name = "v1-5-pruned-emaonly.safetensors"
+    proc = exec(
+        f"""
+            {scalify_cli} model download --url {url} --relative-path {path} --filename {name}
+        """
+    )
+    assert proc.returncode == 0
+
+    workflow = os.path.join(os.path.dirname(os.path.realpath(__file__)), "workflow.json")
+    proc = exec(
+        f"""
+        {scalify_cli} run --workflow {workflow} --wait --timeout 180
+        """
+    )
+    assert proc.returncode == 0

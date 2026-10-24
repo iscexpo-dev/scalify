@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scalify.khulnasoft.com/schemas/build_refs_base_images.json",
+  "title": "scalify build refs base-images --json data payload",
+  "type": "object",
+  "required": ["baseImages"],
+  "additionalProperties": true,
+  "properties": {"baseImages": {"type": "array", "items": {"type": "object", "additionalProperties": true}}}
+}

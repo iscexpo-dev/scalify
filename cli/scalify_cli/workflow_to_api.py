@@ -1,0 +1,2539 @@
+"""Convert ScalifyUI UI-format workflows to API ("prompt") format.
+
+The UI format is what the ScalifyUI frontend saves by default — a litegraph dump
+with `nodes` and `links` arrays. The API format is the flat
+``{node_id: {class_type, inputs, _meta}}`` shape that the server's ``/prompt``
+endpoint accepts.
+
+The conversion needs schema information about each node type (which inputs are
+widgets vs connections, what their order is, defaults, combo options, etc.).
+That information is available from the running server's ``/object_info``
+endpoint — the same data the frontend uses to render the graph editor.
+
+This module is a Python port of Seth A. Robinson's
+``scalifyui-workflow-to-api-converter-endpoint`` (Unlicense), restructured to
+take a fetched ``object_info`` dict instead of importing ScalifyUI's in-process
+``nodes`` module.
+"""
+
+from __future__ import annotations
+
+import copy
+import logging
+import random
+import re
+from typing import Any
+
+from scalify_cli.cql.engine import (
+    _FRONTEND_DOM_WIDGET_TYPES,
+    LOAD_3D_BUTTON_VALUES,
+    DynamicGroupBindingError,
+    _dynamic_combo_server_key_matches,
+    _dynamic_group_fields,
+    _dynamic_group_row_count,
+    _is_dynamic_combo_type,
+    _parse_morphism,
+    _SubgraphDefs,
+    _validate_dynamic_group_layout,
+    _validate_dynamic_group_schema,
+)
+
+logger = logging.getLogger(__name__)
+
+# C-style comments stripped from dynamic-prompt strings before group parsing.
+_DYNAMIC_PROMPT_COMMENT_RE = re.compile(r"/\*[\s\S]*?\*/|//.*")
+_DYNAMIC_PROMPT_UNESCAPE_RE = re.compile(r"\\([{}|])")
+
+
+# Mode values from litegraph: see frontend's LGraphEventMode enum.
+_MODE_MUTED = 2  # excluded from execution; outputs not produced
+_MODE_BYPASS = 4  # node skipped; inputs passed through to outputs
+
+# Node types that exist only in the UI graph and never appear in API output.
+# Aligns with cloud-mcp-server's VIRTUAL_NODE_TYPES and the frontend's
+# isVirtualNode set — every type the frontend's graphToPrompt() skips.
+_UI_ONLY_NODE_TYPES = frozenset({"Note", "MarkdownNote", "PrimitiveNode", "GetNode", "SetNode", "Reroute"})
+
+# Sentinel IDs litegraph uses inside a subgraph definition for the synthetic
+# input and output proxy nodes (the boxes the user wires through).
+_SUBGRAPH_INPUT_NODE_ID = -10
+_SUBGRAPH_OUTPUT_NODE_ID = -20
+
+# Cap on recursive subgraph / passthrough resolution to defend against cycles
+# in malformed inputs.
+_MAX_RESOLUTION_DEPTH = 100
+_MAX_SUBGRAPH_ITERATIONS = 10
+_MAX_SUBGRAPH_EXPANSION_RATIO = 128
+_MIN_SUBGRAPH_EXPANSION_BUDGET = 100_000
+_MAX_SUBGRAPH_EXPANSION_BUDGET = 1_000_000
+_MAX_RESOLVED_SUBGRAPH_INPUTS = 10_000
+
+# Strings that ScalifyUI appends after seed-like INT widgets to control how the
+# value changes between runs. They're not real inputs and must be stripped from
+# the widget-value list before mapping to input names.
+_CONTROL_AFTER_GENERATE_VALUES = frozenset({"fixed", "increment", "decrement", "randomize"})
+
+# A dynamic combo may nest another dynamic combo among its sub-inputs. Real
+# schemas nest at most a couple of levels; a deeper chain (e.g. a pathological
+# third-party ``/object_info`` entry) would otherwise recurse the widget walk
+# without bound. Cap it so a malformed schema degrades to a warning instead of a
+# ``RecursionError`` that aborts the whole conversion.
+_MAX_DYNAMIC_COMBO_DEPTH = 16
+
+
+class WorkflowConversionError(Exception):
+    """Raised when a workflow can't be converted to API format."""
+
+
+def is_api_format(workflow: Any) -> bool:
+    """Return True if ``workflow`` already looks like an API-format prompt."""
+    if not isinstance(workflow, dict):
+        return False
+    if "nodes" in workflow and "links" in workflow:
+        return False
+    for key, value in workflow.items():
+        if key in ("prompt", "extra_data", "client_id"):
+            continue
+        if isinstance(value, dict) and "class_type" in value:
+            return True
+    return False
+
+
+def is_subgraph_uuid(node_type: Any) -> bool:
+    """A subgraph instance's node ``type`` field is the UUID of a subgraph def."""
+    if not isinstance(node_type, str) or len(node_type) != 36:
+        return False
+    parts = node_type.split("-")
+    if len(parts) != 5:
+        return False
+    return tuple(len(p) for p in parts) == (8, 4, 4, 4, 12)
+
+
+def convert_ui_to_api(workflow: dict, object_info: dict) -> dict:
+    """Convert a UI-format workflow to API format.
+
+    Args:
+        workflow: UI workflow with ``nodes`` and ``links`` keys.
+        object_info: ``/object_info`` response: ``{node_type: schema}``.
+
+    Returns:
+        API-format dict: ``{node_id_str: {class_type, inputs, _meta}}``.
+    """
+    from scalify_cli.cql.promoted import PromotionTraversalLimitError
+
+    try:
+        return _convert_ui_to_api(workflow, object_info)
+    except PromotionTraversalLimitError as exc:
+        raise WorkflowConversionError(str(exc)) from exc
+
+
+def _convert_ui_to_api(workflow: dict, object_info: dict) -> dict:
+    if is_api_format(workflow):
+        return workflow
+    if not isinstance(workflow, dict):
+        raise WorkflowConversionError("Workflow must be a JSON object")
+    if not isinstance(workflow.get("nodes"), list) or not isinstance(workflow.get("links"), list):
+        raise WorkflowConversionError("Workflow is missing 'nodes' or 'links' list")
+    if not isinstance(object_info, dict):
+        raise WorkflowConversionError("object_info must be a JSON object")
+
+    workflow = copy.deepcopy(workflow)
+    # Discard any non-dict entries up front so the rest of the pipeline doesn't
+    # have to defend against malformed nodes inside the list.
+    nodes = [n for n in workflow["nodes"] if isinstance(n, dict)]
+    links = list(workflow["links"])
+
+    subgraph_defs = _collect_subgraph_defs(workflow)
+    nodes, links, subgraph_ctx = _expand_subgraphs(nodes, links, subgraph_defs)
+
+    links = _rewrite_links_for_subgraphs(links, subgraph_ctx, nodes)
+    link_map = _build_link_map(links)
+
+    node_by_id = {str(n.get("id")): n for n in nodes}
+    primitive_values = _collect_primitive_values(nodes)
+    bypassed = _collect_bypassed(nodes)
+    nodes_to_exclude = _collect_excluded(nodes)
+    reroute_sources = _collect_reroute_sources(nodes, link_map)
+    set_sources, get_vars = _collect_get_set_mappings(nodes, link_map)
+
+    tracers = _Tracers(
+        link_map=link_map,
+        nodes=nodes,
+        node_by_id=node_by_id,
+        bypassed=bypassed,
+        reroute_sources=reroute_sources,
+        set_sources=set_sources,
+        get_vars=get_vars,
+        subgraph_ctx=subgraph_ctx,
+    )
+
+    if _has_group_nodes(workflow):
+        logger.warning(
+            "Workflow uses legacy 'group nodes' (extra.groupNodes); these aren't "
+            "expanded by this converter. Recreate them as subgraphs in the frontend."
+        )
+
+    api_prompt: dict[str, dict] = {}
+    for node in nodes:
+        node_id_str = str(node.get("id"))
+        node_type = node.get("type")
+        if not node_type:
+            continue
+        node_mode = node.get("mode", 0)
+        if node_mode in (_MODE_MUTED, _MODE_BYPASS):
+            continue
+        if node_type in _UI_ONLY_NODE_TYPES:
+            continue
+        if node_id_str in nodes_to_exclude:
+            continue
+
+        try:
+            api_prompt[node_id_str] = _build_api_node(
+                node=node,
+                node_type=node_type,
+                object_info=object_info,
+                tracers=tracers,
+                primitive_values=primitive_values,
+                bypassed=bypassed,
+                nodes_to_exclude=nodes_to_exclude,
+            )
+        except DynamicGroupBindingError as exc:
+            raise WorkflowConversionError(f"Node {node_id_str} ({node_type}): {exc}") from exc
+        except Exception:
+            # An individual malformed node should not torpedo the whole prompt.
+            # The executor will fail loudly on missing nodes if this matters.
+            logger.exception("Failed to convert node id=%s type=%s; skipping", node_id_str, node_type)
+
+    _strip_orphan_link_inputs(api_prompt)
+    _overlay_promoted_host_values(api_prompt, workflow, subgraph_defs)
+    return api_prompt
+
+
+def _overlay_promoted_host_values(api_prompt: dict, workflow: dict, subgraph_defs: dict[str, dict]) -> None:
+    """Apply host-owned promoted widget values onto the expanded interior nodes.
+
+    A promoted widget's value lives on the HOST instance (``widgets_values``
+    positional over the widget-backed subgraph inputs — ADR-SUBGRAPH-PROMOTION-0009); the
+    interior widget is only its default. Expansion above copied the interior
+    default, so a post-migration save (host prompt filled in, interior
+    ``caption`` still ``''``) would submit the wrong prompt. Precedence, as the
+    frontend serializes it: a link feeding the instance input wins (already
+    reattached), else the host value when materialized, else the interior.
+    Inner instances are visited first so an outer host wins over an inner one;
+    an inner input promoted further (linked from ``-10``) is left to the outer.
+    """
+    from scalify_cli.cql import promoted as _promoted
+
+    visit_budget = [_MAX_SUBGRAPH_EXPANSION_BUDGET]
+    definition_nodes: dict[int, tuple[dict, list[dict]]] = {}
+    scope_links: dict[int, tuple[dict, set[tuple[type, int | str]]]] = {}
+
+    def nodes_for(definition: dict) -> list[dict]:
+        cached = definition_nodes.get(id(definition))
+        if cached is not None and cached[0] is definition:
+            return cached[1]
+        raw_nodes = definition.get("nodes")
+        nodes = [node for node in raw_nodes if isinstance(node, dict)] if isinstance(raw_nodes, list) else []
+        definition_nodes[id(definition)] = (definition, nodes)
+        return nodes
+
+    def live_link_keys(scope: dict) -> set[tuple[type, int | str]]:
+        cached = scope_links.get(id(scope))
+        if cached is not None and cached[0] is scope:
+            return cached[1]
+        keys = _promoted._live_link_keys(scope)
+        scope_links[id(scope)] = (scope, keys)
+        return keys
+
+    def visit(instance: dict, sg: dict, scope: dict, prefix: str, depth: int) -> None:
+        # ``scope`` holds the links that can feed THIS instance's inputs: the
+        # workflow for a top-level instance, the containing definition for a
+        # nested one. A serialized link id that no longer exists there is one
+        # the frontend drops on load — the input is unlinked and the host value
+        # runs, exactly as ``resolve_write`` and ``slots`` treat it.
+        if depth > _MAX_SUBGRAPH_ITERATIONS or instance.get("mode") in (_MODE_MUTED, _MODE_BYPASS):
+            return
+        inner_nodes = nodes_for(sg)
+        raw_definition_inputs = sg.get("inputs")
+        definition_input_count = len(raw_definition_inputs) if isinstance(raw_definition_inputs, list) else 0
+        visit_cost = len(inner_nodes) + definition_input_count + 1
+        if visit_cost > visit_budget[0]:
+            raise WorkflowConversionError("promoted-value overlay exceeded its safe limit")
+        visit_budget[0] -= visit_cost
+        for inner in inner_nodes:
+            inner_type = inner.get("type")
+            inner_def = subgraph_defs.get(str(inner_type)) if is_subgraph_uuid(inner_type) else None
+            if inner_def is not None:
+                visit(inner, inner_def, sg, f"{prefix}:{inner.get('id')}", depth + 1)
+        promoted_widgets = [pi for pi in _promoted.promoted_inputs(sg, subgraph_defs) if pi.is_widget]
+        if not promoted_widgets:
+            return
+        # Expansion, slots and write resolution share this exact name-first,
+        # positional-fallback mapping and live-entry collision preference.
+        # Cache the scope scan: many sibling instances share the same links.
+        live_links = live_link_keys(scope)
+        mapped_inputs = _promoted._mapped_instance_inputs(scope, instance, sg, live_links)
+
+        def is_live(link_id: Any) -> bool:
+            return _is_link_id(link_id) and (type(link_id), link_id) in live_links
+
+        external_links = {input_index: entry.get("link") for input_index, entry in mapped_inputs.items()}
+        for pi in promoted_widgets:
+            external_link = external_links.get(pi.index)
+            if not pi.is_widget or is_live(external_link):
+                continue
+            value = _promoted.host_value(instance, pi)
+            if value is _promoted.UNSET:
+                continue
+            # Every interior widget the input feeds — a repaired primitive
+            # fan-out links one host value into several targets.
+            targets = _promoted.boundary_widget_targets(sg, pi, subgraph_defs)
+            if len(targets) > visit_budget[0]:
+                raise WorkflowConversionError("promoted-value overlay exceeded its safe limit")
+            visit_budget[0] -= len(targets)
+            for path, widget in targets:
+                entry = api_prompt.get(":".join([prefix, *path]))
+                if not isinstance(entry, dict):
+                    continue
+                inputs = entry.setdefault("inputs", {})
+                current = inputs.get(widget)
+                if isinstance(current, list) and len(current) == 2:
+                    continue  # wired from inside the definition: the link wins
+                # Same wrapping every widget value gets, so a two-item list
+                # host value is never read back as a ``[node, slot]`` link.
+                inputs[widget] = _wrap_widget_value(value)
+
+    for node in workflow.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        node_type = node.get("type")
+        sg = subgraph_defs.get(str(node_type)) if is_subgraph_uuid(node_type) else None
+        if sg is not None:
+            visit(node, sg, workflow, str(node.get("id")), 0)
+
+
+def _has_group_nodes(workflow: dict) -> bool:
+    """Legacy 'group nodes' (workflow> types) live under extra.groupNodes."""
+    extra = workflow.get("extra")
+    if isinstance(extra, dict) and isinstance(extra.get("groupNodes"), dict) and extra["groupNodes"]:
+        return True
+    for node in workflow.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        t = node.get("type")
+        if isinstance(t, str) and (t.startswith("workflow>") or t.startswith("workflow/")):
+            return True
+    return False
+
+
+def _strip_orphan_link_inputs(api_prompt: dict[str, dict]) -> None:
+    """Drop any link inputs that reference a node we didn't emit.
+
+    Defensive mirror of the frontend's final cleanup pass. We already skip
+    most orphans during emission, but a stray reference can survive if the
+    upstream tracing terminated on a node that later got pruned.
+    """
+    for node in api_prompt.values():
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        for name in list(inputs):
+            value = inputs[name]
+            if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str) and value[0] not in api_prompt:
+                del inputs[name]
+
+
+# ---------------------------------------------------------------------------
+# Subgraph handling
+# ---------------------------------------------------------------------------
+
+
+class _SubgraphCtx:
+    """Bookkeeping built during subgraph expansion, used later to rewrite links."""
+
+    def __init__(self) -> None:
+        # subgraph_node_id_str -> {subgraph_input_idx: [(internal_node_id, internal_slot), ...]}
+        self.input_targets: dict[str, dict[int, list[tuple[Any, int]]]] = {}
+        # subgraph_node_id_str -> {output_slot_idx: (internal_node_id, internal_slot)}
+        self.output_sources: dict[str, dict[int, tuple[Any, int]]] = {}
+        # subgraph_node_id_str -> {subgraph_input_idx: (upstream_node_id, upstream_slot)}
+        self.input_sources: dict[str, dict[int, tuple[Any, Any]]] = {}
+        # subgraph_node_id_str -> {outer_slot: subgraph_input_idx} (when names differ in order)
+        self.outer_to_input_idx: dict[str, dict[int, int]] = {}
+        # subgraph_node_id_str -> {raw held link id: every subgraph input idx}
+        self.held_input_idx: dict[str, dict[Any, tuple[int, ...]]] = {}
+        # raw link id -> every expanded instance/input that actually holds it.
+        # This recovers rows whose declared target drifted away from the holder.
+        self.input_holders: dict[Any, list[tuple[str, int]]] = {}
+
+
+def _collect_subgraph_defs(workflow: dict) -> dict[str, dict]:
+    definitions = workflow.get("definitions")
+    if not isinstance(definitions, dict):
+        return {}
+    subgraphs = definitions.get("subgraphs")
+    if not isinstance(subgraphs, list):
+        return {}
+    defs: dict[str, dict] = _SubgraphDefs()
+    for sg in subgraphs:
+        if not isinstance(sg, dict):
+            continue
+        sg_id = sg.get("id")
+        # sg_id has to be a string both because we use it as a dict key and
+        # because is_subgraph_uuid (used to match instances) only accepts str.
+        if isinstance(sg_id, str) and sg_id:
+            defs[sg_id] = sg
+    return defs
+
+
+def _expand_subgraphs(
+    nodes: list[dict], links: list, subgraph_defs: dict[str, dict]
+) -> tuple[list[dict], list, _SubgraphCtx]:
+    """Recursively expand subgraph instances into their constituent nodes."""
+    ctx = _SubgraphCtx()
+    if not subgraph_defs:
+        return nodes, links, ctx
+
+    from scalify_cli.cql import promoted as _promoted
+
+    definition_cache: dict[int, tuple[Any, ...]] = {}
+    expansion_metrics: dict[int, tuple[dict, int, int, int]] = {}
+    # Interior rows minted during expansion must not collide with either a
+    # concrete outer row or a stale id that an outer input still holds. A
+    # single allocator also avoids rescanning the growing link list once per
+    # instance.
+    max_link_id = 0
+    for link in links:
+        if isinstance(link, (list, tuple)) and link and _is_slot_index(link[0]):
+            max_link_id = max(max_link_id, link[0])
+    for node in nodes:
+        raw_inputs = node.get("inputs")
+        for entry in raw_inputs if isinstance(raw_inputs, list) else []:
+            if isinstance(entry, dict) and _is_slot_index(entry.get("link")):
+                max_link_id = max(max_link_id, entry["link"])
+    link_id_counter = [max_link_id + 1]
+    serialized_size = len(links) + 1 + sum(_node_expansion_cost(node) for node in nodes)
+    seen_definitions: set[int] = set()
+    for definition in subgraph_defs.values():
+        if not isinstance(definition, dict) or id(definition) in seen_definitions:
+            continue
+        seen_definitions.add(id(definition))
+        cost, node_count, link_count = _definition_expansion_metrics(definition)
+        expansion_metrics[id(definition)] = (definition, cost, node_count, link_count)
+        serialized_size += 1 + cost
+    expansion_budget = [
+        min(
+            _MAX_SUBGRAPH_EXPANSION_BUDGET,
+            max(_MIN_SUBGRAPH_EXPANSION_BUDGET, serialized_size * _MAX_SUBGRAPH_EXPANSION_RATIO),
+        )
+    ]
+    for _iteration in range(_MAX_SUBGRAPH_ITERATIONS):
+        expanded: list[dict] = []
+        found_any = False
+        iteration_scope = {"links": links}
+        iteration_live_keys = _promoted._live_link_keys(iteration_scope)
+        for node in nodes:
+            node_type = node.get("type")
+            if is_subgraph_uuid(node_type) and node_type in subgraph_defs:
+                # Frontend semantics (executionUtil.ts): if the subgraph
+                # instance node itself is muted (mode 2) or bypassed (mode 4),
+                # do NOT pull its inner nodes into the prompt. The instance
+                # stays in the node list where the normal mode-check excludes
+                # it from emission; for bypass, downstream consumers route
+                # through ``trace_bypassed`` on the instance's external
+                # inputs, the same way a bypassed regular node is handled.
+                if node.get("mode") in (_MODE_MUTED, _MODE_BYPASS):
+                    expanded.append(node)
+                    continue
+                found_any = True
+                generated = _instance_expansion_cost(
+                    subgraph_defs[node_type],
+                    node.get("id"),
+                    _metrics=expansion_metrics,
+                )
+                if generated > expansion_budget[0]:
+                    raise WorkflowConversionError("subgraph expansion exceeded its proportional safe limit")
+                expansion_budget[0] -= generated
+                sg_nodes, sg_links, input_map, output_map = _expand_one_subgraph(
+                    node,
+                    subgraph_defs[node_type],
+                    links,
+                    _definition_cache=definition_cache,
+                    _link_id_counter=link_id_counter,
+                )
+                expanded.extend(sg_nodes)
+                links.extend(sg_links)
+                ctx.input_targets[str(node.get("id"))] = input_map
+                ctx.output_sources[str(node.get("id"))] = output_map
+                node_id = str(node.get("id"))
+                outer_map = _outer_slot_to_input_idx(
+                    node,
+                    subgraph_defs[node_type],
+                    _definition_cache=definition_cache,
+                )
+                ctx.outer_to_input_idx[node_id] = outer_map
+                held_slots: dict[Any, set[int]] = {}
+                mapped_inputs = _promoted._mapped_instance_inputs(
+                    iteration_scope, node, subgraph_defs[node_type], iteration_live_keys
+                )
+                for input_index, entry in mapped_inputs.items():
+                    if not _is_link_id(entry.get("link")):
+                        continue
+                    held_slots.setdefault(entry["link"], set()).add(input_index)
+                ctx.held_input_idx[node_id] = {link_id: tuple(sorted(slots)) for link_id, slots in held_slots.items()}
+                for link_id, slots in ctx.held_input_idx[node_id].items():
+                    ctx.input_holders.setdefault(link_id, []).extend((node_id, slot) for slot in slots)
+            else:
+                expanded.append(node)
+        nodes = expanded
+        if not found_any:
+            return nodes, links, ctx
+
+    if any(
+        node.get("mode") not in (_MODE_MUTED, _MODE_BYPASS)
+        and isinstance(node.get("type"), str)
+        and is_subgraph_uuid(node.get("type"))
+        and node.get("type") in subgraph_defs
+        for node in nodes
+    ):
+        raise WorkflowConversionError("subgraph expansion exceeded its iteration safe limit")
+    return nodes, links, ctx
+
+
+def _node_expansion_cost(node: dict) -> int:
+    """Work/memory copied for one node during expansion."""
+    raw_inputs = node.get("inputs")
+    raw_outputs = node.get("outputs")
+    input_entries = raw_inputs if isinstance(raw_inputs, list) else []
+    return (
+        len(node)
+        + len(str(node.get("id", "")))
+        + len(input_entries)
+        + sum(len(entry) for entry in input_entries if isinstance(entry, dict))
+        + (len(raw_outputs) if isinstance(raw_outputs, list) else 0)
+    )
+
+
+def _definition_expansion_metrics(definition: dict) -> tuple[int, int, int]:
+    """Cached-worthy copied work plus real node/link counts for one definition."""
+    raw_nodes = definition.get("nodes")
+    raw_links = definition.get("links")
+    raw_inputs = definition.get("inputs")
+    nodes = [node for node in raw_nodes if isinstance(node, dict)] if isinstance(raw_nodes, list) else []
+    links = [link for link in raw_links if isinstance(link, dict)] if isinstance(raw_links, list) else []
+    raw_scan_cost = (len(raw_nodes) if isinstance(raw_nodes, list) else 0) + (
+        len(raw_links) if isinstance(raw_links, list) else 0
+    )
+    if isinstance(raw_inputs, list):
+        raw_scan_cost += len(raw_inputs)
+        raw_scan_cost += sum(
+            len(entry) + (len(entry.get("linkIds")) if isinstance(entry.get("linkIds"), list) else 0)
+            for entry in raw_inputs
+            if isinstance(entry, dict)
+        )
+    copied_cost = sum(_node_expansion_cost(node) for node in nodes) + sum(
+        1 + len(link) + len(str(link.get("origin_id", ""))) + len(str(link.get("target_id", ""))) for link in links
+    )
+    return raw_scan_cost + copied_cost, len(nodes), len(links)
+
+
+def _definition_expansion_cost(definition: dict) -> int:
+    return _definition_expansion_metrics(definition)[0]
+
+
+def _instance_expansion_cost(
+    definition: dict,
+    outer_id: Any,
+    *,
+    _metrics: dict[int, tuple[dict, int, int, int]] | None = None,
+) -> int:
+    """Copied work for one instance, including its repeated id prefix."""
+    cached = _metrics.get(id(definition)) if _metrics is not None else None
+    if cached is not None and cached[0] is definition:
+        _definition, definition_cost, node_count, link_count = cached
+    else:
+        definition_cost, node_count, link_count = _definition_expansion_metrics(definition)
+        if _metrics is not None:
+            _metrics[id(definition)] = (definition, definition_cost, node_count, link_count)
+    prefix_size = len(str(outer_id)) + 1
+    return definition_cost + prefix_size * (node_count + 2 * link_count)
+
+
+def _last_wins_interior_links(internal_links: list[dict], link_map: dict[Any, dict]) -> list[dict]:
+    """Interior rows that own their id after last-row-wins normalization."""
+    return [
+        link
+        for link in internal_links
+        if _is_link_id(link.get("id"))
+        and link_map.get(link.get("id")) is link
+        and str(link.get("origin_id")) not in (str(_SUBGRAPH_INPUT_NODE_ID), str(_SUBGRAPH_OUTPUT_NODE_ID))
+        and str(link.get("target_id")) not in (str(_SUBGRAPH_INPUT_NODE_ID), str(_SUBGRAPH_OUTPUT_NODE_ID))
+    ]
+
+
+def _output_boundary_holder_edges(
+    sg_def: dict,
+    internal_links: list[dict],
+    link_map: dict[Any, dict],
+    holders: dict[Any, list[tuple[dict, int, dict]]],
+    outer_id: Any,
+    link_id_counter: list[int],
+) -> tuple[dict[tuple[int, int], int], list[list[Any]]]:
+    """Mint interior edges for real inputs holding an output-boundary row."""
+    from scalify_cli.cql.promoted import held_link_targets
+
+    holder_ids: dict[tuple[int, int], int] = {}
+    edges: list[list[Any]] = []
+    for link in internal_links:
+        old_id = link.get("id")
+        if (
+            not _is_link_id(old_id)
+            or link_map.get(old_id) is not link
+            or str(link.get("target_id")) != str(_SUBGRAPH_OUTPUT_NODE_ID)
+            or str(link.get("origin_id")) in (str(_SUBGRAPH_INPUT_NODE_ID), str(_SUBGRAPH_OUTPUT_NODE_ID))
+        ):
+            continue
+        for target, target_slot, _entry in held_link_targets(sg_def, old_id, link, holders):
+            new_id = link_id_counter[0]
+            link_id_counter[0] += 1
+            holder_ids[(id(target), target_slot)] = new_id
+            edges.append(
+                [
+                    new_id,
+                    f"{outer_id}:{link.get('origin_id')}",
+                    link.get("origin_slot"),
+                    f"{outer_id}:{target.get('id')}",
+                    target_slot,
+                    link.get("type"),
+                ]
+            )
+    return holder_ids, edges
+
+
+def _expanded_node_inputs(
+    inner: dict,
+    internal_link_map: dict[Any, dict],
+    link_id_remap: dict[Any, int],
+    boundary_holder_ids: dict[tuple[int, int], int],
+) -> list[Any]:
+    """Rewrite one expanded node's inputs, including boundary-holder edges."""
+    raw_inputs = inner.get("inputs")
+    inputs = raw_inputs if isinstance(raw_inputs, list) else []
+    expanded: list[Any] = []
+    for slot, entry in enumerate(inputs):
+        if not isinstance(entry, dict):
+            expanded.append(entry)
+            continue
+        rewritten = _rewrite_internal_input(entry, internal_link_map, link_id_remap)
+        holder_id = boundary_holder_ids.get((id(inner), slot))
+        if holder_id is not None:
+            rewritten["link"] = holder_id
+        expanded.append(rewritten)
+    return expanded
+
+
+def _outer_slot_to_input_idx(
+    outer_node: dict,
+    sg_def: dict,
+    *,
+    _definition_cache: dict[int, tuple[Any, ...]] | None = None,
+) -> dict[int, int]:
+    """Map the outer node's input slots to subgraph-definition input indices."""
+    cached = _definition_cache.get(id(sg_def)) if _definition_cache is not None else None
+    if cached is not None and cached[0] is sg_def and len(cached) >= 11:
+        sg_input_names = cached[10]
+    else:
+        sg_input_names = {}
+        raw_definition_inputs = sg_def.get("inputs")
+        definition_inputs = raw_definition_inputs if isinstance(raw_definition_inputs, list) else []
+        for idx, inp in enumerate(definition_inputs):
+            if isinstance(inp, dict):
+                sg_input_names.setdefault(_input_name(inp.get("name")), idx)
+    mapping: dict[int, int] = {}
+    raw_outer_inputs = outer_node.get("inputs")
+    outer_inputs = raw_outer_inputs if isinstance(raw_outer_inputs, list) else []
+    for outer_idx, outer_input in enumerate(outer_inputs):
+        if not isinstance(outer_input, dict):
+            continue
+        name = _input_name(outer_input.get("name"))
+        if name in sg_input_names:
+            mapping[outer_idx] = sg_input_names[name]
+    return mapping
+
+
+def _is_link_id(value: Any) -> bool:
+    """Whether ``value`` can be a link id: an int as LiteGraph mints, or a string
+    as the doc host's ``insert_workflow`` remap mints (``insert:<op>:root:link:12``).
+    Anything else (``None``, a list or dict in a malformed save) is not a link and
+    must not reach a dict lookup, where an unhashable value would raise."""
+    return isinstance(value, (int, str)) and not isinstance(value, bool)
+
+
+def _is_slot_index(value: Any) -> bool:
+    """Whether ``value`` is a serialized input/output slot index."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _input_name(value: Any) -> str:
+    """Hashable boundary name with the same coercion on both sides."""
+    return "" if value is None else str(value)
+
+
+def _expand_one_subgraph(
+    outer_node: dict,
+    sg_def: dict,
+    existing_links: list,
+    *,
+    _definition_cache: dict[int, tuple[Any, ...]] | None = None,
+    _link_id_counter: list[int] | None = None,
+) -> tuple[list[dict], list, dict[int, list[tuple[Any, int]]], dict[int, tuple[Any, int]]]:
+    from scalify_cli.cql.promoted import _link_holders, _listed_link_ids, held_link_targets
+
+    outer_id = outer_node.get("id")
+    internal_link_map: dict[Any, dict] | None = None
+    interior_links: list[dict] | None = None
+    cached = _definition_cache.get(id(sg_def)) if _definition_cache is not None else None
+    if cached is None or cached[0] is not sg_def:
+        raw_nodes = sg_def.get("nodes")
+        internal_nodes = [n for n in raw_nodes if isinstance(n, dict)] if isinstance(raw_nodes, list) else []
+        raw_links = sg_def.get("links")
+        internal_links = [link for link in raw_links if isinstance(link, dict)] if isinstance(raw_links, list) else []
+        raw_inputs = sg_def.get("inputs")
+        definition_inputs = raw_inputs if isinstance(raw_inputs, list) else []
+        holders = _link_holders({"nodes": internal_nodes})
+        input_slots_by_link: dict[Any, set[int]] = {}
+        serialized_boundary_links = 0
+        for idx, entry in enumerate(definition_inputs):
+            if not isinstance(entry, dict):
+                continue
+            listed = _listed_link_ids(entry)
+            serialized_boundary_links += len(listed)
+            for link_id in listed:
+                if _is_link_id(link_id):
+                    input_slots_by_link.setdefault(link_id, set()).add(idx)
+        interior_by_id = {str(node.get("id")): node for node in internal_nodes}
+        internal_link_map = {link.get("id"): link for link in internal_links if _is_link_id(link.get("id"))}
+        interior_links = _last_wins_interior_links(internal_links, internal_link_map)
+        cached = (
+            sg_def,
+            internal_nodes,
+            internal_links,
+            definition_inputs,
+            holders,
+            input_slots_by_link,
+            serialized_boundary_links,
+            interior_by_id,
+        )
+        if _definition_cache is not None:
+            _definition_cache[id(sg_def)] = cached
+    (
+        _definition,
+        internal_nodes,
+        internal_links,
+        definition_inputs,
+        holders,
+        input_slots_by_link,
+        serialized_boundary_links,
+        interior_by_id,
+    ) = cached[:8]
+    if len(cached) >= 13:
+        internal_link_map, interior_links = cached[11:13]
+    elif internal_link_map is None or interior_links is None:
+        internal_link_map = {link.get("id"): link for link in internal_links if _is_link_id(link.get("id"))}
+        interior_links = _last_wins_interior_links(internal_links, internal_link_map)
+    assert internal_link_map is not None and interior_links is not None
+
+    # Direct callers that do not share the expansion allocator still get an id
+    # above concrete rows and every integer id held by this instance.
+    if _link_id_counter is None:
+        max_link_id = 0
+        for link in existing_links:
+            if isinstance(link, (list, tuple)) and link and _is_slot_index(link[0]):
+                max_link_id = max(max_link_id, link[0])
+        raw_outer_inputs = outer_node.get("inputs")
+        for entry in raw_outer_inputs if isinstance(raw_outer_inputs, list) else []:
+            if isinstance(entry, dict) and _is_slot_index(entry.get("link")):
+                max_link_id = max(max_link_id, entry["link"])
+        _link_id_counter = [max_link_id + 1]
+
+    link_id_remap: dict[Any, int] = {}
+    for link in interior_links:
+        old_id = link.get("id")
+        # link_id_remap[old_id] / internal_link_map[old_id] need a hashable key
+        # (see _is_link_id). Skip the entry entirely on a missing/unhashable/
+        # wrong-typed id so a bad apple can't crash the whole subgraph expansion (which runs
+        # before the per-node try/except wrapper).
+        if not _is_link_id(old_id):
+            continue
+        link_id_remap[old_id] = _link_id_counter[0]
+        _link_id_counter[0] += 1
+
+    # A row routed to the output proxy can also be held by a real interior
+    # input in malformed-but-recoverable saves. The renderer treats every
+    # real holder as fed by the row's source; preserve those dependencies in
+    # the API graph with one fresh edge per holder while still publishing the
+    # same row as the definition output.
+    boundary_holder_ids, boundary_holder_edges = _output_boundary_holder_edges(
+        sg_def, internal_links, internal_link_map, holders, outer_id, _link_id_counter
+    )
+
+    if len(cached) >= 11:
+        input_targets, output_sources, _definition_input_names = cached[8:11]
+    else:
+        input_targets = {}
+        target_cache: dict[int, tuple[tuple[dict, int, dict], ...]] = {}
+        target_budget = [_MAX_RESOLVED_SUBGRAPH_INPUTS + 3 * serialized_boundary_links]
+        for idx, in_def in enumerate(definition_inputs):
+            if not isinstance(in_def, dict):
+                continue
+            targets = []
+            seen_targets: set[tuple[str, int]] = set()
+            for lid in _listed_link_ids(in_def):
+                if target_budget[0] <= 0:
+                    raise WorkflowConversionError("subgraph input expansion exceeded its safe limit")
+                target_budget[0] -= 1
+                if not _is_link_id(lid) or input_slots_by_link.get(lid) != {idx}:
+                    continue
+                link = internal_link_map.get(lid)
+                if isinstance(link, dict) and str(link.get("origin_id")) == str(_SUBGRAPH_INPUT_NODE_ID):
+                    for target, target_slot, _entry in held_link_targets(
+                        sg_def,
+                        lid,
+                        link,
+                        holders,
+                        target_cache,
+                        target_budget,
+                        "subgraph input expansion exceeded its safe limit",
+                    ):
+                        target_key = (str(target.get("id")), target_slot)
+                        if target_key in seen_targets:
+                            continue
+                        if target_budget[0] <= 0:
+                            raise WorkflowConversionError("subgraph input expansion exceeded its safe limit")
+                        target_budget[0] -= 1
+                        seen_targets.add(target_key)
+                        targets.append((target.get("id"), target_slot))
+            if targets:
+                input_targets[idx] = targets
+
+        output_sources = {}
+        raw_outputs = sg_def.get("outputs")
+        definition_outputs = raw_outputs if isinstance(raw_outputs, list) else []
+        output_slots_by_link: dict[Any, set[int]] = {}
+        for idx, out_def in enumerate(definition_outputs):
+            if not isinstance(out_def, dict):
+                continue
+            for lid in _listed_link_ids(out_def):
+                if _is_link_id(lid):
+                    output_slots_by_link.setdefault(lid, set()).add(idx)
+        resolved_output_link_ids: set[Any] = set()
+        for link in internal_links:
+            lid = link.get("id")
+            output_slots = output_slots_by_link.get(lid, set()) if _is_link_id(lid) else set()
+            if (
+                not output_slots
+                or internal_link_map.get(lid) is not link
+                or lid in resolved_output_link_ids
+                or str(link.get("target_id")) != str(_SUBGRAPH_OUTPUT_NODE_ID)
+            ):
+                continue
+            origin_id = link.get("origin_id")
+            origin_slot = link.get("origin_slot")
+            if str(origin_id) == str(_SUBGRAPH_INPUT_NODE_ID):
+                listed_inputs = input_slots_by_link.get(lid, set())
+                if len(listed_inputs) == 1:
+                    source = (_SUBGRAPH_INPUT_NODE_ID, next(iter(listed_inputs)))
+                    for output_slot in output_slots:
+                        output_sources.setdefault(output_slot, source)
+                    resolved_output_link_ids.add(lid)
+                continue
+            source_node = interior_by_id.get(str(origin_id))
+            if not _is_link_id(origin_id) or not _is_slot_index(origin_slot) or origin_slot < 0 or source_node is None:
+                continue
+            outputs = source_node.get("outputs")
+            if isinstance(outputs, list) and origin_slot >= len(outputs):
+                continue
+            for output_slot in output_slots:
+                output_sources.setdefault(output_slot, (origin_id, origin_slot))
+            resolved_output_link_ids.add(lid)
+
+        definition_input_names: dict[str, int] = {}
+        for idx, entry in enumerate(definition_inputs):
+            if isinstance(entry, dict):
+                definition_input_names.setdefault(_input_name(entry.get("name")), idx)
+        cached = (*cached, input_targets, output_sources, definition_input_names, internal_link_map, interior_links)
+        if _definition_cache is not None:
+            _definition_cache[id(sg_def)] = cached
+
+    expanded_nodes: list[dict] = []
+    for inner in internal_nodes:
+        expanded = inner.copy()
+        expanded["id"] = f"{outer_id}:{inner.get('id')}"
+        expanded["inputs"] = _expanded_node_inputs(inner, internal_link_map, link_id_remap, boundary_holder_ids)
+        expanded_nodes.append(expanded)
+
+    expanded_links: list = []
+    for link in interior_links:
+        origin_id = link.get("origin_id")
+        target_id = link.get("target_id")
+        if str(origin_id) in (str(_SUBGRAPH_INPUT_NODE_ID), str(_SUBGRAPH_OUTPUT_NODE_ID)):
+            continue
+        if str(target_id) in (str(_SUBGRAPH_INPUT_NODE_ID), str(_SUBGRAPH_OUTPUT_NODE_ID)):
+            continue
+        old_id = link.get("id")
+        if not _is_link_id(old_id):
+            continue
+        new_id = link_id_remap.get(old_id, old_id)
+        expanded_links.append(
+            [
+                new_id,
+                f"{outer_id}:{origin_id}",
+                link.get("origin_slot"),
+                f"{outer_id}:{target_id}",
+                link.get("target_slot"),
+                link.get("type"),
+            ]
+        )
+    expanded_links.extend(boundary_holder_edges)
+
+    return expanded_nodes, expanded_links, input_targets, output_sources
+
+
+def _rewrite_internal_input(
+    input_info: dict, internal_link_map: dict[int, dict], link_id_remap: dict[int, int]
+) -> dict:
+    input_copy = input_info.copy()
+    link_id = input_info.get("link")
+    if not _is_link_id(link_id):
+        # Both internal_link_map and link_id_remap are keyed by int IDs; an
+        # unhashable (list/dict) link_id would otherwise crash the lookup
+        # and abort the whole subgraph expansion.
+        return input_copy
+    link = internal_link_map.get(link_id)
+    if not isinstance(link, dict):
+        # An interior holder whose row is absent is dangling in this definition.
+        # Keeping its raw id would let it collide with an unrelated link in an
+        # outer scope after expansion.
+        input_copy["link"] = None
+        return input_copy
+    if link_id in link_id_remap:
+        input_copy["link"] = link_id_remap[link_id]
+    else:
+        # Boundary and malformed rows are not emitted. They may be reattached
+        # to an external link later; until then their definition-scope id must
+        # never collide with an outer row.
+        input_copy["link"] = None
+    return input_copy
+
+
+def _rewrite_links_for_subgraphs(links: list, ctx: _SubgraphCtx, nodes: list[dict]) -> list:
+    """Resolve links that cross subgraph boundaries to their internal endpoints."""
+    if not ctx.output_sources and not ctx.input_targets:
+        return links
+
+    node_input_updates: dict[str, dict[int, int]] = {}
+    expanded_node_ids = {str(node.get("id")) for node in nodes}
+    live_input_holders: dict[Any, list[tuple[str, int]]] = {}
+    for node in nodes:
+        raw_inputs = node.get("inputs")
+        inputs = raw_inputs if isinstance(raw_inputs, list) else []
+        for slot, entry in enumerate(inputs):
+            if isinstance(entry, dict) and _is_link_id(entry.get("link")):
+                live_input_holders.setdefault(entry["link"], []).append((str(node.get("id")), slot))
+    resolution_memo: dict[tuple[str, str, bool], list[tuple[Any, Any]]] = {}
+    # A one-to-one boundary row spends four fixed units (root visit, direct
+    # target, leaf visit, result append). Reserve that serialized baseline;
+    # the fixed cap remains available only for fan-out beyond it.
+    resolution_budget = [3 * _MAX_RESOLVED_SUBGRAPH_INPUTS + (3 * _MAX_RESOLUTION_DEPTH + 1) * len(links)]
+    source_budget = [_MAX_RESOLVED_SUBGRAPH_INPUTS + (2 * _MAX_RESOLUTION_DEPTH + 1) * len(links)]
+    # Holder routing depends only on a typed link id, not on which duplicate
+    # row carried it. Materialize each fanout once so repeated rows cannot turn
+    # K serialized holders into K² work.
+    routed_holder_targets: dict[Any, tuple[list[tuple[Any, Any]], set[tuple[str, int]]]] = {}
+    routed_link_ids = {
+        link[0] for link in links if isinstance(link, (list, tuple)) and len(link) >= 6 and _is_link_id(link[0])
+    }
+    for routed_link_id in routed_link_ids:
+        holder_specs = ctx.input_holders.get(routed_link_id, [])
+        live_holder_specs = live_input_holders.get(routed_link_id, [])
+        if not holder_specs and not live_holder_specs:
+            continue
+        targets: list[tuple[Any, Any]] = []
+        update_targets: set[tuple[str, int]] = set()
+        for holder_id, held_idx in holder_specs:
+            resolved = _resolve_subgraph_input_all(
+                holder_id,
+                held_idx,
+                ctx,
+                _memo=resolution_memo,
+                _budget=resolution_budget,
+                _definition_slot=True,
+            )
+            if resolved != [(holder_id, held_idx)]:
+                targets.extend(resolved)
+                update_targets.update(
+                    (str(resolved_id), resolved_slot)
+                    for resolved_id, resolved_slot in resolved
+                    if _is_slot_index(resolved_slot)
+                )
+        targets.extend(live_holder_specs)
+        deduped: list[tuple[Any, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for target in targets:
+            key = (str(target[0]), repr(target[1]))
+            if key not in seen:
+                seen.add(key)
+                deduped.append(target)
+        routed_holder_targets[routed_link_id] = (deduped, update_targets)
+    # Concrete link lookup is last-row-wins. Walk in reverse and process each
+    # typed id once so passthrough source recording uses that same row and
+    # duplicate rows cannot multiply boundary-fanout work.
+    source_link_ids: set[Any] = set()
+    for link in reversed(links):
+        if not isinstance(link, (list, tuple)) or len(link) < 6:
+            continue
+        link_id, src_id, src_slot, tgt_id, tgt_slot, _link_type = link[:6]
+        if not _is_link_id(link_id) or link_id in source_link_ids:
+            continue
+        source_link_ids.add(link_id)
+        tgt_id_str = str(tgt_id)
+        holder_specs = ctx.input_holders.get(link_id, [])
+        if holder_specs:
+            for holder_id, held_idx in holder_specs:
+                _record_subgraph_input_source(holder_id, held_idx, (src_id, src_slot), ctx, source_budget)
+            continue
+        if tgt_id_str not in ctx.output_sources and tgt_id_str not in ctx.input_targets:
+            continue
+        if tgt_id_str in ctx.held_input_idx:
+            held_slots = ctx.held_input_idx[tgt_id_str].get(link_id)
+            if not held_slots:
+                continue
+            for held_idx in held_slots:
+                _record_subgraph_input_source(tgt_id_str, held_idx, (src_id, src_slot), ctx, source_budget)
+            continue
+        else:
+            if not ((isinstance(tgt_slot, int) and not isinstance(tgt_slot, bool)) or isinstance(tgt_slot, str)):
+                continue
+            outer_map = ctx.outer_to_input_idx.get(tgt_id_str)
+            held_idx = outer_map.get(tgt_slot, tgt_slot) if outer_map else tgt_slot
+        if not isinstance(held_idx, int) or isinstance(held_idx, bool):
+            continue
+        _record_subgraph_input_source(
+            tgt_id_str,
+            held_idx,
+            (src_id, src_slot),
+            ctx,
+            source_budget,
+        )
+    # If the authoritative last row for an id resolves to an unwired
+    # passthrough, every duplicate row with that id is stale and must be
+    # removed. Otherwise an earlier duplicate becomes the effective row.
+    last_rows: dict[Any, tuple | list] = {}
+    for link in links:
+        if isinstance(link, (list, tuple)) and len(link) >= 6 and _is_link_id(link[0]):
+            last_rows[link[0]] = link
+    dropped_unwired_ids = {
+        link_id for link_id, link in last_rows.items() if _resolve_subgraph_output(str(link[1]), link[2], ctx) is None
+    }
+    updated: list = []
+    applied_holder_updates: set[Any] = set()
+    for link in links:
+        if not isinstance(link, (list, tuple)) or len(link) < 6:
+            updated.append(link)
+            continue
+        link_id, src_id, src_slot, tgt_id, tgt_slot, link_type = link[:6]
+        if _is_link_id(link_id) and link_id in dropped_unwired_ids:
+            continue
+
+        src_id_str = str(src_id)
+        resolved_source = _resolve_subgraph_output(src_id_str, src_slot, ctx)
+        if resolved_source is None:
+            continue
+        src_id_out, src_slot_out = resolved_source
+
+        tgt_id_str = str(tgt_id)
+        effective_tgt_slot = tgt_slot
+        holder_specs = ctx.input_holders.get(link_id, []) if _is_link_id(link_id) else []
+        live_holder_specs = live_input_holders.get(link_id, []) if _is_link_id(link_id) else []
+        expanded_target = (
+            bool(holder_specs)
+            or tgt_id_str in ctx.held_input_idx
+            or tgt_id_str in ctx.input_targets
+            or tgt_id_str in ctx.output_sources
+        )
+        holder_route = routed_holder_targets.get(link_id) if _is_link_id(link_id) else None
+        if holder_route is not None:
+            all_targets = holder_route[0]
+            update_targets = holder_route[1]
+        else:
+            all_targets = []
+            update_targets = set()
+            if tgt_id_str in ctx.held_input_idx:
+                if not _is_link_id(link_id):
+                    continue
+                held_slots = ctx.held_input_idx[tgt_id_str].get(link_id)
+                if not held_slots:
+                    continue
+                for held_idx in held_slots:
+                    resolved = _resolve_subgraph_input_all(
+                        tgt_id_str,
+                        held_idx,
+                        ctx,
+                        _memo=resolution_memo,
+                        _budget=resolution_budget,
+                        _definition_slot=True,
+                    )
+                    all_targets.extend(resolved)
+                    update_targets.update(
+                        (str(resolved_id), resolved_slot)
+                        for resolved_id, resolved_slot in resolved
+                        if _is_slot_index(resolved_slot)
+                    )
+            else:
+                all_targets = _resolve_subgraph_input_all(
+                    tgt_id_str,
+                    effective_tgt_slot,
+                    ctx,
+                    _memo=resolution_memo,
+                    _budget=resolution_budget,
+                )
+                update_targets.update(
+                    (str(resolved_id), resolved_slot)
+                    for resolved_id, resolved_slot in all_targets
+                    if _is_slot_index(resolved_slot)
+                    and (str(resolved_id) != tgt_id_str or resolved_slot != effective_tgt_slot)
+                )
+        if holder_route is None:
+            deduped_targets: list[tuple[Any, Any]] = []
+            seen_targets: set[tuple[str, str]] = set()
+            for resolved_target in all_targets:
+                key = (str(resolved_target[0]), repr(resolved_target[1]))
+                if key not in seen_targets:
+                    seen_targets.add(key)
+                    deduped_targets.append(resolved_target)
+            all_targets = deduped_targets
+        if expanded_target and not all_targets:
+            # The expanded-away instance has no live interior holder for this
+            # input. Passthrough outputs already captured its upstream in the
+            # pre-pass; retaining this row would point at a nonexistent node.
+            continue
+        if not all_targets:
+            all_targets = [(tgt_id_str, effective_tgt_slot)]
+        # Track input-slot rewrites for ALL targets (one outer input may fan out).
+        if not _is_link_id(link_id) or link_id not in applied_holder_updates:
+            for resolved_tgt_id, resolved_tgt_slot in all_targets:
+                if (
+                    _is_slot_index(resolved_tgt_slot)
+                    and (str(resolved_tgt_id), resolved_tgt_slot) in update_targets
+                    and str(resolved_tgt_id) in expanded_node_ids
+                ):
+                    node_input_updates.setdefault(str(resolved_tgt_id), {})[resolved_tgt_slot] = link_id
+            if _is_link_id(link_id):
+                applied_holder_updates.add(link_id)
+
+        first_tgt_id, first_tgt_slot = all_targets[0]
+        updated.append([link_id, src_id_out, src_slot_out, first_tgt_id, first_tgt_slot, link_type])
+
+    # Apply input updates to the expanded internal nodes.
+    for node in nodes:
+        node_id_str = str(node.get("id"))
+        if node_id_str not in node_input_updates:
+            continue
+        slot_to_link = node_input_updates[node_id_str]
+        raw_inputs = node.get("inputs")
+        inputs = raw_inputs if isinstance(raw_inputs, list) else []
+        for slot_idx, input_info in enumerate(inputs):
+            if slot_idx in slot_to_link and isinstance(input_info, dict):
+                input_info["link"] = slot_to_link[slot_idx]
+
+    return updated
+
+
+def _resolve_subgraph_output(node_id_str: str, slot: Any, ctx: _SubgraphCtx, depth: int = 0) -> tuple[Any, Any] | None:
+    if depth > _MAX_RESOLUTION_DEPTH:
+        raise WorkflowConversionError("subgraph output resolution exceeded its safe limit")
+    mapping = ctx.output_sources.get(node_id_str)
+    if not mapping:
+        return node_id_str, slot
+    if not isinstance(slot, int) or isinstance(slot, bool):
+        return node_id_str, slot
+    source = mapping.get(slot)
+    if source is None:
+        return node_id_str, slot
+    internal_node, internal_slot = source
+    if str(internal_node) == str(_SUBGRAPH_INPUT_NODE_ID):
+        upstream = ctx.input_sources.get(node_id_str, {}).get(internal_slot)
+        if upstream is None:
+            return None
+        return _resolve_subgraph_output(str(upstream[0]), upstream[1], ctx, depth + 1)
+    new_id = f"{node_id_str}:{internal_node}"
+    return _resolve_subgraph_output(new_id, internal_slot, ctx, depth + 1)
+
+
+def _record_subgraph_input_source(
+    node_id_str: str,
+    input_idx: int,
+    source: tuple[Any, Any],
+    ctx: _SubgraphCtx,
+    budget: list[int],
+    depth: int = 0,
+    seen: set[tuple[str, int]] | None = None,
+) -> None:
+    """Record one external source on every nested instance boundary it feeds."""
+    if depth > _MAX_RESOLUTION_DEPTH:
+        return
+    if seen is None:
+        seen = set()
+    key = (node_id_str, input_idx)
+    if key in seen:
+        return
+    sources = ctx.input_sources.setdefault(node_id_str, {})
+    if input_idx in sources:
+        return
+    if budget[0] <= 0:
+        raise WorkflowConversionError("subgraph input-source resolution exceeded its safe limit")
+    budget[0] -= 1
+    seen.add(key)
+    sources[input_idx] = source
+    for internal_node, internal_slot in ctx.input_targets.get(node_id_str, {}).get(input_idx, []):
+        if budget[0] <= 0:
+            raise WorkflowConversionError("subgraph input-source resolution exceeded its safe limit")
+        budget[0] -= 1
+        nested_id = f"{node_id_str}:{internal_node}"
+        if nested_id not in ctx.input_targets and nested_id not in ctx.output_sources:
+            continue
+        nested_idx = internal_slot
+        outer_map = ctx.outer_to_input_idx.get(nested_id)
+        if outer_map:
+            nested_idx = outer_map.get(internal_slot, internal_slot)
+        if isinstance(nested_idx, int) and not isinstance(nested_idx, bool):
+            _record_subgraph_input_source(nested_id, nested_idx, source, ctx, budget, depth + 1, seen)
+
+
+def _resolve_subgraph_input_all(
+    node_id_str: str,
+    slot: Any,
+    ctx: _SubgraphCtx,
+    depth: int = 0,
+    _memo: dict[tuple[str, str, bool], list[tuple[Any, Any]]] | None = None,
+    _budget: list[int] | None = None,
+    _definition_slot: bool = False,
+) -> list[tuple[Any, Any]]:
+    if _memo is None:
+        _memo = {}
+    if _budget is None:
+        _budget = [_MAX_RESOLVED_SUBGRAPH_INPUTS]
+    memo_key = (node_id_str, repr(slot), _definition_slot)
+    if memo_key in _memo:
+        result = _memo[memo_key]
+        if len(result) > _budget[0]:
+            raise WorkflowConversionError("subgraph input resolution exceeded its safe limit")
+        _budget[0] -= len(result)
+        return result
+    if _budget[0] <= 0:
+        raise WorkflowConversionError("subgraph input resolution exceeded its safe limit")
+    _budget[0] -= 1
+    if depth > _MAX_RESOLUTION_DEPTH:
+        return [(node_id_str, slot)]
+    mapping = ctx.input_targets.get(node_id_str)
+    if not mapping:
+        return [(node_id_str, slot)]
+
+    if not ((isinstance(slot, int) and not isinstance(slot, bool)) or isinstance(slot, str)):
+        return [(node_id_str, slot)]
+
+    sg_input_idx = slot
+    outer_map = ctx.outer_to_input_idx.get(node_id_str)
+    if not _definition_slot and outer_map and slot in outer_map:
+        sg_input_idx = outer_map[slot]
+
+    targets = mapping.get(sg_input_idx)
+    if not targets:
+        return [(node_id_str, slot)]
+
+    out: list[tuple[Any, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    seen_direct: set[tuple[str, str]] = set()
+    for internal_node, internal_slot in targets:
+        direct_key = (str(internal_node), repr(internal_slot))
+        if direct_key in seen_direct:
+            continue
+        seen_direct.add(direct_key)
+        if _budget[0] <= 0:
+            raise WorkflowConversionError("subgraph input resolution exceeded its safe limit")
+        _budget[0] -= 1
+        new_id = f"{node_id_str}:{internal_node}"
+        for resolved_node, resolved_slot in _resolve_subgraph_input_all(
+            new_id, internal_slot, ctx, depth + 1, _memo, _budget
+        ):
+            resolved_key = (str(resolved_node), repr(resolved_slot))
+            if resolved_key in seen:
+                continue
+            if _budget[0] <= 0:
+                raise WorkflowConversionError("subgraph input resolution exceeded its safe limit")
+            _budget[0] -= 1
+            seen.add(resolved_key)
+            out.append((resolved_node, resolved_slot))
+    result = out or [(node_id_str, slot)]
+    _memo[memo_key] = result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Link map + tracing helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_valid_connection(type_a: Any, type_b: Any) -> bool:
+    """Mirror of LiteGraph.isValidConnection from the frontend.
+
+    ``*`` and ``""`` wildcards match anything; comma-separated alternatives are
+    expanded; otherwise we case-insensitively compare type names.
+    """
+    if type_a in (0, "", "*"):
+        type_a = 0
+    if type_b in (0, "", "*"):
+        type_b = 0
+    if not type_a or not type_b or type_a == type_b:
+        return True
+    type_a_s = str(type_a).lower()
+    type_b_s = str(type_b).lower()
+    if "," not in type_a_s and "," not in type_b_s:
+        return type_a_s == type_b_s
+    for a in type_a_s.split(","):
+        for b in type_b_s.split(","):
+            if _is_valid_connection(a.strip(), b.strip()):
+                return True
+    return False
+
+
+def _build_link_map(links: list) -> dict[int, dict]:
+    link_map: dict[int, dict] = {}
+    for link in links:
+        if not isinstance(link, (list, tuple)) or len(link) < 6:
+            continue
+        link_id, src_id, src_slot, tgt_id, tgt_slot, link_type = link[:6]
+        if not _is_link_id(link_id):
+            continue  # unhashable (malformed save) — skip it, don't abort the conversion
+        link_map[link_id] = {
+            "source_id": src_id,
+            "source_slot": src_slot,
+            "target_id": tgt_id,
+            "target_slot": tgt_slot,
+            "type": link_type,
+        }
+    return link_map
+
+
+def _collect_primitive_values(nodes: list[dict]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for node in nodes:
+        if node.get("type") != "PrimitiveNode":
+            continue
+        widgets = node.get("widgets_values")
+        if isinstance(widgets, list) and widgets:
+            out[str(node.get("id"))] = widgets[0]
+    return out
+
+
+def _collect_bypassed(nodes: list[dict]) -> set[str]:
+    return {str(n.get("id")) for n in nodes if n.get("mode") == _MODE_BYPASS}
+
+
+def _collect_reroute_sources(nodes: list[dict], link_map: dict[int, dict]) -> dict[str, tuple[Any, Any]]:
+    out: dict[str, tuple[Any, Any]] = {}
+    for node in nodes:
+        if node.get("type") != "Reroute":
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, list) or not inputs or not isinstance(inputs[0], dict):
+            continue
+        link_id = inputs[0].get("link")
+        # ``link_id in link_map`` raises TypeError on unhashable values
+        # (e.g. ``link: []`` in a malformed saved file). _collect_reroute_sources
+        # runs before the per-node try/except wrapper, so a single bad Reroute
+        # would otherwise abort the entire conversion.
+        if not _is_link_id(link_id) or link_id not in link_map:
+            continue
+        ld = link_map[link_id]
+        out[str(node.get("id"))] = (ld["source_id"], ld["source_slot"])
+    return out
+
+
+def _collect_get_set_mappings(
+    nodes: list[dict], link_map: dict[int, dict]
+) -> tuple[dict[str, tuple[Any, Any]], dict[str, str]]:
+    """SetNode publishes a value under a name; GetNode reads it back."""
+    set_sources: dict[str, tuple[Any, Any]] = {}
+    get_vars: dict[str, str] = {}
+    for node in nodes:
+        node_type = node.get("type")
+        widgets = node.get("widgets_values")
+        if not isinstance(widgets, list) or not widgets:
+            continue
+        var_name = widgets[0]
+        # var_name becomes a dict key (set_sources[var_name]) and is later
+        # checked with ``var_name in set_sources`` inside the tracer. Both
+        # require it to be a non-empty string; reject anything else early.
+        if not isinstance(var_name, str) or not var_name:
+            continue
+        if node_type == "SetNode":
+            for inp in node.get("inputs") or []:
+                if not isinstance(inp, dict):
+                    continue
+                lid = inp.get("link")
+                # See _collect_reroute_sources: unhashable lid would crash
+                # the global pre-pass before any per-node guard kicks in.
+                if not _is_link_id(lid) or lid not in link_map:
+                    continue
+                ld = link_map[lid]
+                set_sources[var_name] = (ld["source_id"], ld["source_slot"])
+                break
+        elif node_type == "GetNode":
+            get_vars[str(node.get("id"))] = var_name
+    return set_sources, get_vars
+
+
+def _collect_excluded(nodes: list[dict]) -> set[str]:
+    """Identify nodes that should never appear in the API output.
+
+    Only ``LoadImageOutput`` is excluded here — it's a UI-only file picker
+    for browsing the output folder, with no Python class behind it. All
+    other UI-only types are filtered by name via ``_UI_ONLY_NODE_TYPES``.
+
+    Matches the frontend's policy (``executionUtil.ts:graphToPrompt``) and
+    cloud-mcp-server's ``shouldIncludeInOutput`` of emitting every
+    non-virtual, non-muted, non-bypassed node regardless of whether its
+    outputs are wired. The executor only runs nodes reachable from sinks
+    (SaveImage, etc.), so unwired nodes are harmless in the prompt.
+
+    We previously applied a "dead-branch" heuristic that dropped any node
+    with no downstream consumer; that excluded legitimate sources like an
+    unwired ``LoadAudio`` and caused 20+ cloud-mcp oracle fixtures to lose
+    nodes that the live frontend emits.
+    """
+    return {str(n.get("id")) for n in nodes if n.get("type") == "LoadImageOutput"}
+
+
+class _Tracers:
+    """Bundle of upstream-resolution helpers used while emitting each API node."""
+
+    def __init__(
+        self,
+        *,
+        link_map: dict[int, dict],
+        nodes: list[dict],
+        node_by_id: dict[str, dict],
+        bypassed: set[str],
+        reroute_sources: dict[str, tuple[Any, Any]],
+        set_sources: dict[str, tuple[Any, Any]],
+        get_vars: dict[str, str],
+        subgraph_ctx: _SubgraphCtx,
+    ) -> None:
+        self.link_map = link_map
+        self.nodes = nodes
+        self.node_by_id = node_by_id
+        self.bypassed = bypassed
+        self.reroute_sources = reroute_sources
+        self.set_sources = set_sources
+        self.get_vars = get_vars
+        self.subgraph_ctx = subgraph_ctx
+
+    def trace_reroute(self, src_id: Any, src_slot: Any) -> tuple[Any, Any]:
+        # Iterative to avoid Python's recursion limit on long chains. The
+        # body matches a tail-recursive version exactly; the seen-set guards
+        # against cyclic ``Reroute -> Reroute -> ...`` loops.
+        seen: set[str] = set()
+        while True:
+            key = str(src_id)
+            if key in seen or key not in self.reroute_sources:
+                return src_id, src_slot
+            seen.add(key)
+            src_id, src_slot = self.reroute_sources[key]
+
+    def trace_get_set(self, src_id: Any, src_slot: Any) -> tuple[Any, Any]:
+        # Same iterative shape as trace_reroute. Hops through one
+        # GetNode -> SetNode pair per step; the seen-set guards against
+        # cycles via repeated variable names.
+        seen: set[str] = set()
+        while True:
+            key = str(src_id)
+            if key in seen or key not in self.get_vars:
+                return src_id, src_slot
+            seen.add(key)
+            var_name = self.get_vars[key]
+            if var_name not in self.set_sources:
+                return src_id, src_slot
+            src_id, src_slot = self.set_sources[var_name]
+
+    def trace_bypassed(self, src_id: Any, src_slot: Any) -> tuple[Any, Any]:
+        # Iterative. Each loop iteration corresponds to walking through one
+        # bypassed node; inner calls to trace_get_set / trace_reroute already
+        # iterate over their respective chains (no recursion).
+        seen: set[Any] = set()
+        while True:
+            if src_id in seen:
+                return src_id, src_slot
+            seen.add(src_id)
+            if str(src_id) not in self.bypassed:
+                return src_id, src_slot
+
+            node = self.node_by_id.get(str(src_id))
+            if not node:
+                return src_id, src_slot
+
+            outputs = node.get("outputs") or []
+            # Guard the slot index — malformed workflows can have non-numeric slots.
+            try:
+                slot_idx = int(src_slot) if src_slot is not None else 0
+            except (TypeError, ValueError):
+                slot_idx = 0
+            output_type = (
+                outputs[slot_idx].get("type")
+                if 0 <= slot_idx < len(outputs) and isinstance(outputs[slot_idx], dict)
+                else None
+            )
+
+            # Pick the input we'll forward the output through. We mix the frontend's
+            # strict matcher (ExecutableNodeDTO._getBypassSlotIndex) with the
+            # reference converter's permissive fallback, in order of preference:
+            #   1. Same-slot input if its type connects to the output type
+            #   2. First input whose type matches the output type exactly
+            #   3. First input whose type is connection-compatible (handles ``*``
+            #      and ``,``-separated alternatives via LiteGraph.isValidConnection)
+            #   4. First linked input regardless of type — preserves user intent
+            #      when types disagree, matching SethRobinson's reference. The
+            #      executor will surface a type mismatch loudly if it matters.
+            inputs = node.get("inputs") or []
+            chosen_link: int | None = None
+            exact_link: int | None = None
+            compat_link: int | None = None
+            fallback_link: int | None = None
+
+            same_slot_inp = (
+                inputs[slot_idx] if 0 <= slot_idx < len(inputs) and isinstance(inputs[slot_idx], dict) else None
+            )
+            if same_slot_inp:
+                lid = same_slot_inp.get("link")
+                if (
+                    lid is not None
+                    and lid in self.link_map
+                    and _is_valid_connection(same_slot_inp.get("type"), output_type)
+                ):
+                    chosen_link = lid
+
+            if chosen_link is None:
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    lid = inp.get("link")
+                    if lid is None or lid not in self.link_map:
+                        continue
+                    inp_type = inp.get("type")
+                    if fallback_link is None:
+                        fallback_link = lid
+                    if output_type and inp_type == output_type and exact_link is None:
+                        exact_link = lid
+                    if compat_link is None and _is_valid_connection(inp_type, output_type):
+                        compat_link = lid
+                chosen_link = exact_link if exact_link is not None else compat_link
+                if chosen_link is None:
+                    chosen_link = fallback_link
+
+            if chosen_link is None:
+                return src_id, src_slot
+
+            ld = self.link_map[chosen_link]
+            upstream_id, upstream_slot = ld["source_id"], ld["source_slot"]
+            upstream_id, upstream_slot = self.trace_get_set(upstream_id, upstream_slot)
+            upstream_id, upstream_slot = self.trace_reroute(upstream_id, upstream_slot)
+            src_id, src_slot = upstream_id, upstream_slot
+            # Loop continues with the new src_id/src_slot.
+
+
+# ---------------------------------------------------------------------------
+# Per-node emission
+# ---------------------------------------------------------------------------
+
+
+def _wrap_widget_value(value: Any) -> Any:
+    """Wrap list widget values to disambiguate them from [node_id, slot] links.
+
+    ScalifyUI's executor strips the wrapper before passing to the node. See
+    execution.py: ``if "__value__" in val: val = val["__value__"]``.
+    """
+    if isinstance(value, list):
+        return {"__value__": value}
+    return value
+
+
+def process_dynamic_prompt(value: str) -> str:
+    """Resolve the ``{a|b|c}`` syntax used in CLIPTextEncode text widgets.
+
+    Port of the frontend's ``processDynamicPrompt`` (``formatUtil.ts``):
+
+    * Strips ``/* ... */`` and ``// ...`` comments first.
+    * Picks one alternative at random from each top-level ``{a|b|...}``
+      group. Nested groups are recursed into after a choice is made.
+    * ``\\{``, ``\\}``, ``\\|`` escape their literal characters.
+
+    Non-deterministic by design — the backend doesn't process the syntax,
+    so a workflow saved with ``{red|blue} hat`` would otherwise tokenize
+    the braces literally and produce a junk image.
+    """
+    return _resolve_dynamic_prompt(_DYNAMIC_PROMPT_COMMENT_RE.sub("", value))
+
+
+def _resolve_dynamic_prompt(value: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(value)
+    while i < n:
+        ch = value[i]
+        i += 1
+        if ch == "\\" and i < n:
+            # Preserve the escape marker so the unescape pass at the end can
+            # restore the literal character without it being consumed earlier.
+            out.append("\\" + value[i])
+            i += 1
+        elif ch == "{":
+            chosen, i = _parse_dynamic_prompt_block(value, i)
+            out.append(_resolve_dynamic_prompt(chosen))
+        else:
+            out.append(ch)
+    return _DYNAMIC_PROMPT_UNESCAPE_RE.sub(r"\1", "".join(out))
+
+
+def _parse_dynamic_prompt_block(value: str, i: int) -> tuple[str, int]:
+    """Parse a ``{a|b|...}`` group starting at index ``i`` (just past the ``{``).
+
+    Returns ``(chosen_option, new_i)``. ``new_i`` points past the closing
+    ``}`` (or past end-of-string if the group is unterminated — the frontend
+    silently degrades on malformed input and we match that).
+    """
+    options: list[str] = []
+    choice: list[str] = []
+    depth = 0
+    n = len(value)
+    while i < n:
+        ch = value[i]
+        i += 1
+        if ch == "\\" and i < n:
+            choice.append("\\" + value[i])
+            i += 1
+            continue
+        if ch == "{":
+            depth += 1
+            choice.append(ch)
+        elif ch == "}":
+            if depth == 0:
+                break
+            depth -= 1
+            choice.append(ch)
+        elif ch == "|" and depth == 0:
+            options.append("".join(choice))
+            choice = []
+        else:
+            choice.append(ch)
+    options.append("".join(choice))
+    return random.choice(options), i
+
+
+def _dynamic_prompt_input_names(node_type: str | None, node: dict | None, object_info: dict) -> set[str]:
+    """Names of inputs whose schema declares ``dynamicPrompts: True``."""
+    if not node_type or not node:
+        return set()
+    schema = _schema_for(node_type, node, object_info)
+    if not schema:
+        return set()
+    input_def = _schema_input_def(schema)
+    out: set[str] = set()
+    for section in ("required", "optional"):
+        section_def = input_def.get(section) or {}
+        if not isinstance(section_def, dict):
+            continue
+        for input_name, input_spec in section_def.items():
+            if not isinstance(input_spec, (list, tuple)) or len(input_spec) < 2:
+                continue
+            options = input_spec[1] if isinstance(input_spec[1], dict) else {}
+            if options.get("dynamicPrompts"):
+                out.add(input_name)
+    return out
+
+
+def _build_api_node(
+    *,
+    node: dict,
+    node_type: str,
+    object_info: dict,
+    tracers: _Tracers,
+    primitive_values: dict[str, Any],
+    bypassed: set[str],
+    nodes_to_exclude: set[str],
+) -> dict:
+    api_node: dict = {"inputs": {}, "class_type": node_type}
+    # Resolve the schema once via _schema_for so every consumer
+    # (_meta.title, defaults, combo normalization) sees the same thing
+    # as the widget-mapping path, even on nodes that carry a ``Node name
+    # for S&R`` property pointing at a different class.
+    schema = _schema_for(node_type, node, object_info) or {}
+
+    if "title" in node:
+        api_node["_meta"] = {"title": node["title"]}
+    else:
+        api_node["_meta"] = {"title": schema.get("display_name") or node_type}
+
+    link_inputs: dict[str, list] = {}
+    primitive_inputs: dict[str, Any] = {}
+    for inp in node.get("inputs") or []:
+        if not isinstance(inp, dict):
+            continue
+        input_name = inp.get("name")
+        link_id = inp.get("link")
+        if not input_name or not _is_link_id(link_id) or link_id not in tracers.link_map:
+            continue
+        ld = tracers.link_map[link_id]
+        actual_id, actual_slot = ld["source_id"], ld["source_slot"]
+
+        actual_id, actual_slot = tracers.trace_get_set(actual_id, actual_slot)
+        actual_id, actual_slot = tracers.trace_reroute(actual_id, actual_slot)
+        if str(actual_id) in bypassed:
+            actual_id, actual_slot = tracers.trace_bypassed(actual_id, actual_slot)
+            if str(actual_id) in bypassed:
+                # Couldn't find a non-bypassed source — let widget default cover it.
+                continue
+        # Bypassed source may itself have referenced a GetNode or Reroute.
+        actual_id, actual_slot = tracers.trace_get_set(actual_id, actual_slot)
+        actual_id, actual_slot = tracers.trace_reroute(actual_id, actual_slot)
+        # If we crossed a subgraph boundary while tracing, finalize to internal node.
+        resolved_source = _resolve_subgraph_output(str(actual_id), actual_slot, tracers.subgraph_ctx)
+        if resolved_source is None:
+            continue
+        actual_id, actual_slot = resolved_source
+
+        actual_id_str = str(actual_id)
+        if actual_id_str in primitive_values:
+            primitive_inputs[input_name] = _wrap_widget_value(primitive_values[actual_id_str])
+        elif actual_id_str in nodes_to_exclude:
+            continue
+        elif actual_id_str in bypassed:
+            continue
+        else:
+            link_inputs[input_name] = [actual_id_str, actual_slot]
+
+    widget_inputs = _collect_widget_inputs(node, node_type, object_info, link_inputs)
+    default_inputs = _collect_default_inputs(schema, widget_inputs, primitive_inputs, link_inputs)
+
+    ordered = _get_ordered_input_names(node_type, node, object_info)
+    if ordered:
+        # First widget-like values in the declared order, then link inputs.
+        # This matches what ScalifyUI's "Save (API)" produces.
+        for name in ordered:
+            if name in widget_inputs:
+                api_node["inputs"][name] = widget_inputs[name]
+            elif name in primitive_inputs:
+                api_node["inputs"][name] = primitive_inputs[name]
+            elif name in default_inputs:
+                api_node["inputs"][name] = default_inputs[name]
+        for name in ordered:
+            if name in link_inputs and name not in api_node["inputs"]:
+                api_node["inputs"][name] = link_inputs[name]
+
+    # Anything we didn't know an order for is still emitted (preserves data).
+    for source in (widget_inputs, primitive_inputs, default_inputs, link_inputs):
+        for key, value in source.items():
+            if key not in api_node["inputs"]:
+                api_node["inputs"][key] = value
+
+    _normalize_combo_values(schema, api_node["inputs"])
+    return api_node
+
+
+# ---------------------------------------------------------------------------
+# Widget / input order helpers (driven by /object_info)
+# ---------------------------------------------------------------------------
+
+
+def _schema_for(node_type: str, node: dict, object_info: dict) -> dict | None:
+    # Some nodes (litegraph subgraphs) store the real class name under properties.
+    properties = node.get("properties") or {}
+    alt_name = properties.get("Node name for S&R")
+    if isinstance(alt_name, str) and alt_name in object_info:
+        return object_info[alt_name]
+    return object_info.get(node_type) if isinstance(node_type, str) else None
+
+
+def _schema_input_def(schema: Any) -> dict:
+    """Return the schema's ``input`` block as a dict, or ``{}`` if absent/malformed.
+
+    Every helper that walks INPUT_TYPES sections needs this guard: the raw
+    ``schema.get("input") or {}`` pattern returns the value as-is when it's
+    truthy, so a malformed schema with ``"input": [...]`` would later crash
+    on ``.get(section)``. In practice ``/object_info`` never sends a non-dict
+    here, but the rest of the converter follows the same defensive contract.
+    """
+    if not isinstance(schema, dict):
+        return {}
+    input_def = schema.get("input")
+    return input_def if isinstance(input_def, dict) else {}
+
+
+def _get_ordered_input_names(node_type: str, node: dict, object_info: dict) -> list[str]:
+    schema = _schema_for(node_type, node, object_info)
+    if not schema:
+        return []
+    input_order = schema.get("input_order")
+    if not isinstance(input_order, dict):
+        input_order = {}
+    out: list[str] = []
+    for section in ("required", "optional"):
+        section_order = input_order.get(section)
+        if isinstance(section_order, list):
+            out.extend(section_order)
+    if out:
+        return out
+    # Fall back to whatever order is in the input dict itself.
+    input_def = _schema_input_def(schema)
+    for section in ("required", "optional"):
+        section_def = input_def.get(section) or {}
+        if isinstance(section_def, dict):
+            out.extend(section_def.keys())
+    return out
+
+
+def _is_widget_input(input_spec: Any) -> tuple[bool, bool]:
+    """Return (is_widget, is_dynamic_combo) for an INPUT_TYPES spec."""
+    if not isinstance(input_spec, (list, tuple)) or not input_spec:
+        return False, False
+    # ``forceInput: True`` (legacy alias: ``defaultInput``) explicitly demotes
+    # a widget-type input to a connection-only slot; the frontend doesn't
+    # render a widget for it and the saved workflow has no value for it in
+    # widgets_values. Treating it as a widget here would consume a value-slot
+    # that doesn't exist and shift every later widget out of position.
+    options = input_spec[1] if len(input_spec) >= 2 and isinstance(input_spec[1], dict) else {}
+    if options.get("forceInput") or options.get("defaultInput"):
+        return False, False
+    input_type = input_spec[0]
+    # ``widgetType`` overrides the socket type for widget selection
+    # (``inputSpec.widgetType ?? inputSpec.type`` in the frontend), so a
+    # ``FLOAT,INT`` input with ``widgetType: "FLOAT"`` owns a slot.
+    if isinstance(options.get("widgetType"), str) and options.get("widgetType"):
+        return True, False
+    # ``socketless`` hides the input SOCKET, not the widget: the value is
+    # serialized positionally like any other. Reading it as a link left its
+    # slot unconsumed, and `_collect_default_inputs` then refilled the input
+    # from the schema default — a colour the user picked came back as
+    # "#000000", which the server happily runs.
+    if options.get("socketless"):
+        return True, False
+    if isinstance(input_type, (list, tuple)):
+        return True, False  # combo of choices
+    if isinstance(input_type, str):
+        # The frontend renders a widget only for a type with a registered
+        # widget constructor (``widgetStore.inputIsWidget``); every other type,
+        # whatever its casing, is a connection socket that owns no
+        # ``widgets_values`` slot. A letter-case guess here once gave the
+        # mixed-case link ``VHS_LoadVideo.meta_batch`` (``VHS_BatchManager``) a
+        # slot, shifting the ``format`` value into it and crashing the node.
+        if input_type in {"INT", "FLOAT", "STRING", "BOOLEAN", "COMBO", "SCALIFY_DYNAMICGROUP_V3"}:
+            return True, False
+        if input_type in _FRONTEND_DOM_WIDGET_TYPES:
+            # Uppercase DOM widgets that serialize a slot (Load3D.image);
+            # same set the engine's widget order uses, so the two walks agree.
+            return True, False
+        if input_type.startswith("SCALIFY_") and "COMBO" in input_type:
+            return True, True
+    return False, False
+
+
+def _declared_input_spec(input_def: dict, name: str) -> Any:
+    """The spec a schema declares for ``name`` in either section, else ``None``."""
+    for section in ("required", "optional"):
+        section_def = input_def.get(section) or {}
+        if isinstance(section_def, dict) and name in section_def:
+            return section_def[name]
+    return None
+
+
+def _is_load_3d_spec(input_spec: Any) -> bool:
+    """Whether this input is the one the frontend's LOAD_3D factory renders.
+
+    Exactly the type that factory is registered for — ``LOAD_3D_ADVANCED`` and
+    ``PREVIEW_3D`` have their own widgets and inject no buttons.
+    """
+    return isinstance(input_spec, (list, tuple)) and bool(input_spec) and input_spec[0] == "LOAD_3D"
+
+
+def _dynamic_combo_selected_subs(input_name: str, input_spec: Any, selected: Any) -> list[tuple[str, Any]]:
+    """``(dotted_name, spec)`` pairs for the selected option's sub-inputs.
+
+    The dynamic combo's ``widgets_values`` selector value picks one option; that
+    option's ``inputs`` mirror an INPUT_TYPES dict. We return every sub-input's
+    *spec* (dotted with the parent name, e.g. ``model.size_preset``) and leave
+    the widget-vs-connection decision to the caller's ``_is_widget_input`` — the
+    same test applied to top-level inputs — so a connection-only sub-input (e.g.
+    a ``SCALIFY_AUTOGROW_V3`` image list) consumes no ``widgets_values`` slot.
+    Returns ``[]`` for an unknown selection or a malformed option block (the
+    latter would otherwise crash the per-node wrapper and drop the whole node).
+    """
+    if not isinstance(input_spec, (list, tuple)) or len(input_spec) < 2:
+        return []
+    options_meta = input_spec[1] if isinstance(input_spec[1], dict) else {}
+    options = options_meta.get("options") or []
+    for option in options:
+        if not isinstance(option, dict) or not _dynamic_combo_server_key_matches(option.get("key"), selected):
+            continue
+        sub_def = option.get("inputs")
+        if not isinstance(sub_def, dict):
+            return []
+        subs: list[tuple[str, Any]] = []
+        for section in ("required", "optional"):
+            section_def = sub_def.get(section) or {}
+            if isinstance(section_def, dict):
+                for sub_name, sub_spec in section_def.items():
+                    subs.append((f"{input_name}.{sub_name}", sub_spec))
+        return subs
+    return []
+
+
+def _dynamic_combo_option_keys(input_spec: Any) -> list[Any]:
+    """The ``key`` of every option a dynamic combo declares (order preserved)."""
+    if not isinstance(input_spec, (list, tuple)) or len(input_spec) < 2:
+        return []
+    options_meta = input_spec[1] if isinstance(input_spec[1], dict) else {}
+    options = options_meta.get("options") or []
+    return [option.get("key") for option in options if isinstance(option, dict)]
+
+
+def _schema_widget_pairs(schema: Any, widget_values: list[Any]) -> list[tuple[str, Any]]:
+    """Pair a schema's widget inputs with their ``widgets_values`` slots.
+
+    One ordered walk that unifies name-order and control-marker filtering so the
+    two can never disagree. For each schema input in order:
+
+    * skip non-widget inputs (connections, ``forceInput`` demotions, wildcards)
+      — they own no slot;
+    * consume one slot for a widget input, emitting ``(name, value)``;
+    * for a V3 dynamic combo (``SCALIFY_*COMBO*``) the consumed value is the
+      selector — recurse into the selected option's *widget* sub-inputs, each
+      consuming a following slot (connection-only subs are skipped, nested
+      dynamic combos recurse), so ``model.size_preset``/``model.width`` land in
+      order and ``model.images`` never steals a slot;
+    * drop a trailing ``control_after_generate`` marker string when the
+      just-consumed input is control-flagged (explicit flag or an implicit INT
+      ``seed``/``noise_seed``), or a legacy stray marker after another seed-like
+      INT that the next widget could not hold; sub-inputs recurse the same way.
+
+    Returns ``[]`` when the schema declares no widget inputs, so the caller can
+    fall back to node-input inspection exactly as before.
+    """
+    input_def = _schema_input_def(schema)
+    # ``hasModelFileWidget`` in the frontend's LOAD_3D factory: the buttons are
+    # attached to Load3D and occur in legacy Load3DAdvanced saves, but the
+    # current Load3DAdvanced factory is buttonless. They are NOT attached to
+    # viewers fed by a ``model_3d`` link (Preview3DAdvanced,
+    # SaveGaussianSplat, …). The value gate below supports both generations.
+    injects_load_3d_buttons = _is_widget_input(_declared_input_spec(input_def, "model_file"))[0]
+
+    def next_widget_spec(entries: list[tuple[str, Any]], start: int) -> Any:
+        # The spec of the next WIDGET-owning input, not the next declared one.
+        # Connection inputs own no widgets_values slot, so the slot following a
+        # seed belongs to the next widget — handing the companion guard a
+        # connection's spec defeated its COMBO-membership refusal, and one
+        # connection input between an unflagged seed INT and a COMBO made the
+        # guard consume the combo's real value as a phantom marker.
+        for _n, s in entries[start:]:
+            if _is_widget_input(s)[0]:
+                return s
+        return None
+
+    # Flatten required+optional first so each input knows its successor's
+    # schema. Within each section, honor ``input_order`` the way the cql
+    # engine's ``_ordered_names`` does (listed names first, leftovers in dict
+    # order): the input DICT's own order is only trustworthy on a catalog that
+    # was never re-serialized, and pairing widgets positionally from a sorted
+    # dict silently swaps neighboring values (observed: GeminiImageNode's
+    # prompt/model traded places on an alphabetized fixture).
+    input_order = schema.get("input_order") if isinstance(schema, dict) else None
+    if not isinstance(input_order, dict):
+        input_order = {}
+    ordered: list[tuple[str, Any]] = []
+    for section in ("required", "optional"):
+        section_def = input_def.get(section) or {}
+        if not isinstance(section_def, dict):
+            continue
+        section_order = input_order.get(section)
+        names = list(section_def.keys())
+        if isinstance(section_order, list):
+            listed = [n for n in section_order if n in section_def]
+            names = listed + [n for n in names if n not in listed]
+        ordered.extend((n, section_def[n]) for n in names)
+
+    def walk(strict: bool) -> tuple[list[tuple[str, Any]], bool, list[tuple[Any, ...]]]:
+        # ``strict`` assumes the current frontend's slot layout: every exact
+        # ``seed``/``noise_seed`` INT is followed by its companion slot, so a
+        # control keyword there is always consumed. Returns the pairs and
+        # whether the walk used every value with no widget left short, plus
+        # the warnings it would log (only the chosen walk's are emitted).
+        pairs: list[tuple[str, Any]] = []
+        warnings: list[tuple[Any, ...]] = []
+        vidx = 0
+        short = False
+
+        def consume(name: str, spec: Any, depth: int = 0, next_spec: Any = None) -> None:
+            # ``next_spec`` is the schema of the widget that follows this one at the
+            # same level. The implicit-seed rule matches any INT whose name contains
+            # `seed` (partner nodes call it variation_seed/image_seed/...), so it
+            # needs the next widget's schema to avoid eating a value that the next
+            # COMBO legitimately lists as one of its own options.
+            nonlocal vidx, short
+            is_widget, is_dynamic = _is_widget_input(spec)
+            if not is_widget:
+                return
+            legacy_buttons_consumed = False
+            if injects_load_3d_buttons and depth == 0 and _is_load_3d_spec(spec):
+                # The LOAD_3D custom widget adds its three buttons before its own
+                # component widget, so their values sit between ``model_file`` and
+                # this slot. Consuming them here read "upload3dmodel" into the
+                # viewport input and shifted width/height by three.
+                while (
+                    vidx < len(widget_values)
+                    and isinstance(widget_values[vidx], str)
+                    and widget_values[vidx] in LOAD_3D_BUTTON_VALUES
+                ):
+                    legacy_buttons_consumed = True
+                    vidx += 1
+            if vidx >= len(widget_values):
+                if legacy_buttons_consumed:
+                    # A save truncated after its button markers still names this
+                    # LOAD_3D slot; emit the component's empty state rather than
+                    # dropping a required input.
+                    pairs.append((name, ""))
+                    return
+                short = True
+                return
+            value = widget_values[vidx]
+            vidx += 1
+            if spec[0] == "SCALIFY_DYNAMICGROUP_V3":
+                template = spec[1].get("template", {})
+                fields = [(n, s) for section in ("required", "optional") for n, s in template.get(section, {}).items()]
+                count = _dynamic_group_row_count(value, len(widget_values) - vidx, len(fields))
+                for row in range(count):
+                    for j, (field, field_spec) in enumerate(fields):
+                        field_next = next_widget_spec(fields, j + 1)
+                        if field_next is None:
+                            field_next = next_widget_spec(fields, 0) if row + 1 < count else next_spec
+                        consume(f"{name}.{row}.{field}", field_spec, depth + 1, field_next)
+                return
+            pairs.append((name, value))
+            if is_dynamic:
+                subs = _dynamic_combo_selected_subs(name, spec, value)
+                if not subs and not any(
+                    _dynamic_combo_server_key_matches(value, key) for key in _dynamic_combo_option_keys(spec)
+                ):
+                    # The saved selector no longer names any option in the current
+                    # schema (model renamed/removed server-side, or object_info /
+                    # workflow version skew). Its sub-input value slots go
+                    # unconsumed, so every following widget reads a shifted slot.
+                    # We can't recover the alignment, but warn so the corruption
+                    # isn't silent.
+                    warnings.append(
+                        (
+                            "Dynamic-combo input %r selector %r matched no option in the current "
+                            "schema; following widget values may be misaligned",
+                            name,
+                            value,
+                        )
+                    )
+                elif depth >= _MAX_DYNAMIC_COMBO_DEPTH:
+                    warnings.append(
+                        (
+                            "Dynamic-combo nesting for input %r exceeded depth %d; stopping sub-input expansion",
+                            name,
+                            _MAX_DYNAMIC_COMBO_DEPTH,
+                        )
+                    )
+                else:
+                    for j, (sub_name, sub_spec) in enumerate(subs):
+                        # The last widget sub-input is followed by the parent's
+                        # successor, not by nothing.
+                        sub_next = next_widget_spec(subs, j + 1)
+                        consume(sub_name, sub_spec, depth + 1, next_spec if sub_next is None else sub_next)
+            elif vidx < len(widget_values) and _has_control_after_generate_companion(
+                name, spec, widget_values[vidx], next_spec, companion_slots_present=strict
+            ):
+                vidx += 1
+
+        for i, (input_name, input_spec) in enumerate(ordered):
+            consume(input_name, input_spec, 0, next_widget_spec(ordered, i + 1))
+        return pairs, not short and vidx == len(widget_values), warnings
+
+    # Two stream shapes exist. Current frontends save a companion slot after an
+    # unflagged ``seed``/``noise_seed`` INT, and it may hold "randomize" even
+    # when the next COMBO also lists "randomize". Older streams have no
+    # companion there, so the same keyword can be the COMBO's real value. Try
+    # the current layout first and keep it only when it accounts for every
+    # value exactly; otherwise fall back to the lenient walk, which refuses to
+    # take a keyword the next COMBO lists.
+    pairs, exact, warnings = walk(strict=True)
+    if not exact:
+        pairs, _exact, warnings = walk(strict=False)
+    for warning in warnings:
+        logger.warning(*warning)
+    return pairs
+
+
+def _fallback_widget_names(node: dict, widget_values: list[Any]) -> list[str | None]:
+    properties = node.get("properties") or {}
+    ue_properties = properties.get("ue_properties") or {}
+    ue_connectable = ue_properties.get("widget_ue_connectable")
+    if isinstance(ue_connectable, dict) and ue_connectable:
+        names = list(ue_connectable.keys())
+        if len(names) >= len(widget_values):
+            return list(names[: len(widget_values)])
+
+    all_inputs: list[str] = []
+    connected: set[str] = set()
+    widget_flagged: list[str] = []
+    for inp in node.get("inputs") or []:
+        if not isinstance(inp, dict):
+            continue
+        name = inp.get("name")
+        if not name:
+            continue
+        all_inputs.append(name)
+        if inp.get("link") is not None:
+            connected.add(name)
+        if inp.get("widget"):
+            widget_flagged.append(name)
+
+    if widget_flagged:
+        if len(widget_values) > len(widget_flagged):
+            extras = [n for n in all_inputs if n not in connected and n not in widget_flagged]
+            return widget_flagged + extras[: len(widget_values) - len(widget_flagged)]
+        return list(widget_flagged)
+
+    unconnected = [n for n in all_inputs if n not in connected]
+    if len(unconnected) >= len(widget_values):
+        return unconnected[: len(widget_values)]
+    return []
+
+
+def _filter_control_values(
+    widget_values: list[Any],
+    node_type: str | None = None,
+    node: dict | None = None,
+    object_info: dict | None = None,
+) -> list[Any]:
+    """Drop the control_after_generate strings that follow seed-like INT widgets.
+
+    Schema-aware when a schema is available: only a string immediately
+    following an input that declares ``control_after_generate: True`` is
+    treated as a control marker. This avoids false positives on legitimate
+    STRING/COMBO widget values that happen to equal one of the control
+    keywords (e.g. a combo option literally named ``"fixed"``).
+
+    Falls back to a positional string-match heuristic when the schema is
+    unavailable — matches SethRobinson's behavior for unknown node types.
+    """
+
+    def is_control(v: Any) -> bool:
+        return isinstance(v, str) and v in _CONTROL_AFTER_GENERATE_VALUES
+
+    schema = _schema_for(node_type, node, object_info) if node_type and node and object_info else None
+    if not schema:
+        out: list[Any] = []
+        i = 0
+        while i < len(widget_values):
+            value = widget_values[i]
+            if is_control(value):
+                i += 1
+                continue
+            if i + 1 < len(widget_values) and is_control(widget_values[i + 1]):
+                out.append(value)
+                i += 2
+                continue
+            out.append(value)
+            i += 1
+        return out
+
+    out = []
+    vidx = 0
+    input_def = _schema_input_def(schema)
+    # Flatten to the ordered widget inputs so the seed companion check can peek at
+    # the NEXT widget input (a legitimate COMBO value that equals a control
+    # keyword must not be mistaken for a control_after_generate marker).
+    widget_inputs: list[tuple[str, Any]] = []
+    for section in ("required", "optional"):
+        section_def = input_def.get(section) or {}
+        if not isinstance(section_def, dict):
+            continue
+        for input_name, input_spec in section_def.items():
+            if _is_widget_input(input_spec)[0]:
+                widget_inputs.append((input_name, input_spec))
+    for i, (input_name, input_spec) in enumerate(widget_inputs):
+        if vidx >= len(widget_values):
+            break
+        _is_widget, is_dynamic = _is_widget_input(input_spec)
+        if is_dynamic:
+            # A V3 dynamic combo (``SCALIFY_*COMBO*``) occupies its selector
+            # slot plus a variable number of sub-input slots chosen by the
+            # selected option. Copy the whole span through untouched and
+            # advance ``vidx`` in lockstep with ``_schema_widget_pairs``
+            # (which expands the same sub-inputs). Otherwise the walk
+            # treats the combo as a single slot, reaches a later seed input
+            # too early, checks the wrong slot for its control_after_generate
+            # marker, and leaves the marker in place — shifting every widget
+            # after the seed by one (e.g. GeminiNanoBanana2V2 / Nano Banana 2,
+            # whose dynamic ``model`` precedes the seed and whose
+            # ``response_modalities`` sits right after it, so the stray
+            # ``"fixed"`` lands on ``response_modalities``).
+            # Only widget sub-inputs occupy a ``widgets_values`` slot;
+            # ``_dynamic_combo_selected_subs`` returns connection-only ones too
+            # (it leaves that call to the caller, as its docstring notes), and
+            # counting those would over-report the span and shift every later
+            # widget. Same ``_is_widget_input`` test ``_schema_widget_pairs``
+            # applies, so the two walks stay in lockstep.
+            subs = [
+                sub
+                for sub in _dynamic_combo_selected_subs(input_name, input_spec, widget_values[vidx])
+                if _is_widget_input(sub[1])[0]
+            ]
+            span = min(1 + len(subs), len(widget_values) - vidx)
+            out.extend(widget_values[vidx : vidx + span])
+            vidx += span
+            continue
+        out.append(widget_values[vidx])
+        vidx += 1
+        next_input_spec = widget_inputs[i + 1][1] if i + 1 < len(widget_inputs) else None
+        if vidx < len(widget_values) and _has_control_after_generate_companion(
+            input_name, input_spec, widget_values[vidx], next_input_spec
+        ):
+            vidx += 1
+    while vidx < len(widget_values):
+        out.append(widget_values[vidx])
+        vidx += 1
+    return out
+
+
+def _combo_lists_option(input_spec: Any, value: Any) -> bool:
+    """True if ``input_spec`` is a COMBO that declares ``value`` as one of its options.
+
+    Covers both the classic list-form combo (``[["a", "b", ...]]`` — the type IS
+    the option list) and the dict-form combo (``["COMBO", {"options": [...]}]``)."""
+    if not isinstance(input_spec, (list, tuple)) or not input_spec:
+        return False
+    type_field = input_spec[0]
+    if isinstance(type_field, list):
+        return value in type_field
+    if len(input_spec) >= 2 and isinstance(input_spec[1], dict):
+        opts = input_spec[1].get("options")
+        if isinstance(opts, list):
+            return value in opts
+    return False
+
+
+def _has_control_after_generate_companion(
+    input_name: str,
+    input_spec: Any,
+    next_value: Any,
+    next_input_spec: Any = None,
+    *,
+    companion_slots_present: bool = False,
+) -> bool:
+    """True if ``next_value`` should be consumed as a control_after_generate marker.
+
+    Two ways the frontend adds the companion widget:
+
+    * Explicit: the input spec sets ``control_after_generate: True``.
+    * Implicit: the schema omits the flag and the input is an INT named
+      exactly ``seed`` or ``noise_seed`` (the frontend's ``useIntWidget``).
+
+    The implicit path mirrors ``useIntWidget`` and the cql engine's
+    ``_has_control_after_generate_slot``: an unflagged INT named exactly
+    ``seed`` or ``noise_seed``. A dynamic-combo sub-input is dotted
+    (``model.seed``), so it never matches, same as in the engine. Even there we
+    only consume ``next_value`` when it is literally a control keyword, and not
+    when the next widget is a COMBO that lists it as one of its own options.
+
+    Legacy leniency: older CLIs wrote a stray marker after other seed-like INTs
+    (``image_seed``/``texture_seed``/``variation_seed``/``Seed``, and dotted
+    sub-input seeds) even though the frontend adds no companion there. For
+    those we drop a control keyword only when the next widget could not hold it
+    (see ``_widget_rejects_control_value``). A STRING or a COMBO listing
+    ``"fixed"`` keeps it, so a real widget value is never eaten.
+
+    ``next_input_spec`` is the schema of the next widget (``None`` when this is
+    the last one).
+
+    ``companion_slots_present`` says the caller already knows the stream has the
+    current frontend's companion slots (its length matches that layout). Then
+    a control keyword after an exact ``seed``/``noise_seed`` is the companion
+    even when the next COMBO lists the same keyword.
+    """
+    if not (isinstance(next_value, str) and next_value in _CONTROL_AFTER_GENERATE_VALUES):
+        return False
+    options = input_spec[1] if len(input_spec) >= 2 and isinstance(input_spec[1], dict) else {}
+    if "control_after_generate" in options and options["control_after_generate"] is not None:
+        # An explicit flag wins over the seed-name rule, as in the frontend's
+        # ``control_after_generate ?? <name rule>``: false means no companion,
+        # so a marker-like value belongs to the next widget.
+        return bool(options["control_after_generate"])
+    input_type = input_spec[0] if input_spec else None
+    if input_type != "INT":
+        return False
+    if input_name in ("seed", "noise_seed"):
+        # Implicit seed path. With the companion slot known to be present the
+        # keyword is always the companion. Otherwise (a stream that may predate
+        # the companion) don't steal a value that the next COMBO widget
+        # declares as one of its own options.
+        if companion_slots_present:
+            return True
+        return not _combo_lists_option(next_input_spec, next_value)
+    if "seed" in input_name.lower():
+        # No companion per the frontend/engine rule; only a legacy stray marker
+        # that the next widget could not have held is dropped.
+        return _widget_rejects_control_value(next_input_spec, next_value)
+    return False
+
+
+def _widget_rejects_control_value(input_spec: Any, value: str) -> bool:
+    """True if a widget declared by ``input_spec`` could not hold ``value`` (a control keyword).
+
+    ``None`` (no next widget) rejects: a trailing marker is safe to drop. Numeric
+    and boolean widgets reject. A COMBO or dynamic combo rejects unless it lists
+    ``value``. Anything else (STRING, custom widget types) may hold the string,
+    so it does not reject.
+    """
+    if input_spec is None:
+        return True
+    if not isinstance(input_spec, (list, tuple)) or not input_spec:
+        return False
+    type_field = input_spec[0]
+    if isinstance(type_field, (list, tuple)):
+        return value not in type_field
+    if not isinstance(type_field, str):
+        return False
+    if type_field in ("INT", "FLOAT", "BOOLEAN"):
+        return True
+    if type_field == "COMBO":
+        return not _combo_lists_option(input_spec, value)
+    if _is_widget_input(input_spec)[1]:
+        return not any(_dynamic_combo_server_key_matches(value, key) for key in _dynamic_combo_option_keys(input_spec))
+    return False
+
+
+def _collect_widget_inputs(
+    node: dict, node_type: str, object_info: dict, link_inputs: dict[str, list]
+) -> dict[str, Any]:
+    widget_values = node.get("widgets_values")
+    dynamic_prompt_names = _dynamic_prompt_input_names(node_type, node, object_info)
+
+    def emit(name: str, value: Any) -> Any:
+        if name in dynamic_prompt_names and isinstance(value, str):
+            value = process_dynamic_prompt(value)
+        return _wrap_widget_value(value)
+
+    out: dict[str, Any] = {}
+    schema = _schema_for(node_type, node, object_info)
+    input_specs = [
+        spec
+        for section in ("required", "optional")
+        for section_def in [_schema_input_def(schema).get(section)]
+        if isinstance(section_def, dict)
+        for spec in section_def.values()
+    ]
+    group_ui_names: set[str] = set()
+    group_prefixes: tuple[str, ...] = ()
+    group_entry_names: set[str] = set()
+    if schema and any(
+        isinstance(spec, (list, tuple))
+        and spec
+        and isinstance(spec[0], str)
+        and (spec[0].startswith("SCALIFY_DYNAMICGROUP") or _is_dynamic_combo_type(spec[0]))
+        for spec in input_specs
+    ):
+        morphism = _parse_morphism(node_type, schema)
+        _validate_dynamic_group_schema(morphism)
+        entries = _validate_dynamic_group_layout(node, morphism) or []
+        fields = {p.name: {f.name for f in _dynamic_group_fields(p)} for p in morphism.inputs if p.is_dynamic_group}
+        group_prefixes = tuple(f"{name}." for name in fields)
+        group_entry_names = {entry.name for entry in entries if entry.owner in fields}
+        group_ui_names.update(fields)
+        group_ui_names.update(
+            e.name
+            for e in entries
+            if e.owner in fields and e.name[len(e.owner) + 1 :].partition(".")[2] not in fields[e.owner]
+        )
+    if widget_values is None:
+        return {}
+    if isinstance(widget_values, dict):
+        # Already self-describing; drop UI-only keys and respect link overrides.
+        for key, value in widget_values.items():
+            if key in group_ui_names:
+                continue
+            if group_prefixes and key.startswith(group_prefixes) and key not in group_entry_names:
+                continue
+            spec = _declared_input_spec(_schema_input_def(schema), key)
+            if isinstance(spec, (list, tuple)) and spec and spec[0] == "SCALIFY_DYNAMICGROUP_V3":
+                continue
+            if key in ("videopreview", "preview"):
+                continue
+            if key in link_inputs:
+                continue
+            out[key] = emit(key, value)
+        return out
+    if not isinstance(widget_values, list):
+        return {}
+
+    if any(isinstance(v, dict) for v in widget_values):
+        _absorb_dict_widget_values(widget_values, out, link_inputs)
+        return out
+
+    # When a schema is available, a single walk pairs names with values while
+    # expanding V3 dynamic combos and dropping control markers together — the
+    # name order and the marker filtering can never disagree (which is what let
+    # a dynamic combo before a seed steal the seed's slot, e.g. Seedream's
+    # ``model`` before ``seed``). It also skips connection-only sub-inputs
+    # (e.g. ``SCALIFY_AUTOGROW_V3`` images) so they never consume a value slot.
+    schema = _schema_for(node_type, node, object_info)
+    pairs = _schema_widget_pairs(schema, widget_values) if schema else []
+    schema_widgets = any(_is_widget_input(spec)[0] for spec in input_specs) if schema else False
+    if pairs or schema_widgets:
+        for name, value in pairs:
+            if not name or name in link_inputs:
+                continue
+            out[name] = emit(name, value)
+        return out
+
+    # No schema, or the schema declares no widget inputs: fall back to the
+    # positional control-marker heuristic + node-input name inspection, which
+    # matches the reference behavior for unknown node types.
+    filtered = _filter_control_values(widget_values, node_type, node, object_info)
+    names = _fallback_widget_names(node, filtered)
+    if not names:
+        if filtered:
+            logger.warning(
+                "Could not map widget_values for unknown node type %r (node %s)",
+                node_type,
+                node.get("id"),
+            )
+        return out
+    for i, value in enumerate(filtered):
+        if i >= len(names):
+            break
+        name = names[i]
+        if not name or name in link_inputs:
+            continue
+        out[name] = emit(name, value)
+    return out
+
+
+def _absorb_dict_widget_values(widget_values: list[Any], out: dict[str, Any], link_inputs: dict[str, list]) -> None:
+    lora_counter = 0
+    for value in widget_values:
+        if isinstance(value, dict):
+            if not value:
+                continue
+            if "type" in value:
+                name = value.get("type")
+                if name and name not in link_inputs:
+                    out[name] = value
+            elif "lora" in value:
+                lora_counter += 1
+                name = f"lora_{lora_counter}"
+                if name in link_inputs:
+                    continue
+                clean = {k: v for k, v in value.items() if k != "strengthTwo" or v is not None}
+                out[name] = clean
+        elif isinstance(value, str) and value == "":
+            # Frontend's "Add Lora" button serializes as an empty string trailer.
+            out.setdefault("➕ Add Lora", value)
+
+
+def _collect_default_inputs(
+    schema: dict | None,
+    widget_inputs: dict[str, Any],
+    primitive_inputs: dict[str, Any],
+    link_inputs: dict[str, list],
+) -> dict[str, Any]:
+    if not schema:
+        return {}
+    input_def = _schema_input_def(schema)
+    defaults: dict[str, Any] = {}
+    for section in ("required", "optional"):
+        section_def = input_def.get(section) or {}
+        if not isinstance(section_def, dict):
+            continue
+        for input_name, input_spec in section_def.items():
+            if input_name in widget_inputs or input_name in primitive_inputs or input_name in link_inputs:
+                continue
+            default = _extract_default(input_spec)
+            if default is not _MISSING:
+                defaults[input_name] = _wrap_widget_value(default)
+            elif section == "required" and _is_socketless_widget(input_spec):
+                # A socketless widget the saved workflow never persisted
+                # (ImageCompare's `compare_view`, saved as `widgets_values:
+                # []`). The frontend builds its prompt from LIVE widget state
+                # and submits one anyway; converting without it yields a prompt
+                # the server refuses outright (`required_input_missing`), which
+                # is 40 of the shipped templates. The server accepts any value
+                # here, `null` included — verified live — and this input has no
+                # declared default to offer instead.
+                defaults[input_name] = None
+    return defaults
+
+
+def _is_socketless_widget(input_spec: Any) -> bool:
+    """A socketless input that is a widget rather than a forceInput link."""
+    if not isinstance(input_spec, (list, tuple)) or len(input_spec) < 2 or not isinstance(input_spec[1], dict):
+        return False
+    options = input_spec[1]
+    return bool(options.get("socketless")) and not (options.get("forceInput") or options.get("defaultInput"))
+
+
+_MISSING = object()
+
+
+def _extract_default(input_spec: Any) -> Any:
+    if not isinstance(input_spec, (list, tuple)) or not input_spec:
+        return _MISSING
+    input_type = input_spec[0]
+    options = input_spec[1] if len(input_spec) >= 2 and isinstance(input_spec[1], dict) else {}
+    if "default" in options:
+        return options["default"]
+    if isinstance(input_type, list) and input_type:
+        return input_type[0]
+    if input_type == "COMBO":
+        opts = options.get("options")
+        if isinstance(opts, list) and opts:
+            return opts[0]
+    return _MISSING
+
+
+def _normalize_combo_values(schema: dict | None, inputs: dict[str, Any]) -> None:
+    if not schema:
+        return
+    input_def = _schema_input_def(schema)
+    for section in ("required", "optional"):
+        section_def = input_def.get(section) or {}
+        if not isinstance(section_def, dict):
+            continue
+        for input_name, input_spec in section_def.items():
+            if input_name not in inputs:
+                continue
+            value = inputs[input_name]
+            if not isinstance(value, str):
+                continue
+            if not isinstance(input_spec, (list, tuple)) or not input_spec:
+                continue
+            allowed = input_spec[0]
+            if not isinstance(allowed, (list, tuple)):
+                continue
+            if value in allowed:
+                continue
+            lower_value = value.lower()
+            for option in allowed:
+                if isinstance(option, str) and option.lower() == lower_value:
+                    inputs[input_name] = option
+                    break

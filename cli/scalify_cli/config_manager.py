@@ -1,0 +1,215 @@
+import configparser
+import os
+from importlib.metadata import version
+
+from scalify_cli import constants, logging
+from scalify_cli.utils import get_os, is_running, singleton
+
+
+@singleton
+class ConfigManager:
+    def __init__(self):
+        self.config = configparser.ConfigParser()
+        self.background: tuple[str, int, int] | None = None
+        self.load()
+
+    @staticmethod
+    def get_config_path():
+        return constants.DEFAULT_CONFIG[get_os()]
+
+    def get_config_file_path(self):
+        return os.path.join(self.get_config_path(), "config.ini")
+
+    def write_config(self):
+        config_file_path = os.path.join(self.get_config_path(), "config.ini")
+        dir_path = os.path.dirname(config_file_path)
+        if not os.path.exists(dir_path):
+            os.mkdir(dir_path)
+
+        with open(config_file_path, "w") as configfile:
+            self.config.write(configfile)
+
+    def set(self, key, value):
+        """
+        Set a key-value pair in the config file.
+        """
+        self.config["DEFAULT"][key] = value
+        self.write_config()  # Write changes to file immediately
+
+    def get(self, key):
+        """
+        Get a value from the config file. Returns None if the key does not exist.
+        """
+        return self.config["DEFAULT"].get(key, None)  # Returns None if the key does not exist
+
+    def get_bool(self, key) -> bool | None:
+        """
+        Get a boolean value from the config file using configparser's built-in
+        getboolean, which accepts: true/false, yes/no, on/off, 1/0 (case-insensitive).
+
+        Returns None if the key does not exist.
+        """
+        if not self.config.has_option("DEFAULT", key):
+            return None
+        return self.config.getboolean("DEFAULT", key)
+
+    def get_or_override(self, env_key: str, config_key: str, set_value: str | None = None) -> str | None:
+        """
+        Resolves and conditionally stores a config value.
+
+        The selected value and action is determined by the following priority:
+
+        1. Use CLI-provided `--set-*` value (if not None), and save it to config via `set()`.
+        2. Use process environment variable if exists (empty strings are allowed).
+        3. Otherwise, use the current config value via `get()`.
+
+        Returns None if the selected value is an empty string.
+        """
+
+        if set_value is not None:
+            self.set(config_key, set_value)
+            return set_value or None
+        elif env_key in os.environ:
+            return os.environ[env_key] or None
+        else:
+            return self.get(config_key) or None
+
+    def load(self):
+        config_file_path = self.get_config_file_path()
+        if os.path.exists(config_file_path):
+            self.config = configparser.ConfigParser()
+            self.config.read(config_file_path)
+
+        # TODO: We need a policy for clearing the tmp directory.
+        tmp_path = os.path.join(self.get_config_path(), "tmp")
+        # exist_ok: several `scalify` processes can share one HOME and load()
+        # concurrently (the scalify-agent runs read-only tool calls in parallel),
+        # so a check-then-create races — both see the dir missing and the loser
+        # dies with FileExistsError before running its command.
+        os.makedirs(tmp_path, exist_ok=True)
+
+        if constants.CONFIG_KEY_BACKGROUND in self.config["DEFAULT"]:
+            bg_info = self.config["DEFAULT"][constants.CONFIG_KEY_BACKGROUND].strip("()").split(",")
+            bg_info = [item.strip().strip("'") for item in bg_info]
+            self.background = bg_info[0], int(bg_info[1]), int(bg_info[2])
+
+            if not is_running(self.background[2]):
+                # The recorded pid is gone — but the logfile it points at is the
+                # ONLY pointer to a crash log, so clear the process record and
+                # keep CONFIG_KEY_BACKGROUND_LOG.
+                self.clear_background_process()
+
+    def get_env_data(self):
+        """
+        Get environment data as a list of tuples for display.
+
+        Returns:
+            List[Tuple[str, str]]: List of (key, value) tuples for environment data.
+        """
+        data = []
+        data.append(("Config Path", self.get_config_file_path()))
+
+        launch_extras = ""
+        if self.config.has_option("DEFAULT", constants.CONFIG_KEY_DEFAULT_WORKSPACE):
+            data.append(
+                (
+                    "Default ScalifyUI workspace",
+                    self.config["DEFAULT"][constants.CONFIG_KEY_DEFAULT_WORKSPACE],
+                )
+            )
+            launch_extras = self.config["DEFAULT"].get(constants.CONFIG_KEY_DEFAULT_LAUNCH_EXTRAS, "")
+        else:
+            data.append(("Default ScalifyUI workspace", "No default ScalifyUI workspace"))
+
+        if launch_extras == "":
+            launch_extras = "[bold red]None[/bold red]"
+
+        data.append(("Default ScalifyUI launch extra options", launch_extras))
+
+        if self.config.has_option("DEFAULT", constants.CONFIG_KEY_RECENT_WORKSPACE):
+            data.append(
+                (
+                    "Recent ScalifyUI workspace",
+                    self.config["DEFAULT"][constants.CONFIG_KEY_RECENT_WORKSPACE],
+                )
+            )
+        else:
+            data.append(("Recent ScalifyUI workspace", "No recent run"))
+
+        tracking = self.get_bool(constants.CONFIG_KEY_ENABLE_TRACKING)
+        if tracking is not None:
+            data.append(
+                (
+                    "Tracking Analytics",
+                    "Enabled" if tracking else "Disabled",
+                )
+            )
+
+        if self.config.has_option("DEFAULT", constants.CONFIG_KEY_BACKGROUND):
+            bg_info = self.background
+            if bg_info:
+                data.append(
+                    (
+                        "Background ScalifyUI",
+                        f"http://{bg_info[0]}:{bg_info[1]} (pid={bg_info[2]})",
+                    )
+                )
+        else:
+            data.append(("Background ScalifyUI", "[bold red]No[/bold red]"))
+
+        return data
+
+    def get_data(self) -> dict:
+        """Structured snapshot of config, used by ``scalify env --json``.
+
+        Returned values are JSON-serializable; absent keys are null.
+        """
+        default_workspace = self.get(constants.CONFIG_KEY_DEFAULT_WORKSPACE)
+        return {
+            "path": self.get_config_file_path(),
+            "default_workspace": default_workspace,
+            "default_launch_extras": self.get(constants.CONFIG_KEY_DEFAULT_LAUNCH_EXTRAS) or None,
+            "recent_workspace": self.get(constants.CONFIG_KEY_RECENT_WORKSPACE),
+            "tracking_enabled": self.get_bool(constants.CONFIG_KEY_ENABLE_TRACKING),
+            "background": (
+                {
+                    "host": self.background[0],
+                    "port": self.background[1],
+                    "pid": self.background[2],
+                }
+                if self.background is not None
+                else None
+            ),
+        }
+
+    def clear_background_process(self):
+        """Forget the recorded background server, PRESERVING its logfile path.
+
+        ``CONFIG_KEY_BACKGROUND_LOG`` is deliberately kept: once the pid is dead
+        that key is the only pointer to the log the dead server wrote, which is
+        exactly what a post-mortem `scalify logs` needs. Dropping it used to send
+        resolution back to the hard-coded default port, serving the wrong file
+        (or none) while the crash output sat elsewhere. Staleness is now reported
+        as `scalify logs` metadata (``source`` / ``mtime`` / ``port_mismatch``)
+        instead of enforced by deleting the pointer.
+        """
+        self.config["DEFAULT"].pop(constants.CONFIG_KEY_BACKGROUND, None)
+        self.write_config()
+        self.background = None
+
+    def remove_background(self):
+        """Clear the background server record (`scalify stop`, dead-pid cleanup).
+
+        Preserves the logfile pointer — see :meth:`clear_background_process`.
+        """
+        self.clear_background_process()
+
+    def get_cli_version(self):
+        # Note: this approach should work for users installing the CLI via
+        # PyPi and Homebrew (e.g., pip install scalify-cli)
+        try:
+            return version("scalify-cli")
+        except Exception as e:
+            logging.debug(f"Error occurred while retrieving CLI version using importlib.metadata: {e}")
+
+        return "0.0.0"

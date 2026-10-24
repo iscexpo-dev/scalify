@@ -1,9 +1,0 @@
-
- blank_issues_enabled: false
-contact_links:
-  - name: 📖 Read the documentation
-    url: https://scalify.khulnasoft.com
-    about: Please consult the documentation before opening any issues!
-  - name: 🙋 Ask a question
-    url: https://discord.gg/Kgw4HpcuYG
-    about: Ask questions about how to use Scalify on our Discord server.

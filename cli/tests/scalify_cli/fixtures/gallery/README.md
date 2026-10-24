@@ -1,7 +1,7 @@
 # Gallery template fixtures
 
 Real subgraphed gallery templates, copied **verbatim** from
-[Khulnasoft/workflow_templates](https://github.com/Khulnasoft/workflow_templates)
+[Khulnasoft/workflow_templates](https://github.com/Khulnasoft/scalify)
 `templates/`. They back `tests/scalify_cli/test_subgraph_gallery_templates.py`,
 the regression sweep that proves `convert_ui_to_api` fully expands real
 subgraph instances and `Graph.get_template_schema` surfaces their interior

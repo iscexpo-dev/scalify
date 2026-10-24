@@ -1,0 +1,69 @@
+services:
+  docker-daemon:
+    command: |
+      case "${SCALIFYUI_FRONTEND_MODE:-local}" in
+        local)
+          echo 'Starting Docker for local ScalifyUI mode'
+          exec sudo dockerd
+          ;;
+        cloud)
+          echo 'Cloud mode selected; Docker is not needed'
+          exec sleep infinity
+          ;;
+        *)
+          echo 'SCALIFYUI_FRONTEND_MODE must be local or cloud' >&2
+          exit 1
+          ;;
+      esac
+
+  scalifyui:
+    port: 8188
+    command: |
+      case "${SCALIFYUI_FRONTEND_MODE:-local}" in
+        local)
+          echo 'Starting the containerized ScalifyUI backend'
+          exec env SCALIFYUI_PORT="$PORT" scripts/start-scalifyui-e2e.sh
+          ;;
+        cloud)
+          echo 'Cloud mode selected; the local ScalifyUI backend is not needed'
+          exec sleep infinity
+          ;;
+        *)
+          echo 'SCALIFYUI_FRONTEND_MODE must be local or cloud' >&2
+          exit 1
+          ;;
+      esac
+
+  frontend:
+    port: 5173
+    command: |
+      case "${SCALIFYUI_FRONTEND_MODE:-local}" in
+        local)
+          echo 'Waiting for the local ScalifyUI backend'
+          for attempt in {1..300}; do
+            if curl --fail --silent --max-time 2 \
+              http://127.0.0.1:8188/system_stats >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" == 300 ]]; then
+              echo 'Local ScalifyUI backend did not become ready after 300 attempts' >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          echo 'Starting the frontend in local ScalifyUI mode'
+          exec env VITE_REMOTE_DEV=true DISABLE_VUE_PLUGINS=true \
+            pnpm dev:test --host 0.0.0.0 --port "$PORT"
+          ;;
+        cloud)
+          echo 'Starting the frontend in Scalify test cloud mode'
+          exec pnpm dev:cloud --host 0.0.0.0 --port "$PORT"
+          ;;
+        *)
+          echo 'SCALIFYUI_FRONTEND_MODE must be local or cloud' >&2
+          exit 1
+          ;;
+      esac
+    portal:
+      title: ScalifyUI Frontend
+      description: ScalifyUI frontend development server.

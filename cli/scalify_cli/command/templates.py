@@ -978,7 +978,7 @@ def fetch_cmd(
             hint=(
                 "the gallery index references a template whose workflow JSON "
                 "is missing upstream — report at "
-                "https://github.com/Khulnasoft/workflow_templates/issues"
+                "https://github.com/Khulnasoft/scalify/issues"
                 if status == 404
                 else "check network connectivity"
             ),
@@ -994,7 +994,7 @@ def fetch_cmd(
         renderer.error(
             code="template_workflow_invalid_json",
             message=f"upstream returned non-JSON for {name!r}: {e}",
-            hint="report at https://github.com/Khulnasoft/workflow_templates/issues",
+            hint="report at https://github.com/Khulnasoft/scalify/issues",
         )
         raise typer.Exit(code=1) from e
 
@@ -1227,7 +1227,7 @@ def get_cmd(
             hint=(
                 "the gallery index references a template whose workflow JSON "
                 "is missing upstream — report at "
-                "https://github.com/Khulnasoft/workflow_templates/issues"
+                "https://github.com/Khulnasoft/scalify/issues"
                 if status == 404
                 else "check network connectivity"
             ),
@@ -1241,7 +1241,7 @@ def get_cmd(
         renderer.error(
             code="template_workflow_invalid_json",
             message=f"upstream returned non-JSON for {name!r}: {e}",
-            hint="report at https://github.com/Khulnasoft/workflow_templates/issues",
+            hint="report at https://github.com/Khulnasoft/scalify/issues",
         )
         raise typer.Exit(code=1) from e
 
@@ -1473,7 +1473,7 @@ def _template_workflow(
                 hint=(
                     "the gallery index references a template whose workflow JSON "
                     "is missing upstream — report at "
-                    "https://github.com/Khulnasoft/workflow_templates/issues"
+                    "https://github.com/Khulnasoft/scalify/issues"
                     if status == 404
                     else "check network connectivity"
                 ),
@@ -2028,7 +2028,7 @@ def run_template_cmd(
             hint=(
                 "the gallery index references a template whose workflow JSON "
                 "is missing upstream — report at "
-                "https://github.com/Khulnasoft/workflow_templates/issues"
+                "https://github.com/Khulnasoft/scalify/issues"
                 if status == 404
                 else "check network connectivity"
             ),
@@ -2041,7 +2041,7 @@ def run_template_cmd(
         renderer.error(
             code="template_workflow_invalid_json",
             message=f"upstream returned non-JSON for {name!r}: {e}",
-            hint="report at https://github.com/Khulnasoft/workflow_templates/issues",
+            hint="report at https://github.com/Khulnasoft/scalify/issues",
         )
         raise typer.Exit(code=1) from e
 

@@ -459,7 +459,7 @@ REGISTRY: tuple[ErrorCode, ...] = (
     ErrorCode(
         "template_workflow_invalid_json",
         "Upstream `templates/<name>.json` was not parseable JSON.",
-        "report at https://github.com/Khulnasoft/workflow_templates/issues",
+        "report at https://github.com/Khulnasoft/scalify/issues",
     ),
     ErrorCode(
         "template_ambiguous",
